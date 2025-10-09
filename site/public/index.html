@@ -1,0 +1,62 @@
+<!--
+#%L
+ngx_pep
+%%
+(C) akquinet tech@Spree GmbH, 2025, licensed for gematik GmbH
+%%
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+*******
+
+For additional notes and disclaimer from gematik and in case of changes by gematik find details in the "Readme" file.
+#L%
+-->
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Shhh…</title>
+  <link
+    rel="icon"
+    type="image/x-icon"
+    href="/favicon.ico"
+    media="(prefers-color-scheme: light)"
+  />
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/@picocss/pico@2/css/pico.min.css"
+  />
+
+  <body>
+    <main class="container">
+      <h1>OIDC Demo</h1>
+      <p>
+        This page will sign in via OIDC and then <code>fetch</code> a protected
+        resource with <code>Authorization: Bearer &lt;token&gt;</code>.
+      </p>
+
+      <article>
+        <header><strong>Status</strong></header>
+        <pre id="status">check-sso…</pre>
+      </article>
+
+      <div>
+        <button id="loginBtn" hidden>Login / Refresh Token</button>
+        <button id="callBtn" hidden class="secondary">Call Protected</button>
+        <button id="logoutBtn" hidden class="contrast">Logout</button>
+      </div>
+    </main>
+
+    <script type="module" src="/js/main.js"></script>
+  </body>
+</html>

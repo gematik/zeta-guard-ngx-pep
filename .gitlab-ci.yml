@@ -1,0 +1,81 @@
+
+include:
+  - component: "$CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-scanning@v0.3.1"
+    inputs:
+      analyzer-image: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/aquasec/trivy:latest"
+      cs-image: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+      git-strategy: fetch
+      severity: HIGH,CRITICAL
+
+default:
+  image: $CI_REGISTRY/zeta/devops/ci-images/docker:24.0.5-zeta-0
+  tags: [ zeta ]
+  services:
+    - name: docker:24.0.5-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: "2376"
+
+variables:
+  DOCKER_BUILDKIT: "1"
+  BUILDX_BUILDER: "ci-builder"
+  DOCKER_HOST: tcp://docker:2376
+  DOCKER_TLS_CERTDIR: /certs
+  DOCKER_CERT_PATH: $DOCKER_TLS_CERTDIR/client
+  DOCKER_TLS_VERIFY: "1"
+
+before_script:
+  - docker context create docker
+  - docker buildx create --name ci-builder --use --driver docker-container --driver-opt image="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/moby/buildkit:buildx-stable-1" docker
+  - docker buildx use ci-builder
+  - printf "%s" "$CI_DEPENDENCY_PROXY_PASSWORD" | docker login "$CI_DEPENDENCY_PROXY_SERVER" -u "$CI_DEPENDENCY_PROXY_USER" --password-stdin
+  - printf "%s" "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+
+build:
+  stage: build
+  variables:
+    BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.89-slim-bookworm
+    # NOTE: must match minor of nginx-src (with "compat" feature)
+    BASE_IMAGE: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx:1.28-bookworm
+    IMAGE: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+  rules:
+    # don't rebuild for nightly build, i.e. keep scanning the last-built image
+    - if: '$CI_PIPELINE_SOURCE != "schedule"'
+      when: always
+  script:
+    - |
+      docker buildx build \
+        --push \
+        --tag "$IMAGE" \
+        --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/docker/dockerfile:1.7" \
+        --build-arg BASE_IMAGE_BUILD=$BASE_IMAGE_BUILD \
+        --build-arg BASE_IMAGE=$BASE_IMAGE \
+        --build-arg AZDO_CRATES_MIRROR_URL=$AZDO_CRATES_MIRROR_URL \
+        --secret id=azdo_pat,env=AZDO_CRATES_PAT \
+        --cache-from "type=registry,ref=$CI_REGISTRY_IMAGE:buildcache" \
+        --cache-to "type=registry,ref=$CI_REGISTRY_IMAGE:buildcache,mode=max" \
+        .
+    - |
+      if [[ $CI_COMMIT_BRANCH == "$CI_DEFAULT_BRANCH" ]]; then
+        docker pull "$IMAGE"
+        docker tag "$IMAGE" "$CI_REGISTRY_IMAGE:$CI_DEFAULT_BRANCH"
+        docker push "$CI_REGISTRY_IMAGE:$CI_DEFAULT_BRANCH"
+      fi
+
+trigger_helm:
+  stage: build
+  needs:
+    - job: build
+      optional: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: on_success
+    - when: never
+  trigger:
+    project: zeta/devops/zeta-guard-helm
+    branch: main
+    strategy: depend
+  variables:
+    KEYCLOAK_IMAGE_TAG: "main"
+    PEPPROXY_IMAGE_TAG: "$CI_DEFAULT_BRANCH" # i.e. main

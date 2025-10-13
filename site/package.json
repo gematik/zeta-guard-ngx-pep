@@ -8,7 +8,7 @@
     "ensure_env": "[[ -f ./.env ]] || install -v -m 00600 .env.tpl .env",
     "build": "npm run ensure_env; set -a; . $PWD/.env; set +a; prettier --write . && printf \"\\n\" && node esbuild.mjs",
     "clean": "rm -rf public/js",
-    "prefix_install": "rm -rf ../prefix/html/* && cp -a public/* ../prefix/html/ && printf \"../site/public/* → ../prefix/html/\\n\""
+    "prefix_install": "mkdir -p ../prefix/html/ && rm -rf ../prefix/html/* && cp -a public/* ../prefix/html/ && printf \"../site/public/* → ../prefix/html/\\n\""
   },
   "dependencies": {
     "keycloak-js": "^26.2.0"

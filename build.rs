@@ -143,6 +143,14 @@ fn install_config() -> io::Result<()> {
             format!("Unable to parse misc/nginx.conf.tlp: {e}"),
         )
     })?;
+    if !fs::exists("prefix/conf")? {
+        fs::create_dir("prefix/conf").map_err(|e| {
+            io::Error::new(
+                ErrorKind::InvalidFilename,
+                format!("Unable to create directory prefix/conf/: {e}"),
+            )
+        })?;
+    }
     fs::write(
         "prefix/conf/nginx.conf",
         tt.render("nginx.conf", &ctx).map_err(|e| {

@@ -1,0 +1,18 @@
+# Plattformspezifische Produkt-ID für Linux Apps
+$schema: "http://json-schema.org/draft-07/schema#"
+title: Linux Product ID
+description: The product identifier for Linux apps
+type: object
+properties:
+  platform:
+    type: string
+    const: "linux"
+  packaging_type:
+    type: string
+    description: The type of packaging for the Linux app (e.g., flatpak, snap, deb).
+  application_id:
+    type: string
+    description: The Application ID for the Linux app (e.g., org.mozilla.firefox for Flatpak).
+required:
+  - packaging_type
+  - application_id

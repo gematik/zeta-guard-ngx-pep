@@ -1,10 +1,18 @@
-CVE-2023-2953 exp:2025-10-23
-CVE-2023-39616 exp:2025-10-23
-CVE-2023-45853 exp:2025-10-23
-CVE-2023-50495 exp:2025-10-23
-CVE-2023-52355 exp:2025-10-23
-CVE-2023-6879 exp:2025-10-23
-CVE-2025-59375 exp:2025-10-23
-CVE-2025-6020 exp:2025-10-23
-CVE-2025-7425 exp:2025-10-23
-CVE-2025-9900 exp:2025-10-23
+# libaom3 — not used
+CVE-2023-6879
+CVE-2023-39616
+# libldap-2.5-0 — not used
+CVE-2023-2953
+# libpam — not used
+CVE-2025-6020
+# lippng - not used
+CVE-2025-64720
+CVE-2025-65018
+CVE-2025-66293
+# libtiff6 — not used
+CVE-2023-52355
+# libxslt1.1 — not used
+CVE-2025-7425
+# zlib1g — vulnerability affects MiniZip tool for zip files, which are not being used
+#          nginx only uses gzip-functionality from zlib1g
+CVE-2023-45853

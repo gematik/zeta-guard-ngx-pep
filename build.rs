@@ -21,141 +21,184 @@
  * For additional notes and disclaimer from gematik and in case of changes by gematik find details in the "Readme" file.
  * #L%
  */
+
 use std::{
     env, fs,
-    io::{self, ErrorKind},
     path::{Path, PathBuf},
-    process::Command,
 };
 
-use cargo_metadata::MetadataCommand;
-use serde::Serialize;
-use tinytemplate::TinyTemplate;
+use anyhow::{Context, Result};
+use schemars::schema::RootSchema;
+use schemars::visit::{Visitor, visit_schema_object};
+use typify::TypeSpace;
 
-// Use cargo_metadata to find nginx-src's embedded nginx source tree, as it doesn't cleanly export
-// that, but we want to call `make install` in it to populate the prefix.
-fn get_nginx_src_path() -> io::Result<PathBuf> {
-    let metadata = MetadataCommand::new().exec().unwrap();
-    let nginx_src = metadata
-        .packages
-        .iter()
-        .find(|package| package.name.as_str() == "nginx-src");
-    nginx_src
-        .map(|p| p.manifest_path.parent().unwrap().join("nginx").into())
-        .ok_or(io::Error::new(
-            ErrorKind::NotFound,
-            "Unable to find nginx source folder",
-        ))
-}
+#[cfg(feature = "devel")]
+mod devel {
+    use anyhow::{Context, Result};
+    use cargo_metadata::MetadataCommand;
+    use serde::Serialize;
+    use std::io::ErrorKind;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::{env, fs, io};
+    use tinytemplate::TinyTemplate;
 
-fn install_site() -> io::Result<()> {
-    let node_modules = Path::new("./site/node_modules");
-    if !node_modules.exists() {
-        eprintln!("running `npm install` in ./site");
-        Command::new("npm")
-            .arg("install")
-            .current_dir("./site")
-            .status()?;
-    }
-    let main_js = Path::new("./site/public/js/main.js");
-    if !main_js.exists() {
-        eprintln!("running `npm build` in ./site");
-        Command::new("npm")
-            .arg("run")
-            .arg("build")
-            .current_dir("./site")
-            .status()?;
+    // Use cargo_metadata to find nginx-src's embedded nginx source tree, as it doesn't cleanly export
+    // that, but we want to call `make install` in it to populate the prefix.
+    fn get_nginx_src_path() -> Result<PathBuf> {
+        let metadata = MetadataCommand::new().exec().unwrap();
+        let nginx_src = metadata
+            .packages
+            .iter()
+            .find(|package| package.name.as_str() == "nginx-src");
+        nginx_src
+            .map(|p| p.manifest_path.parent().unwrap().join("nginx").into())
+            .context("nginx source folder")
     }
 
-    eprintln!("running `npm run prefix_install` in ./site to populate ./prefix/html");
-    Command::new("npm")
-        .arg("run")
-        .arg("prefix_install")
-        .current_dir("./site")
-        .status()?;
-    Ok(())
-}
+    fn nproc() -> usize {
+        Command::new("nproc")
+            .output()
+            .map(|o| {
+                String::from_utf8(o.stdout)
+                    .expect("nproc output")
+                    .parse()
+                    .expect("nproc parse")
+            })
+            .unwrap_or(1)
+    }
 
-fn nproc() -> usize {
-    Command::new("nproc")
-        .output()
-        .map(|o| {
-            String::from_utf8(o.stdout)
-                .expect("nproc output")
-                .parse()
-                .expect("nproc parse")
-        })
-        .unwrap_or(1)
-}
+    #[derive(Serialize)]
+    struct Ctx {
+        libsuff: String,
+    }
 
-fn make_install() -> io::Result<()> {
-    println!("cargo:rerun-if-env-changed=NGX_CONFIGURE_ARGS");
-    println!("cargo:rerun-if-env-changed=MAKE");
+    pub fn install_config() -> Result<()> {
+        println!("cargo:rerun-if-changed=misc/nginx.conf.tpl");
 
-    let make = env::var("MAKE").unwrap_or_else(|_| "make".to_string());
-    let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| format!("{}", nproc()));
+        #[cfg(target_os = "macos")]
+        let ctx = Ctx {
+            libsuff: "dylib".to_string(),
+        };
 
-    let build_dir = std::env::var("DEP_NGINX_BUILD_DIR").unwrap();
-    let build_dir = Path::new(&build_dir);
-    let source_dir = get_nginx_src_path()?;
+        #[cfg(not(target_os = "macos"))]
+        let ctx = Ctx {
+            libsuff: "so".to_string(),
+        };
 
-    eprintln!(
-        "running `{make} -f {}/Makefile -j{jobs} install` in {}",
-        build_dir.display(),
-        source_dir.display()
-    );
-
-    Command::new(&make)
-        .arg("-f")
-        .arg(build_dir.join("Makefile"))
-        .arg(format!("-j{jobs}"))
-        .arg("install")
-        .current_dir(&source_dir)
-        .status()?;
-    // install site again after each `make install`
-    install_site()?;
-    Ok(())
-}
-
-#[derive(Serialize)]
-struct Ctx {
-    libsuff: String,
-}
-
-fn install_config() -> io::Result<()> {
-    println!("cargo:rerun-if-changed=misc/nginx.conf.tpl");
-
-    #[cfg(target_os = "macos")]
-    let ctx = Ctx {
-        libsuff: "dylib".to_string(),
-    };
-
-    #[cfg(not(target_os = "macos"))]
-    let ctx = Ctx {
-        libsuff: "so".to_string(),
-    };
-
-    let mut tt = TinyTemplate::new();
-    let text = fs::read_to_string("misc/nginx.conf.tpl")?;
-    tt.add_template("nginx.conf", &text).map_err(|e| {
-        io::Error::new(
-            ErrorKind::InvalidData,
-            format!("Unable to parse misc/nginx.conf.tlp: {e}"),
-        )
-    })?;
-    fs::write(
-        "prefix/conf/nginx.conf",
-        tt.render("nginx.conf", &ctx).map_err(|e| {
+        let mut tt = TinyTemplate::new();
+        let text = fs::read_to_string("misc/nginx.conf.tpl")?;
+        tt.add_template("nginx.conf", &text).map_err(|e| {
             io::Error::new(
                 ErrorKind::InvalidData,
-                format!("Unable to render prefix/conf/nginx.conf: {e}"),
+                format!("Unable to parse misc/nginx.conf.tlp: {e}"),
             )
-        })?,
-    )?;
+        })?;
+        fs::write(
+            "prefix/conf/nginx.conf",
+            tt.render("nginx.conf", &ctx).map_err(|e| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Unable to render prefix/conf/nginx.conf: {e}"),
+                )
+            })?,
+        )?;
+        Ok(())
+    }
+
+    pub fn make_install() -> Result<()> {
+        println!("cargo:rerun-if-env-changed=NGX_CONFIGURE_ARGS");
+        println!("cargo:rerun-if-env-changed=MAKE");
+
+        let make = env::var("MAKE").unwrap_or_else(|_| "make".to_string());
+        let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| format!("{}", nproc()));
+
+        let build_dir = std::env::var("DEP_NGINX_BUILD_DIR").unwrap();
+        let build_dir = Path::new(&build_dir);
+        let source_dir = get_nginx_src_path()?;
+
+        eprintln!(
+            "running `{make} -f {}/Makefile -j{jobs} install` in {}",
+            build_dir.display(),
+            source_dir.display()
+        );
+
+        Command::new(&make)
+            .arg("-f")
+            .arg(build_dir.join("Makefile"))
+            .arg(format!("-j{jobs}"))
+            .arg("install")
+            .current_dir(&source_dir)
+            .status()?;
+        install_config()?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "devel")]
+use devel::make_install;
+
+fn load_schema(path: &Path) -> Result<RootSchema> {
+    println!("cargo:rerun-if-changed={}", path.display());
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("reading schema file {}", path.display()))?;
+    let schema: RootSchema = serde_yaml_ng::from_str(&content).with_context(|| "parsing schema")?;
+    Ok(schema)
+}
+
+struct Resolver {
+    path: PathBuf,
+}
+
+impl Resolver {
+    fn new(path: PathBuf) -> Self {
+        Resolver { path }
+    }
+}
+
+impl Visitor for Resolver {
+    fn visit_schema_object(&mut self, schema: &mut schemars::schema::SchemaObject) {
+        if let Some(reference) = schema.reference.clone()
+            && !reference.starts_with('#')
+        {
+            let sub = resolve_schema(self.path.join(reference)).expect("schema");
+            *schema = sub.schema;
+        }
+        visit_schema_object(self, schema);
+    }
+}
+
+fn resolve_schema(path: PathBuf) -> Result<RootSchema> {
+    let mut root = load_schema(&path)?;
+    let mut resolver = Resolver::new(path.parent().expect("parent").to_path_buf());
+
+    resolver.visit_schema_object(&mut root.schema);
+    Ok(root)
+}
+
+fn generate_schema() -> Result<()> {
+    let schemas = vec![
+        resolve_schema(Path::new("./src/schema/access-token.yaml").to_path_buf())?,
+        resolve_schema(Path::new("./src/schema/popp-token.yaml").to_path_buf())?,
+        resolve_schema(Path::new("./src/schema/client-instance.yaml").to_path_buf())?,
+        resolve_schema(Path::new("./src/schema/user-info.yaml").to_path_buf())?,
+        resolve_schema(Path::new("./src/schema/dpop-token.yaml").to_path_buf())?,
+        resolve_schema(Path::new("./src/schema/client-assertion-jwt.yaml").to_path_buf())?,
+    ];
+
+    let mut type_space = TypeSpace::default();
+    for schema in schemas {
+        type_space.add_root_schema(schema)?;
+    }
+
+    let contents =
+        prettyplease::unparse(&syn::parse2::<syn::File>(type_space.to_stream()).unwrap());
+    let out_file = Path::new(&env::var("OUT_DIR").unwrap()).join("typify.rs");
+    fs::write(out_file, contents)?;
     Ok(())
 }
 
-fn main() -> io::Result<()> {
+fn main() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         // allow unresolved symbols (resolved by nginx at runtime)
@@ -163,8 +206,10 @@ fn main() -> io::Result<()> {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-undefined,dynamic_lookup");
     }
 
+    #[cfg(feature = "devel")]
     make_install()?;
-    install_config()?;
+
+    generate_schema()?;
 
     Ok(())
 }

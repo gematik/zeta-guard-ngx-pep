@@ -1,0 +1,15 @@
+# Plattformspezifische Produkt-ID für Windows Apps
+$schema: "http://json-schema.org/draft-07/schema#"
+title: Windows Product ID
+description: The product identifier for Windows apps
+type: object
+properties:
+  platform:
+    type: string
+    const: "windows"
+  store_id:
+    type: string
+    description: The Store ID for the Windows app.
+  package_family_name:
+    type: string
+    description: The Package Family Name for the Windows app.

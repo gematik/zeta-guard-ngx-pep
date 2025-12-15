@@ -1,3 +1,16 @@
+spec:
+  inputs:
+    sonar-quality-gate-enabled:
+      description: 'Enables SonarQube [Quality Gate](https://docs.sonarsource.com/sonarqube-server/latest/quality-standards-administration/managing-quality-gates/introduction/) verification.'
+      type: boolean
+      default: false
+
+---
+stages:
+  - build
+  - test
+  - deploy
+  - publish
 
 include:
   - component: "$CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-scanning@v0.3.1"
@@ -6,12 +19,13 @@ include:
       cs-image: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
       git-strategy: fetch
       severity: HIGH,CRITICAL
+      job-stage: test
 
 default:
   image: $CI_REGISTRY/zeta/devops/ci-images/docker:24.0.5-zeta-0
   tags: [ zeta ]
   services:
-    - name: docker:24.0.5-dind
+    - name: docker:25.0.5-dind
       variables:
         HEALTHCHECK_TCP_PORT: "2376"
 
@@ -22,6 +36,8 @@ variables:
   DOCKER_TLS_CERTDIR: /certs
   DOCKER_CERT_PATH: $DOCKER_TLS_CERTDIR/client
   DOCKER_TLS_VERIFY: "1"
+  GIT_SUBMODULE_STRATEGY: recursive
+  GIT_SUBMODULE_FORCE_HTTPS: "true"
 
 before_script:
   - docker context create docker
@@ -33,39 +49,98 @@ before_script:
 build:
   stage: build
   variables:
-    BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.89-slim-bookworm
+    BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.91-slim-bookworm
     # NOTE: must match minor of nginx-src (with "compat" feature)
-    BASE_IMAGE: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx:1.28-bookworm
-    IMAGE: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+    BASE_IMAGE: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx:1.28-bookworm-otel"
+    IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
   rules:
     # don't rebuild for nightly build, i.e. keep scanning the last-built image
     - if: '$CI_PIPELINE_SOURCE != "schedule"'
       when: always
   script:
     - |
+      set -- --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1.7 \
+        --build-arg BASE_IMAGE_BUILD="$BASE_IMAGE_BUILD" \
+        --build-arg BASE_IMAGE="$BASE_IMAGE" \
+        --build-arg AZDO_CRATES_MIRROR_URL="$AZDO_CRATES_MIRROR_URL" \
+        --cache-from type=registry,ref="$CI_REGISTRY_IMAGE:buildcache" \
+        --cache-to type=registry,ref="$CI_REGISTRY_IMAGE:buildcache,mode=max,compression=zstd" \
+        --secret id=azdo_pat,env=AZDO_CRATES_PAT
+
       docker buildx build \
+        "$@" \
         --push \
         --tag "$IMAGE" \
-        --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/docker/dockerfile:1.7" \
-        --build-arg BASE_IMAGE_BUILD=$BASE_IMAGE_BUILD \
-        --build-arg BASE_IMAGE=$BASE_IMAGE \
-        --build-arg AZDO_CRATES_MIRROR_URL=$AZDO_CRATES_MIRROR_URL \
-        --secret id=azdo_pat,env=AZDO_CRATES_PAT \
-        --cache-from "type=registry,ref=$CI_REGISTRY_IMAGE:buildcache" \
-        --cache-to "type=registry,ref=$CI_REGISTRY_IMAGE:buildcache,mode=max" \
         .
+
+      # publish -build container for sonarqube-check
+      docker buildx build \
+        "$@" \
+        --target build \
+        --push \
+        --tag "$IMAGE-build" \
+        .
+
+sbom:
+  stage: build
+  before_script: []
+  needs:
+    - build
+  image:
+    name: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA-build
+  script:
     - |
-      if [[ $CI_COMMIT_BRANCH == "$CI_DEFAULT_BRANCH" ]]; then
-        docker pull "$IMAGE"
-        docker tag "$IMAGE" "$CI_REGISTRY_IMAGE:$CI_DEFAULT_BRANCH"
-        docker push "$CI_REGISTRY_IMAGE:$CI_DEFAULT_BRANCH"
+      if [[ $AZDO_CRATES_PAT ]]; then
+        CARGO_REGISTRIES_CRATES_MIRROR_TOKEN="Basic $(printf "PAT:%s" "$(echo $AZDO_CRATES_PAT)" | base64 -w0)"
+        export CARGO_REGISTRIES_CRATES_MIRROR_TOKEN
       fi
+    - cd /usr/src/ngx_pep
+    - CARGO_HOME="/usr/local/cargo-home" PATH="$PATH:/usr/local/cargo-home/bin" cargo cyclonedx -f json -a
+    - cp /usr/src/ngx_pep/ngx_pep.cdx.json $CI_PROJECT_DIR/ngx_pep.cdx.json
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: always
+  artifacts:
+    when: always
+    paths:
+      - ngx_pep.cdx.json
+
+sonarqube-check:
+  stage: test
+  # see https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/languages/rust
+  before_script: [ ]
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - "${CI_PROJECT_DIR}/.sonar/cache"
+  image:
+    name: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA-build
+  script:
+    - >-
+      cd /usr/src/ngx_pep &&
+      ln -sf ${CI_PROJECT_DIR}/.git .git &&
+      sonar-scanner
+      ${TRACE+-Dsonar.verbose=true}
+      ${SONAR_QUALITY_GATE_ENABLED:+-Dsonar.qualitygate.wait=$SONAR_QUALITY_GATE_ENABLED}
+      -Dsonar.projectVersion="$(cat /usr/src/ngx_pep/.pkg-version)"
+      -Dsonar.links.homepage=${CI_PROJECT_URL}
+      -Dsonar.links.ci=${CI_PROJECT_URL}/-/pipelines
+      -Dsonar.links.issue=${CI_PROJECT_URL}/-/issues
+  rules:
+    - if: '($SONAR_HOST_URL == null || $SONAR_HOST_URL == "")'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: always
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+    GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+    SONAR_QUALITY_GATE_ENABLED: $[[ inputs.sonar-quality-gate-enabled ]]
+    # TRACE: "1"
 
 trigger_helm:
-  stage: build
-  needs:
-    - job: build
-      optional: true
+  stage: deploy
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: never
@@ -77,5 +152,50 @@ trigger_helm:
     branch: main
     strategy: depend
   variables:
-    KEYCLOAK_IMAGE_TAG: "main"
-    PEPPROXY_IMAGE_TAG: "$CI_DEFAULT_BRANCH" # i.e. main
+    PEPPROXY_IMAGE_TAG: "$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA" # e.g. main-cafebabe
+
+tag_main:
+  stage: publish
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+    - when: never
+  needs:
+    - job: build
+    - job: trigger_helm
+      optional: true
+  script:
+    - |
+      docker pull "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+      docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:$CI_DEFAULT_BRANCH"
+      docker push "$CI_REGISTRY_IMAGE:$CI_DEFAULT_BRANCH"
+
+publish_sbom:
+  stage: publish
+  rules:
+    - if: $CI_COMMIT_TAG
+      variables:
+        COMMIT_MESSAGE: "$CI_COMMIT_TAG"
+      when: on_success
+    - if: $CI_COMMIT_BRANCH == "staging"
+      variables:
+        COMMIT_MESSAGE: "staging $CI_COMMIT_SHORT_SHA"
+      when: on_success
+    - if: $CI_COMMIT_BRANCH == "release"
+      variables:
+        COMMIT_MESSAGE: "release $CI_COMMIT_SHORT_SHA"
+      when: on_success
+    - when: never
+  needs:
+    - job: sbom
+      artifacts: true
+  script:
+    - git clone https://zeta-sdk:${REPORTING_TOKEN}@tas-devtools-gitlab.spree.de/zeta/reporting.git
+    - mkdir -p ./reporting/zeta-guard/ngx_pep/
+    - find . -path ./reporting -prune -o -name 'ngx_pep.cdx.json' -exec cp --parents '{}' ./reporting/zeta-guard/keycloak-zeta/ \;
+    - cd reporting
+    - git config user.email "ci@tas-devtools-gitlab.spree.de"
+    - git config  user.name "ci"
+    - git add .
+    - git commit -m "$COMMIT_MESSAGE"
+    - git push

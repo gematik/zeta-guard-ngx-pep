@@ -19,54 +19,145 @@
 #
 # For additional notes and disclaimer from gematik and in case of changes by gematik find details in the "Readme" file.
 # #L%
-ARG BASE_IMAGE_BUILD="rust:1.89-slim-bookworm"
+ARG BASE_IMAGE_BUILD="rust:1.91-slim-bookworm"
 # NOTE: must match minor nginx version built against, see: `cargo info nginx-src`
 # alpine images might not work well due to musl
-ARG BASE_IMAGE="nginx:1.28-bookworm"
-FROM ${BASE_IMAGE_BUILD} AS build
+ARG BASE_IMAGE="nginx:1.28-bookworm-otel"
+FROM ${BASE_IMAGE_BUILD} AS prereqs
 ARG AZDO_CRATES_MIRROR_URL=""
-ARG AZDO_CRATES_PAT=""
 
-ENV CARGO_HOME=/usr/local/cargo \
+ENV CARGO_HOME=/usr/local/cargo-home \
     CARGO_TERM_COLOR=always
 
+# sonarqube-scanner
 RUN apt-get update && \
   DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-    make \
+    curl \
+    git \
+    openjdk-17-jdk-headless \
+    unzip \
+    jq \
+    && \
+  rm -rf /var/lib/apt/lists/*
+
+ADD "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-7.3.0.5189.zip" /tmp/ss.zip
+RUN unzip /tmp/ss.zip -d /tmp/ss \
+  && mv /tmp/ss/*/bin/* /usr/local/bin \
+  && mv /tmp/ss/*/lib/* /usr/local/lib \
+  && rm /tmp/ss.zip
+
+# build dependencies
+RUN apt-get update && \
+  DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+    clang \
     libclang-dev \
     libpcre2-dev \
     libssl-dev \
+    make \
     zlib1g-dev \
     && \
   rm -rf /var/lib/apt/lists/*
 
-ADD Cargo.toml Cargo.lock .env /usr/src/ngx_pep/
-ADD src /usr/src/ngx_pep/src
-
-WORKDIR /usr/src/ngx_pep
+RUN rustup component add clippy llvm-tools-preview
 
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
+
+RUN --mount=type=cache,target=/usr/local/cargo-home,sharing=locked \
+<<-'SH'
+  if [[ -n ${AZDO_CRATES_MIRROR_URL:-} ]]; then
+    printf "!! configure crates mirror %q\n\n" "$AZDO_CRATES_MIRROR_URL"
+
+    mkdir -p "$CARGO_HOME"
+    cat >"$CARGO_HOME/config.toml" <<-CONFIG
+			[registry]
+			global-credential-providers = ["cargo:token"]
+	
+			[registries.crates_mirror]
+			index = "$AZDO_CRATES_MIRROR_URL"
+	
+			[source.crates-io]
+			replace-with = "crates_mirror"
+CONFIG
+  else
+    # cargo home is cached
+    printf "!! no AZDO_CRATES_MIRROR_URL, removing %s/config.toml\n\n" "$CARGO_HOME/config.toml"
+    rm "$CARGO_HOME/config.toml" || :
+  fi
+SH
+
+RUN --mount=type=cache,target=/usr/local/cargo-home,sharing=locked \
     --mount=type=secret,id=azdo_pat \
 <<-'SH'
-  set -a; . .env; set +a
-  if [[ -n ${AZDO_CRATES_MIRROR_URL:-} ]] && [[ -f /run/secrets/azdo_pat ]]; then
-    # use secret to make sure it doesn't end up in metadata
-    AZDO_CRATES_PAT="$(cat /run/secrets/azdo_pat)"
-    export CARGO_REGISTRIES_CRATES_MIRROR_TOKEN="Basic $(printf 'PAT:%s' "${AZDO_CRATES_PAT}" | base64 -w0)"
-    export CARGO_REGISTRIES_CRATES_MIRROR_INDEX=${AZDO_CRATES_MIRROR_URL:-}
-    printf "Using AZDO crates mirror %s\n\n" "$AZDO_CRATES_MIRROR_URL"
-
-    set -- --config 'registry.global-credential-providers=["cargo:token"]' \
-      --config 'source.crates-io.replace-with="crates_mirror"'
+  if [[ -f /run/secrets/azdo_pat ]]; then
+    CARGO_REGISTRIES_CRATES_MIRROR_TOKEN="Basic $(printf "PAT:%s" "$(cat /run/secrets/azdo_pat)" | base64 -w0)"
+    export CARGO_REGISTRIES_CRATES_MIRROR_TOKEN
   fi
-  cargo build --release "$@"
+
+  printf "!! install cargo-llvm-cov\n\n"
+
+  cargo install cargo-llvm-cov --bins --locked --root /usr/local
+
+  printf "!! install cargo-cyclonedx\n\n"
+  cargo install cargo-cyclonedx --bins --locked --root /usr/local
+SH
+
+FROM prereqs AS build
+
+COPY sonar-project.properties /usr/src/ngx_pep/
+COPY Cargo.toml Cargo.lock /usr/src/ngx_pep/
+COPY build.rs /usr/src/ngx_pep/
+COPY src /usr/src/ngx_pep/src
+COPY libasl /usr/src/ngx_pep/libasl
+
+WORKDIR /usr/src/ngx_pep
+
+RUN --mount=type=cache,target=/usr/local/cargo-home,sharing=locked \
+    --mount=type=secret,id=azdo_pat \
+<<-'SH'
+  if [[ -f /run/secrets/azdo_pat ]]; then
+    CARGO_REGISTRIES_CRATES_MIRROR_TOKEN="Basic $(printf "PAT:%s" "$(cat /run/secrets/azdo_pat)" | base64 -w0)"
+    export CARGO_REGISTRIES_CRATES_MIRROR_TOKEN
+  fi
+
+  echo "--- AAA ---"
+  find /usr/local/bin
+  type -a cargo-cyclonedx || :
+  type -a cargo-llvm-cov || :
+  echo "--- /AAA ---"
+
+  printf "!! cargo fetch\n\n"
+  cargo fetch --locked
+
+  common_args=(
+    --frozen
+    # exclude "devel"
+    --no-default-features
+  )
+
+  printf "!! cargo build\n\n"
+  cargo build "${common_args[@]}" --release --lib
+
+  printf "!! clippy\n\n"
+  cargo clippy "${common_args[@]}" --release --lib
+
+  printf "!! clippy json\n\n"
+  cargo clippy "${common_args[@]}" --release --lib --message-format json > clippy.json
+
+  printf "!! tests\n\n"
+  RUST_BACKTRACE=1 cargo llvm-cov --lib "${common_args[@]}" || :
+
+  printf "!! code coverage\n\n"
+  cargo llvm-cov "${common_args[@]}" \
+    report --lcov --output-path target/llvm-cov-target/coverage.lcov || :
+
+  printf "!! write .pkg-version\n\n"
+  cargo metadata --format-version 1 | jq -r '.packages | map(select(.name == "ngx_pep")) | .[0].version' \
+    >.pkg-version || :
 SH
 
 FROM ${BASE_IMAGE}
 
-ADD docker/nginx.conf /etc/nginx/nginx.conf
-ADD docker/default.conf /etc/nginx/conf.d/
+COPY docker/nginx.conf /etc/nginx/nginx.conf
+COPY docker/default.conf /etc/nginx/conf.d/
 COPY --from=build /usr/src/ngx_pep/target/release/libngx_pep.so /etc/nginx/modules/

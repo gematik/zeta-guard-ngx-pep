@@ -21,10 +21,13 @@
  * For additional notes and disclaimer from gematik and in case of changes by gematik find details in the "Readme" file.
  * #L%
  */
+
 use nginx_sys::{
     NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF,
-    NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_SRV_CONF, NGX_LOG_EMERG, ngx_uint_t,
+    NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_SRV_CONF, NGX_LOG_EMERG, ngx_shm_zone_t, ngx_uint_t,
 };
+use std::collections::HashSet;
+use std::ptr;
 use std::{
     ffi::{c_char, c_void},
     time::Duration,
@@ -89,7 +92,8 @@ macro_rules! loc_command {
     ($name: expr, $handler: ident) => {
         ngx_command_t {
             name: ngx_string!($name),
-            type_: (NGX_HTTP_LOC_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+            type_: (NGX_HTTP_LOC_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1)
+                as ngx_uint_t,
             set: Some($handler),
             conf: NGX_HTTP_LOC_CONF_OFFSET,
             offset: 0,
@@ -99,9 +103,10 @@ macro_rules! loc_command {
 }
 
 // MAIN
-#[derive(Debug)]
-pub(crate) struct MainConfig {
-    pub issuer: Option<String>,
+#[derive(Debug, Clone)]
+pub struct MainConfig {
+    pub pdp_issuer: Option<String>,
+    pub popp_issuer: Option<String>,
     pub jwks_refresh_interval: Duration,
     pub http_client_idle_timeout: Duration,
     pub http_client_max_idle_per_host: usize,
@@ -109,12 +114,14 @@ pub(crate) struct MainConfig {
     pub http_client_connect_timeout: Duration,
     pub http_client_timeout: Duration,
     pub http_client_accept_invalid_certs: bool,
+    pub shm_zone: *mut ngx_shm_zone_t,
 }
 
 impl Default for MainConfig {
     fn default() -> Self {
         Self {
-            issuer: None,
+            pdp_issuer: None,
+            popp_issuer: None,
             jwks_refresh_interval: Duration::from_secs(300), // NOTE: not exposed as directive r.n.
             http_client_idle_timeout: Duration::from_secs(30),
             http_client_max_idle_per_host: 64,
@@ -122,13 +129,17 @@ impl Default for MainConfig {
             http_client_connect_timeout: Duration::from_secs(2),
             http_client_timeout: Duration::from_secs(10),
             http_client_accept_invalid_certs: false,
+            shm_zone: ptr::null_mut(),
         }
     }
 }
 
 impl MainConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.issuer.is_none() {
+        if self.pdp_issuer.is_none() {
+            anyhow::bail!("no issuer configured");
+        }
+        if self.popp_issuer.is_none() {
             anyhow::bail!("no issuer configured");
         }
         Ok(())
@@ -210,36 +221,59 @@ conf_handler!(
     }
 );
 
-conf_handler!(pep_issuer, MainConfig, |conf: &mut MainConfig,
-                                       val: &str|
- -> anyhow::Result<*mut c_char> {
+conf_handler!(pep_pdp_issuer, MainConfig, |conf: &mut MainConfig,
+                                           val: &str|
+ -> anyhow::Result<
+    *mut c_char,
+> {
     if val.trim().is_empty() {
-        anyhow::bail!("issuer empty");
+        anyhow::bail!("pep_pdp_issuer empty");
     }
-    conf.issuer = Some(val.to_string());
+    conf.pdp_issuer = Some(val.to_string());
+
+    Ok(ngx::core::NGX_CONF_OK)
+});
+
+conf_handler!(pep_popp_issuer, MainConfig, |conf: &mut MainConfig,
+                                            val: &str|
+ -> anyhow::Result<
+    *mut c_char,
+> {
+    if val.trim().is_empty() {
+        anyhow::bail!("pep_popp_issuer empty");
+    }
+    conf.popp_issuer = Some(val.to_string());
 
     Ok(ngx::core::NGX_CONF_OK)
 });
 
 // LOCATION
 
-#[derive(Debug)]
-pub(crate) struct LocationConfig {
-    pub enable: bool,
+#[derive(Debug, Default, Clone)]
+pub struct LocationConfig {
+    pub pep: Option<bool>,
+    pub asl: Option<bool>,
 
-    pub require_aud_any: Option<Vec<String>>, // optional
-    pub require_scope: Option<String>,        // optional
-    pub leeway: Duration,
+    pub aud: Option<HashSet<String>>,
+    pub scope: Option<HashSet<String>>,
+    pub leeway: Option<Duration>,
+    pub dpop_validity: Option<Duration>,
+
+    pub require_popp: Option<bool>,
+    pub popp_validity: Option<Duration>,
 }
 
-impl Default for LocationConfig {
-    fn default() -> Self {
-        Self {
-            enable: false,
-            require_aud_any: None,
-            require_scope: None,
-            leeway: Duration::from_secs(60),
-        }
+impl LocationConfig {
+    pub fn leeway(&self) -> Duration {
+        self.leeway.unwrap_or_else(|| Duration::from_secs(60))
+    }
+    pub fn dpop_validity(&self) -> Duration {
+        self.dpop_validity
+            .unwrap_or_else(|| Duration::from_secs(300))
+    }
+    pub fn ppop_validity(&self) -> Duration {
+        self.popp_validity
+            .unwrap_or_else(|| Duration::from_secs(31536000)) // TODO: update default
     }
 }
 
@@ -249,18 +283,27 @@ unsafe impl HttpModuleLocationConf for Module {
 
 impl Merge for LocationConfig {
     fn merge(&mut self, prev: &LocationConfig) -> Result<(), MergeConfigError> {
-        if prev.enable {
-            self.enable = true;
-        };
-
-        if let Some(require_aud) = &prev.require_aud_any {
-            self.require_aud_any = Some(require_aud.clone());
+        if self.pep.is_none() {
+            self.pep = prev.pep;
         }
-
-        if let Some(require_scope) = &prev.require_scope {
-            self.require_scope = Some(require_scope.clone());
+        if self.aud.is_none() {
+            self.aud = prev.aud.clone();
         }
-        self.leeway = prev.leeway;
+        if self.scope.is_none() {
+            self.scope = prev.scope.clone();
+        }
+        if self.leeway.is_none() {
+            self.leeway = prev.leeway;
+        }
+        if self.dpop_validity.is_none() {
+            self.dpop_validity = prev.dpop_validity;
+        }
+        if self.require_popp.is_none() {
+            self.require_popp = prev.require_popp;
+        }
+        if self.popp_validity.is_none() {
+            self.popp_validity = prev.popp_validity;
+        }
 
         Ok(())
     }
@@ -270,9 +313,9 @@ conf_handler!(pep, LocationConfig, |conf: &mut LocationConfig,
                                     val: &str|
  -> anyhow::Result<*mut c_char> {
     if val.eq_ignore_ascii_case("on") {
-        conf.enable = true;
+        conf.pep = Some(true);
     } else if val.eq_ignore_ascii_case("off") {
-        conf.enable = false;
+        conf.pep = Some(false);
     } else {
         anyhow::bail!("Unable to parse pep: {val}")
     }
@@ -280,13 +323,27 @@ conf_handler!(pep, LocationConfig, |conf: &mut LocationConfig,
     Ok(ngx::core::NGX_CONF_OK)
 });
 
+conf_handler!(asl, LocationConfig, |conf: &mut LocationConfig,
+                                    val: &str|
+ -> anyhow::Result<*mut c_char> {
+    if val.eq_ignore_ascii_case("on") {
+        conf.asl = Some(true);
+    } else if val.eq_ignore_ascii_case("off") {
+        conf.asl = Some(false);
+    } else {
+        anyhow::bail!("Unable to parse asl: {val}")
+    }
+
+    Ok(ngx::core::NGX_CONF_OK)
+});
+
 conf_handler!(
-    pep_require_aud_any,
+    pep_require_aud,
     LocationConfig,
     |conf: &mut LocationConfig, val: &str| -> anyhow::Result<*mut c_char> {
-        if !val.trim().is_empty() {
-            conf.require_aud_any = Some(val.trim().split("|").map(str::to_string).collect());
-        }
+        conf.aud = Some(HashSet::from_iter(
+            val.trim().split(" ").map(str::to_string),
+        ));
 
         Ok(ngx::core::NGX_CONF_OK)
     }
@@ -296,9 +353,9 @@ conf_handler!(
     pep_require_scope,
     LocationConfig,
     |conf: &mut LocationConfig, val: &str| -> anyhow::Result<*mut c_char> {
-        if !val.trim().is_empty() {
-            conf.require_scope = Some(val.to_string());
-        }
+        conf.scope = Some(HashSet::from_iter(
+            val.trim().split(" ").map(str::to_string),
+        ));
 
         Ok(ngx::core::NGX_CONF_OK)
     }
@@ -310,13 +367,55 @@ conf_handler!(pep_leeway, LocationConfig, |conf: &mut LocationConfig,
     *mut c_char,
 > {
     let val = Duration::from_secs(val.parse()?);
-    conf.leeway = val;
+
+    conf.leeway = Some(val);
 
     Ok(ngx::core::NGX_CONF_OK)
 });
 
-pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 12] = [
-    main_command!("pep_issuer", pep_issuer),
+conf_handler!(
+    pep_dpop_validity,
+    LocationConfig,
+    |conf: &mut LocationConfig, val: &str| -> anyhow::Result<*mut c_char> {
+        let val = Duration::from_secs(val.parse()?);
+
+        conf.dpop_validity = Some(val);
+
+        Ok(ngx::core::NGX_CONF_OK)
+    }
+);
+
+conf_handler!(
+    pep_require_popp,
+    LocationConfig,
+    |conf: &mut LocationConfig, val: &str| -> anyhow::Result<*mut c_char> {
+        if val.eq_ignore_ascii_case("on") {
+            conf.require_popp = Some(true);
+        } else if val.eq_ignore_ascii_case("off") {
+            conf.require_popp = Some(false);
+        } else {
+            anyhow::bail!("Unable to parse pep_require_popp: {val}")
+        }
+
+        Ok(ngx::core::NGX_CONF_OK)
+    }
+);
+
+conf_handler!(
+    pep_popp_validity,
+    LocationConfig,
+    |conf: &mut LocationConfig, val: &str| -> anyhow::Result<*mut c_char> {
+        let val = Duration::from_secs(val.parse()?);
+
+        conf.dpop_validity = Some(val);
+
+        Ok(ngx::core::NGX_CONF_OK)
+    }
+);
+
+pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 17] = [
+    main_command!("pep_pdp_issuer", pep_pdp_issuer),
+    main_command!("pep_popp_issuer", pep_popp_issuer),
     main_command!("pep_http_client_idle_timeout", pep_http_client_idle_timeout),
     main_command!(
         "pep_http_client_max_idle_per_host",
@@ -336,9 +435,54 @@ pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 12] = [
         pep_http_client_accept_invalid_certs
     ),
     loc_command!("pep", pep),
-    loc_command!("pep_require_aud_any", pep_require_aud_any),
+    loc_command!("pep_require_aud", pep_require_aud),
     loc_command!("pep_require_scope", pep_require_scope),
     loc_command!("pep_leeway", pep_leeway),
+    loc_command!("pep_dpop_validity", pep_dpop_validity),
+    loc_command!("pep_require_popp", pep_require_popp),
+    loc_command!("pep_popp_validity", pep_popp_validity),
+    loc_command!("asl", asl),
     // terminate sequence
     ngx_command_t::empty(),
 ];
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    use ngx::http::Merge;
+
+    use crate::conf::LocationConfig;
+
+    #[test]
+    fn merge_inherits_unset_values() {
+        let some_scope = HashSet::from_iter(["scope".to_string()]);
+        let some_duration = Duration::from_secs(123);
+        let parent = LocationConfig {
+            pep: Some(true),
+            asl: None,
+            aud: None,
+            scope: Some(some_scope.clone()),
+            leeway: None,
+            dpop_validity: None,
+            require_popp: None,
+            popp_validity: None,
+        };
+        let mut child = LocationConfig {
+            pep: Some(false),
+            asl: None,
+            aud: None,
+            scope: None,
+            leeway: Some(some_duration),
+            dpop_validity: None,
+            require_popp: None,
+            popp_validity: None,
+        };
+        child.merge(&parent).expect("merge");
+        assert_eq!(child.pep, Some(false));
+        assert_eq!(child.aud, None);
+        assert_eq!(child.scope, Some(some_scope));
+        assert_eq!(child.leeway, Some(some_duration));
+    }
+}

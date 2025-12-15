@@ -1,57 +1,8 @@
-<img align="right" width="250" height="47" src="docs/img/Gematik_Logo_Flag.png"/> <br/>
+# libasl
 
-# ZETA PEP
+Library that implements the logic of gematik's additional security layer (ASL).
 
-# system dependencies
-
-You need the following programs:
-- rust toolchain
-- pkg-config
-- C toolchain (clang works best)
-- gnu make
-- [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov)
-
-Required C libraries and headers:
-- pcre2
-- openssl
-- zlib
-- libclang
-
-(look for "-dev" variants of packages if your distro splits into runtime and development
-packages)
-
-Additionally, a basic C build setup, e.g. gcc and gnu make.
-The nginx configure script will yell at you when something is missing.
-
-# environment
-
-To manage project-specific environment variables the `direnv` tool is used.
-When using a JetBrains IDE, the [Direnv Integration](https://plugins.jetbrains.com/plugin/15285-direnv-integration)
-plugin is known to work to make the env available during "import" tasks calling cargo.
-After installation, go to Settings → Direnv Settings and enable both:
-- „Automatically … when the project is opened.”
-- „Automatically … before every run/debug.”
-
-`.envrc` loads `.envrc.local` if present (developer-specific, .gitignore'd)
-
-# nginx
-
-Via nginx-sys' "vendored" feature, a nginx source tree is managed by the nginx-source
-crate. ./build.rs additionally calls `make install` in that tree to populate ./prefix
-for easier testing.
-This directory is set as nginx' prefix, so most paths are relative to that directory,
-e.g.:
-- nginx will look in ./prefix/conf/nginx.conf instead of /etc/nginx.conf
-- "load_module modules/debug/libngx_pep.so;" will load ./prefix/modules/debug/libngx_pep.so
-  (which is a symlink that points to the libnx_pep.so built by "cargo build")
-- temp files are written to ./prefix/*_temp/
-- etc.
-
-`./prefix/sbin/nginx` without arguments starts the server and listens on port 8000 with
-the debug variant of the ngx_pep module enabled, and debug logging
-(`ngx_log_debug_http!`, etc.) enabled.
-
-## License
+# License
 
 (C) akquinet tech@Spree GmbH, 2025, licensed for gematik GmbH
 

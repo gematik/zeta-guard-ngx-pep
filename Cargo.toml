@@ -21,36 +21,76 @@
 # #L%
 [package]
 name = "ngx_pep"
-version = "0.1.3"
+version = "0.2.3"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.89.0"
+rust-version = "1.91.1"
+
+[features]
+default = ["devel"]
+devel = [
+  # purl dependencies
+  "tokio/rt-multi-thread",
+  "dep:argp",
+  "dep:p256",
+  "dep:uuid",
+  "dep:p12-keystore",
+  "dep:openssl",
+  "dep:indicatif",
+]
 
 [dependencies]
 anyhow = "1.0"
 async-compat = "0.2"
 scc = "3.3"
-base64 = "0.22"
+base64ct = "1.8"
 futures = "0.3"
-jsonwebtoken = { version = "10.0", features = ["rust_crypto"] }
-# nginx-sys = { version = "0.5.0-beta", features = ["vendored"] }
-nginx-sys = { git = "https://github.com/pschyska/ngx-rust.git", features = ["vendored"] }
-# ngx = { version = "0.5.0-beta", features = ["async"] }
-ngx = { git = "https://github.com/pschyska/ngx-rust.git", features = ["async"] }
+jsonwebtoken = { version = "10.2", features = ["rust_crypto"] }
+nginx-sys = { version = "0.5", features = ["vendored"] }
+ngx = { version = "0.5", features = ["vendored", "async"] } # async: only needed for nginx sleep, spawn from ngx-tickle
+ngx-tickle = "0.1"
 reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
   "blocking",
   "json",
   "http2",
 ] }
-serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "2.0"
+asl = { path = "./libasl" }
+tokio = { version = "1.48", features = ["macros", "fs", "rt"] }
+libc = "0.2"
+hex = "0.4"
+serde_cbor = "0.11"
+sha2 = "0.10"
+httparse = "1.10"
+http = "1.4"
+fastrand = "2.3"
+argp = {version = "0.4", optional = true }
+p256 = {version = "0.13", optional = true }
+uuid = {version = "1.18", optional = true }
+p12-keystore = {version = "0.2", optional = true}
+openssl = {version = "0.10", optional = true }
+indicatif = {version = "0.18", optional = true }
+
+[dev-dependencies]
+mockall = "0.13"
+rstest = "0.26"
+serial_test = "3"
+ambassador = "0.4"
 
 [build-dependencies]
+cc = { version = "1.0", optional = true }
+anyhow = "1.0"
 cargo_metadata = "0.23"
 tinytemplate = "1.2"
 serde = { version = "1.0", features = ["derive"] }
+serde_yaml_ng = "0.10"
+typify = "0.5"
+schemars = "0.8"
+prettyplease = "0.2"
+syn = "2.0"
 
 [lib]
 crate-type = ["cdylib"]

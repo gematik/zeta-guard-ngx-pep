@@ -569,7 +569,7 @@ where
             times.len() - 1000
         };
 
-        let times_l: Vec<_> = times.iter().skip(l).map(|x| *x).collect();
+        let times_l: Vec<_> = times.iter().skip(l).copied().collect();
         let sum_l: f32 = times_l.iter().sum();
         let mean_ms_l = sum_l * 100f32 / times_l.len() as f32;
         progress.set_message(format!(
@@ -692,7 +692,7 @@ async fn asl(
                 .bytes()
                 .await?;
                 times.push(Instant::now().duration_since(start).as_secs_f32());
-                let response_bytes = client::decrypt_response(&mut state, req_ctr, &response)?;
+                let response_bytes = client::decrypt_response(&state, req_ctr, &response)?;
 
                 let mut headers = [httparse::EMPTY_HEADER; 128];
                 let mut response = httparse::Response::new(&mut headers);

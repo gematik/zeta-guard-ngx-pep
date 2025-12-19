@@ -23,11 +23,25 @@ ARG BASE_IMAGE_BUILD="rust:1.91-slim-bookworm"
 # NOTE: must match minor nginx version built against, see: `cargo info nginx-src`
 # alpine images might not work well due to musl
 ARG BASE_IMAGE="nginx:1.28-bookworm-otel"
-FROM ${BASE_IMAGE_BUILD} AS prereqs
+FROM ${BASE_IMAGE_BUILD} AS build-env
 ARG AZDO_CRATES_MIRROR_URL=""
 
-ENV CARGO_HOME=/usr/local/cargo-home \
-    CARGO_TERM_COLOR=always
+# docker
+RUN apt-get update && \
+  DEBIAN_FRONTEND=noninteractive apt-get install --yes \
+    ca-certificates \
+    curl \
+    && \
+  install -m 0755 -d /etc/apt/keyrings && \
+  curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && \
+  chmod a+r /etc/apt/keyrings/docker.asc && \
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+    tee /etc/apt/sources.list.d/docker.list > /dev/null && \
+  apt-get update && \
+  DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin && \
+  rm -rf /var/lib/apt/lists/*
 
 # sonarqube-scanner
 RUN apt-get update && \
@@ -60,49 +74,33 @@ RUN apt-get update && \
 
 RUN rustup component add clippy llvm-tools-preview
 
+COPY misc/cargo-env /usr/local/bin/cargo-env
+
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
-
-RUN --mount=type=cache,target=/usr/local/cargo-home,sharing=locked \
-<<-'SH'
-  if [[ -n ${AZDO_CRATES_MIRROR_URL:-} ]]; then
-    printf "!! configure crates mirror %q\n\n" "$AZDO_CRATES_MIRROR_URL"
-
-    mkdir -p "$CARGO_HOME"
-    cat >"$CARGO_HOME/config.toml" <<-CONFIG
-			[registry]
-			global-credential-providers = ["cargo:token"]
-	
-			[registries.crates_mirror]
-			index = "$AZDO_CRATES_MIRROR_URL"
-	
-			[source.crates-io]
-			replace-with = "crates_mirror"
-CONFIG
-  else
-    # cargo home is cached
-    printf "!! no AZDO_CRATES_MIRROR_URL, removing %s/config.toml\n\n" "$CARGO_HOME/config.toml"
-    rm "$CARGO_HOME/config.toml" || :
-  fi
-SH
-
-RUN --mount=type=cache,target=/usr/local/cargo-home,sharing=locked \
+RUN --mount=type=cache,id=cargo-home,target=/usr/local/cargo-home,sharing=locked \
     --mount=type=secret,id=azdo_pat \
 <<-'SH'
-  if [[ -f /run/secrets/azdo_pat ]]; then
-    CARGO_REGISTRIES_CRATES_MIRROR_TOKEN="Basic $(printf "PAT:%s" "$(cat /run/secrets/azdo_pat)" | base64 -w0)"
-    export CARGO_REGISTRIES_CRATES_MIRROR_TOKEN
-  fi
+  MIRROR=${AZDO_CRATES_MIRROR_URL:-} \
+    TOKEN=$(cat /run/secrets/azdo_pat 2>/dev/null) \
+    . /usr/local/bin/cargo-env
+
+  export CARGO_HOME=/usr/local/cargo-home
+  mkdir -p "$CARGO_HOME"
 
   printf "!! install cargo-llvm-cov\n\n"
-
   cargo install cargo-llvm-cov --bins --locked --root /usr/local
 
   printf "!! install cargo-cyclonedx\n\n"
   cargo install cargo-cyclonedx --bins --locked --root /usr/local
 SH
 
-FROM prereqs AS build
+FROM build-env AS local-build
+
+COPY misc/cargo-build /usr/local/bin/cargo-build
+
+RUN mkdir -p /usr/src/ngx_pep
+WORKDIR /usr/src/ngx_pep
 
 COPY sonar-project.properties /usr/src/ngx_pep/
 COPY Cargo.toml Cargo.lock /usr/src/ngx_pep/
@@ -110,54 +108,21 @@ COPY build.rs /usr/src/ngx_pep/
 COPY src /usr/src/ngx_pep/src
 COPY libasl /usr/src/ngx_pep/libasl
 
-WORKDIR /usr/src/ngx_pep
-
-RUN --mount=type=cache,target=/usr/local/cargo-home,sharing=locked \
-    --mount=type=secret,id=azdo_pat \
+RUN \
 <<-'SH'
-  if [[ -f /run/secrets/azdo_pat ]]; then
-    CARGO_REGISTRIES_CRATES_MIRROR_TOKEN="Basic $(printf "PAT:%s" "$(cat /run/secrets/azdo_pat)" | base64 -w0)"
-    export CARGO_REGISTRIES_CRATES_MIRROR_TOKEN
-  fi
-
-  echo "--- AAA ---"
-  find /usr/local/bin
-  type -a cargo-cyclonedx || :
-  type -a cargo-llvm-cov || :
-  echo "--- /AAA ---"
-
-  printf "!! cargo fetch\n\n"
-  cargo fetch --locked
-
-  common_args=(
-    --frozen
-    # exclude "devel"
-    --no-default-features
-  )
-
-  printf "!! cargo build\n\n"
-  cargo build "${common_args[@]}" --release --lib
-
-  printf "!! clippy\n\n"
-  cargo clippy "${common_args[@]}" --release --lib
-
-  printf "!! clippy json\n\n"
-  cargo clippy "${common_args[@]}" --release --lib --message-format json > clippy.json
-
-  printf "!! tests\n\n"
-  RUST_BACKTRACE=1 cargo llvm-cov --lib "${common_args[@]}" || :
-
-  printf "!! code coverage\n\n"
-  cargo llvm-cov "${common_args[@]}" \
-    report --lcov --output-path target/llvm-cov-target/coverage.lcov || :
-
-  printf "!! write .pkg-version\n\n"
-  cargo metadata --format-version 1 | jq -r '.packages | map(select(.name == "ngx_pep")) | .[0].version' \
-    >.pkg-version || :
+  /usr/local/bin/cargo-build
 SH
 
+# gitlab-ci likes to build "locally", copy .so from context
+FROM ${BASE_IMAGE} AS ci
+
+COPY misc/docker/nginx.conf /etc/nginx/nginx.conf
+COPY misc/docker/default.conf /etc/nginx/conf.d/
+COPY target/release/libngx_pep.so /etc/nginx/modules/
+
+# default target, i.e. for interactive usage, copy so. from local-build stage
 FROM ${BASE_IMAGE}
 
-COPY docker/nginx.conf /etc/nginx/nginx.conf
-COPY docker/default.conf /etc/nginx/conf.d/
-COPY --from=build /usr/src/ngx_pep/target/release/libngx_pep.so /etc/nginx/modules/
+COPY misc/docker/nginx.conf /etc/nginx/nginx.conf
+COPY misc/docker/default.conf /etc/nginx/conf.d/
+COPY --from=local-build /usr/src/ngx_pep/target/release/libngx_pep.so /etc/nginx/modules/

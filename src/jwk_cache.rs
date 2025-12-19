@@ -37,10 +37,10 @@ pub trait JwkCacheOps {
 #[cfg(not(test))]
 mod prod {
     use anyhow::Context;
-    use http::Uri;
+    
     use jsonwebtoken::jwk::JwkSet;
-    use jsonwebtoken::jws::{Jws, decode};
-    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
+    
+    
 
     use {
         super::JwkCacheOps,

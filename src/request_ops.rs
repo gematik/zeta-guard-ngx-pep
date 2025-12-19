@@ -58,8 +58,8 @@ fn split_authority(authority: &str) -> Result<(&str, Option<u16>)> {
     }
 
     // IPv6 literal: [2001:db8::1]:443
-    if authority.starts_with('[') {
-        if let Some(end) = authority.find(']') {
+    if authority.starts_with('[')
+        && let Some(end) = authority.find(']') {
             let host = &authority[..=end]; // include brackets
             let rest = &authority[end + 1..];
             if let Some(port_str) = rest.strip_prefix(':') {
@@ -72,7 +72,6 @@ fn split_authority(authority: &str) -> Result<(&str, Option<u16>)> {
             }
             return Ok((host, None));
         }
-    }
 
     // host or host:port
     if let Some(idx) = authority.rfind(':') {
@@ -112,7 +111,7 @@ fn try_parse_forwarded(forwarded: Option<&str>) -> Option<(&str, &str, Option<u1
             }
         }
         match host {
-            Some(host) => match split_authority(&host) {
+            Some(host) => match split_authority(host) {
                 Ok((host, port)) => Some((proto.unwrap_or("https"), host, port)),
                 Err(_) => None,
             },
@@ -130,23 +129,35 @@ fn try_parse_xforwarded<'a>(
         Some((first, _)) => first.trim(),
         None => xfh.trim(),
     })
-    .and_then(|host| {
+    .map(|host| {
         let xfpr = xfpr.unwrap_or("https");
         let proto = match xfpr.split_once(",") {
             Some((proto, _)) => proto.trim(),
             None => xfpr.trim(),
         };
-        match xfpo.map(|xfpo| {
-            match xfpo.split_once(",") {
-                Some((port, _)) => port,
-                None => xfpo,
-            }
-            .trim()
-            .parse::<u16>()
-        }) {
-            Some(Ok(port)) => Some((proto, host, Some(port))),
-            Some(Err(_)) => None,
-            None => Some((proto, host, None)),
+        // Some servers set x-forwarded-host: name:443 x-forwarded-port:443 when given host:
+        // name:443.
+        // Strip the port number from x-forwarded-host and use it unless x-forwarded-port is also
+        // specified
+        let (host, port): (&str, Option<u16>) = match host.split_once(":") {
+            Some((host, port)) => (host.trim(), port.trim().parse().ok()),
+            None => (host, None),
+        };
+
+        match (
+            xfpo.map(|xfpo| {
+                match xfpo.split_once(",") {
+                    Some((port, _)) => port,
+                    None => xfpo,
+                }
+                .trim()
+                .parse::<u16>()
+            }),
+            port,
+        ) {
+            (Some(Ok(xfpo)), _) => (proto, host, Some(xfpo)),
+            (_, Some(port)) => (proto, host, Some(port)),
+            (_, None) => (proto, host, None),
         }
     })
 }
@@ -354,15 +365,31 @@ mod tests {
             Some(("https", "host", None)),
             try_parse_xforwarded(None, Some("host"), None)
         );
+        // http if specified
+        assert_eq!(
+            Some(("http", "host", None)),
+            try_parse_xforwarded(Some("http"), Some("host"), None)
+        );
         // with port
         assert_eq!(
             Some(("https", "host", Some(1234))),
             try_parse_xforwarded(None, Some("host"), Some("1234"))
         );
-        // None with unparseable port
+        let x = try_parse_xforwarded(None, Some("host"), Some("weird"));
+        // ignore unparseable port
         assert_eq!(
-            None,
-            try_parse_xforwarded(None, Some("host"), Some("weird"))
+            Some(("https", "host", None)),
+            try_parse_xforwarded(Some("https"), Some("host"), Some("weird"))
+        );
+        // with port in x-forwarded-host and x-forwarded-port — use xfpo
+        assert_eq!(
+            Some(("https", "host", Some(2))),
+            try_parse_xforwarded(Some("https"), Some("host:1"), Some("2"))
+        );
+        // with port in x-forwarded-host and no x-forwarded-port
+        assert_eq!(
+            Some(("https", "host", Some(1))),
+            try_parse_xforwarded(Some("https"), Some("host:1"), None)
         );
         // multi-valued
         assert_eq!(

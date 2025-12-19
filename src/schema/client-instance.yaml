@@ -36,6 +36,5 @@ required:
   - platform
   - manufacturer_id
   - manufacturer_name
-  - owner_mail
   - registration_timestamp
   - platform_product_id

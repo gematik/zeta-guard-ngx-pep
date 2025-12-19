@@ -71,6 +71,49 @@ properties:
             description: SHA-256 hash of the public key used in the DPoP proof.
         required:
           - jkt
+      udat:
+        type: object
+        description: user data
+        properties:
+          prof:
+            type: string
+            description: profession oid
+          telid:
+            type: string
+            description: telematik id
+        required:
+          - prof
+          - telid
+      cdat:
+        type: object
+        description: client data
+        properties:
+          client_id:
+            type: string
+            description: client id
+          name:
+            type: string
+            description: client's name
+          registration_timestamp:
+            type: integer
+            description: seconds since epoch at time of registration
+          manufacturer_id:
+            type: string
+            description: The manufacturer identifier
+          manufacturer_name:
+            type: string
+            description: The manufacturer name
+          platform_product_id:
+            oneOf:
+              - $ref: "./product-id-android.yaml"
+              - $ref: "./product-id-apple.yaml"
+              - $ref: "./product-id-windows.yaml"
+              - $ref: "./product-id-linux.yaml"
+        required:
+          - client_id
+          - name
+          - registration_timestamp
+          - platform_product_id
     required:
       - iss
       - exp

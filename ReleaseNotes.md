@@ -2,6 +2,16 @@
 
 # Release Notes ZETA PEP
 
+## Release 0.2.4
+
+### added:
+- url normalization for htu verification
+- added htu verification again
+- extracting userdata and clientdata from access token and passing it on to the Fachdienst
+
+### changed:
+- minor build and CI changes
+
 ## Release 0.2.3
 
 ### changed:

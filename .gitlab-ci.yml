@@ -38,6 +38,10 @@ variables:
   DOCKER_TLS_VERIFY: "1"
   GIT_SUBMODULE_STRATEGY: recursive
   GIT_SUBMODULE_FORCE_HTTPS: "true"
+  BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.91-slim-bookworm
+  # NOTE: must match major.minor of cargo-dependency `nginx-src`
+  BASE_IMAGE: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx:1.28-bookworm-otel"
+  IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
 
 before_script:
   - docker context create docker
@@ -46,80 +50,99 @@ before_script:
   - printf "%s" "$CI_DEPENDENCY_PROXY_PASSWORD" | docker login "$CI_DEPENDENCY_PROXY_SERVER" -u "$CI_DEPENDENCY_PROXY_USER" --password-stdin
   - printf "%s" "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
 
-build:
+build-env:
   stage: build
   variables:
-    BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.91-slim-bookworm
-    # NOTE: must match minor of nginx-src (with "compat" feature)
-    BASE_IMAGE: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx:1.28-bookworm-otel"
-    IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
   rules:
-    # don't rebuild for nightly build, i.e. keep scanning the last-built image
+    # don't rebuild for nightly build, keep scanning the last-built image
     - if: '$CI_PIPELINE_SOURCE != "schedule"'
       when: always
   script:
     - |
-      set -- --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1.7 \
+      docker buildx build \
+        --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1.7 \
         --build-arg BASE_IMAGE_BUILD="$BASE_IMAGE_BUILD" \
         --build-arg BASE_IMAGE="$BASE_IMAGE" \
         --build-arg AZDO_CRATES_MIRROR_URL="$AZDO_CRATES_MIRROR_URL" \
         --cache-from type=registry,ref="$CI_REGISTRY_IMAGE:buildcache" \
         --cache-to type=registry,ref="$CI_REGISTRY_IMAGE:buildcache,mode=max,compression=zstd" \
-        --secret id=azdo_pat,env=AZDO_CRATES_PAT
-
-      docker buildx build \
-        "$@" \
+        --secret id=azdo_pat,env=AZDO_CRATES_PAT \
+        --target build-env \
+        --tag "$IMAGE-build-env" \
         --push \
-        --tag "$IMAGE" \
+        "$@" \
         .
 
-      # publish -build container for sonarqube-check
-      docker buildx build \
-        "$@" \
-        --target build \
-        --push \
-        --tag "$IMAGE-build" \
-        .
-
-sbom:
+build:
   stage: build
-  before_script: []
+  image: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA-build-env
   needs:
-    - build
-  image:
-    name: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA-build
+    - job: build-env
+  rules:
+    # don't rebuild for nightly build, keep scanning the last-built image
+    - if: '$CI_PIPELINE_SOURCE != "schedule"'
+      when: always
+  cache:
+    - key: build-$CI_COMMIT_REF_SLUG
+      fallback_keys:
+        - build-$CI_DEFAULT_BRANCH
+        - build-default
+      paths:
+        - "${CI_PROJECT_DIR}/target"
+        - "${CI_PROJECT_DIR}/.cargo-home"
   script:
     - |
-      if [[ $AZDO_CRATES_PAT ]]; then
-        CARGO_REGISTRIES_CRATES_MIRROR_TOKEN="Basic $(printf "PAT:%s" "$(echo $AZDO_CRATES_PAT)" | base64 -w0)"
-        export CARGO_REGISTRIES_CRATES_MIRROR_TOKEN
-      fi
-    - cd /usr/src/ngx_pep
-    - CARGO_HOME="/usr/local/cargo-home" PATH="$PATH:/usr/local/cargo-home/bin" cargo cyclonedx -f json -a
-    - cp /usr/src/ngx_pep/ngx_pep.cdx.json $CI_PROJECT_DIR/ngx_pep.cdx.json
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule"
-      when: never
-    - when: always
+      MIRROR=${AZDO_CRATES_MIRROR_URL:-} \
+        TOKEN=${AZDO_CRATES_PAT:-} \
+        . /usr/local/bin/cargo-env
+
+      export CARGO_HOME=".cargo-home"
+      mkdir -p "$CARGO_HOME"
+
+      misc/cargo-build
+
+      printf "!! build image %s\n\n" "$IMAGE"
+
+      docker buildx build \
+        --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1.7 \
+        --build-arg BASE_IMAGE_BUILD="$BASE_IMAGE_BUILD" \
+        --build-arg BASE_IMAGE="$BASE_IMAGE" \
+        --target ci \
+        --tag "$IMAGE" \
+        --push \
+        "$@" \
+        .
   artifacts:
     when: always
     paths:
+      - target/release/libngx_pep.so
+      - clippy.json
+      - coverage.lcov
+      - .pkg-version
       - ngx_pep.cdx.json
 
-sonarqube-check:
+sonarqube:
   stage: test
   # see https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/languages/rust
   before_script: [ ]
   cache:
-    key: "${CI_JOB_NAME}"
-    paths:
-      - "${CI_PROJECT_DIR}/.sonar/cache"
+    - key: build-$CI_COMMIT_REF_SLUG
+      fallback_keys:
+        - build-$CI_DEFAULT_BRANCH
+        - build-default
+      paths:
+        - "${CI_PROJECT_DIR}/target"
+        - "${CI_PROJECT_DIR}/.cargo-home"
+    - key: "${CI_JOB_NAME}"
+      paths:
+        - "${CI_PROJECT_DIR}/.sonar/cache"
   image:
-    name: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA-build
+    name: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA-build-env
+  needs:
+    - job: build
+      artifacts: true
   script:
     - >-
-      cd /usr/src/ngx_pep &&
-      ln -sf ${CI_PROJECT_DIR}/.git .git &&
       sonar-scanner
       ${TRACE+-Dsonar.verbose=true}
       ${SONAR_QUALITY_GATE_ENABLED:+-Dsonar.qualitygate.wait=$SONAR_QUALITY_GATE_ENABLED}
@@ -132,7 +155,7 @@ sonarqube-check:
       when: never
     - if: $CI_PIPELINE_SOURCE == "schedule"
       when: never
-    - when: always
+    - when: on_success
   variables:
     SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
     GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
@@ -159,9 +182,14 @@ tag_main:
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: on_success
+    # don't trigger for nightly builds — they are supposed to check dependency issues in
+    # *previously* built and released images, and not build/tag anything themselves.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
     - when: never
   needs:
     - job: build
+      optional: true # resolved before rules are evaluated, which fails when schedule
     - job: trigger_helm
       optional: true
   script:
@@ -187,7 +215,7 @@ publish_sbom:
       when: on_success
     - when: never
   needs:
-    - job: sbom
+    - job: build
       artifacts: true
   script:
     - git clone https://zeta-sdk:${REPORTING_TOKEN}@tas-devtools-gitlab.spree.de/zeta/reporting.git

@@ -176,7 +176,7 @@ async fn handle_subrequest(request: &mut Request, cid: String, body: &[u8]) -> R
     // body
     response_bytes.extend_from_slice(&subresponse.bytes().await?);
 
-    let response = encrypt_response(&SESSION_CACHE.server_config(), &session, ctr, &response_bytes)?;
+    let response = encrypt_response(SESSION_CACHE.server_config(), &session, ctr, &response_bytes)?;
 
     // TODO: errors become application/cbor with a structure given in A_26924, and map http reponse
     // codes

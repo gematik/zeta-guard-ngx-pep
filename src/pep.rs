@@ -30,7 +30,8 @@ use crate::headers::{
 use crate::jwk_cache::JwkCacheOps;
 use crate::request_ops::{ConfigOps, RequestOps, normalized_uri};
 use crate::typify::{
-    AccessTokenPayload, AccessTokenPayloadAud, ClientInstance, DPoPProofJwtPayload, UserInfo,
+    AccessTokenPayload, AccessTokenPayloadAud, AccessTokenPayloadCdatPlatformProductId,
+    ClientInstance, DPoPProofJwtPayload, UserInfo,
 };
 use crate::{
     conf::{LocationConfig, MainConfig},
@@ -181,7 +182,7 @@ async fn verify_popp(
     let key = DecodingKey::from_jwk(&jwk)?;
 
     // TODO: Fix schema and use PoPpTokenPayload instead of Value
-    let token_data: TokenData<Value> = decode(&popp, &key, &validation)?;
+    let token_data: TokenData<Value> = decode(popp, &key, &validation)?;
 
     let iat: u64 = token_data.claims["iat"]
         .as_u64()
@@ -325,9 +326,9 @@ async fn verify_dpop(
         htu.port().map(|port| port.as_u16()),
         htu.path(),
     )?;
-//     if request_uri != htu {
-//         anyhow::bail!("DPoP: htu invalid: want {}; got {}", request_uri, htu);
-//     }
+    if request_uri != htu {
+        anyhow::bail!("DPoP: htu invalid: want {}; got {}", request_uri, htu);
+    }
 
     Ok(())
 }
@@ -359,16 +360,6 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> Result<Statu
     )
     .await?;
 
-    ensure_api_version_header_out(request)?;
-    ensure_user_info_header_in(
-        request,
-        UserInfo {
-            identifier: "TODO".to_string(),
-            mail: Some("to@do.invalid".to_string()),
-            profession_oid: "1.2.276.0.76.4.30".to_string(),
-        },
-    )?;
-
     if location_config.require_popp.unwrap_or(true) {
         match request.get_header_in("popp") {
             Some(popp) => {
@@ -378,22 +369,114 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> Result<Statu
             None => bail!("PoPP header missing"),
         }
     }
-    ensure_client_data_header_in(
+
+    ensure_api_version_header_out(request)?;
+
+    let udat = access_token.claims.udat.context("missing udat")?;
+    ensure_user_info_header_in(
         request,
-        ClientInstance::Variant0 {
-            client_id: "TODO".to_string(),
-            manufacturer_id: "TODO".to_string(),
-            manufacturer_name: "TODO".to_string(),
-            name: "TODO".to_string(),
-            namespace: "TODO".to_string(),
-            owner_mail: "TODO".to_string(),
-            package_name: "TODO".to_string(),
-            platform: "android".to_string(),
-            platform_product_id: Map::new(),
-            registration_timestamp: 1,
-            sha256_cert_fingerprints: vec!["TODO".to_string()],
+        UserInfo {
+            identifier: udat.telid.clone(),
+            mail: None,
+            profession_oid: udat.prof.clone(),
         },
     )?;
+
+    let cdat = access_token.claims.cdat.context("cdat missing")?;
+    let platform_product_id = cdat.platform_product_id;
+    let client_instance = match platform_product_id {
+        AccessTokenPayloadCdatPlatformProductId::AndroidProductId {
+            namespace,
+            package_name,
+            platform,
+            sha256_cert_fingerprints,
+        } => ClientInstance::Variant0 {
+            client_id: cdat.client_id.clone(),
+            manufacturer_id: cdat
+                .manufacturer_id
+                .context("manufacturer_id missing")?
+                .clone(),
+            manufacturer_name: cdat
+                .manufacturer_name
+                .context("manufacturer_name missing")?
+                .clone(),
+            name: cdat.name.clone(),
+            namespace: namespace.clone(),
+            owner_mail: None,
+            package_name: package_name.clone(),
+            platform: platform.context("platform missing")?.clone(),
+            platform_product_id: Map::new(),
+            registration_timestamp: cdat.registration_timestamp,
+            sha256_cert_fingerprints: sha256_cert_fingerprints.clone(),
+        },
+        AccessTokenPayloadCdatPlatformProductId::AppleProductId {
+            app_bundle_ids,
+            platform,
+            platform_type,
+        } => ClientInstance::Variant1 {
+            client_id: cdat.client_id.clone(),
+            manufacturer_id: cdat
+                .manufacturer_id
+                .context("manufacturer_id missing")?
+                .clone(),
+            manufacturer_name: cdat
+                .manufacturer_name
+                .context("manufacturer_name missing")?
+                .clone(),
+            name: cdat.name.clone(),
+            owner_mail: None,
+            platform_type: platform_type.clone(),
+            platform: platform.context("platform missing")?.clone(),
+            platform_product_id: Map::new(),
+            registration_timestamp: cdat.registration_timestamp,
+            app_bundle_ids: app_bundle_ids.clone(),
+        },
+        AccessTokenPayloadCdatPlatformProductId::WindowsProductId {
+            package_family_name,
+            platform,
+            store_id,
+        } => ClientInstance::Variant2 {
+            client_id: cdat.client_id.clone(),
+            manufacturer_id: cdat
+                .manufacturer_id
+                .context("manufacturer_id missing")?
+                .clone(),
+            manufacturer_name: cdat
+                .manufacturer_name
+                .context("manufacturer_name missing")?
+                .clone(),
+            name: cdat.name.clone(),
+            owner_mail: None,
+            package_family_name,
+            platform: platform.context("platform missing")?.clone(),
+            platform_product_id: Map::new(),
+            registration_timestamp: cdat.registration_timestamp,
+            store_id,
+        },
+        AccessTokenPayloadCdatPlatformProductId::LinuxProductId {
+            application_id,
+            packaging_type,
+            platform,
+        } => ClientInstance::Variant3 {
+            client_id: cdat.client_id.clone(),
+            manufacturer_id: cdat
+                .manufacturer_id
+                .context("manufacturer_id missing")?
+                .clone(),
+            manufacturer_name: cdat
+                .manufacturer_name
+                .context("manufacturer_name missing")?
+                .clone(),
+            name: cdat.name.clone(),
+            owner_mail: None,
+            application_id,
+            platform: platform.context("platform missing")?.clone(),
+            platform_product_id: Map::new(),
+            registration_timestamp: cdat.registration_timestamp,
+            packaging_type,
+        },
+    };
+    ensure_client_data_header_in(request, client_instance)?;
 
     Ok(Status::NGX_OK)
 }
@@ -475,6 +558,8 @@ mod tests {
                 jti: "jti".to_string(),
                 scope: None,
                 sub: "sub".to_string(),
+                udat: None,
+                cdat: None,
             }
         }
     }

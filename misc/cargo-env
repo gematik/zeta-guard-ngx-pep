@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+
+set -e
+set -u
+set -o pipefail
+
+if [[ -n ${MIRROR:-} ]] && [[ -n ${TOKEN:-} ]]; then
+	printf "!! configure crates mirror %q\n\n" "$MIRROR"
+
+	mkdir -p .cargo
+	cat >.cargo/config.toml <<-CONFIG
+		[registry]
+		global-credential-providers = ["cargo:token"]
+
+		[registries.crates_mirror]
+		index = "$MIRROR"
+
+		[source.crates-io]
+		replace-with = "crates_mirror"
+	CONFIG
+	CARGO_REGISTRIES_CRATES_MIRROR_TOKEN="Basic $(printf "PAT:%s" "$TOKEN" | base64 -w0)"
+	export CARGO_REGISTRIES_CRATES_MIRROR_TOKEN
+fi

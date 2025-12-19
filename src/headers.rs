@@ -28,7 +28,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::request_ops::RequestOps;
-use crate::typify::{ClientInstance, PoPpTokenPayload, UserInfo};
+use crate::typify::{ClientInstance, UserInfo};
 
 fn to_base64_encoded_json<T: Serialize>(value: &T) -> Result<String> {
     let json = serde_json::to_string_pretty(&value)?;

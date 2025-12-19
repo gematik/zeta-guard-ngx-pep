@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+
+set -e
+set -u
+set -o pipefail
+
+printf "!! cargo fetch\n\n"
+cargo fetch --locked
+
+common_args=(
+	--frozen
+	# exclude "devel"
+	--no-default-features
+)
+
+printf "!! cargo build\n\n"
+cargo build "${common_args[@]}" --release --lib
+
+printf "!! clippy\n\n"
+cargo clippy "${common_args[@]}" --release --lib
+
+printf "!! clippy json\n\n"
+cargo clippy "${common_args[@]}" --release --lib --message-format json >clippy.json
+
+printf "!! tests\n\n"
+RUST_BACKTRACE=1 cargo llvm-cov --lib "${common_args[@]}"
+
+printf "!! code coverage\n\n"
+cargo llvm-cov "${common_args[@]}" \
+	report --lcov --output-path coverage.lcov || :
+
+printf "!! write .pkg-version\n\n"
+cargo metadata --format-version 1 | jq -r '.packages | map(select(.name == "ngx_pep")) | .[0].version' \
+	>.pkg-version || :
+
+printf "!! write ngx_pep.cdx.json\n\n"
+cargo cyclonedx -f json -a

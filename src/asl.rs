@@ -26,10 +26,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use anyhow::{Result, anyhow, bail};
-use asl::{
-    decrypt_request, encrypt_response, finish_handshake, 
-    initiate_handshake,
-};
+use asl::{decrypt_request, encrypt_response, finish_handshake, initiate_handshake, Environment};
 use async_compat::Compat;
 use http::Method;
 use nginx_sys::{NGX_LOG_ERR, ngx_cycle};
@@ -111,9 +108,14 @@ async fn handle_subrequest(request: &mut Request, cid: String, body: &[u8]) -> R
         return Ok(Response::new(HTTPStatus(406)));
     }
 
+    let config = SESSION_CACHE.server_config();
+    if config.env == Environment::Production && request.get_header_in("ZETA-ASL-nonPU-Tracing").is_some() {
+        return Ok(Response::new(HTTPStatus::FORBIDDEN));
+    }
+
     let session = SESSION_CACHE.continue_session(&cid).await?;
     // TODO: validate ctr — how?
-    let (ctr, inner) = decrypt_request(SESSION_CACHE.server_config(), &session, body)?;
+    let (ctr, inner) = decrypt_request(config, &session, body)?;
 
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut inner_request = httparse::Request::new(&mut headers);

@@ -2,6 +2,11 @@
 
 # Release Notes ZETA PEP
 
+## Release 0.2.5
+
+### changed:
+- full implementation of ASL test mode (see A_26942 and A_26943)
+
 ## Release 0.2.4
 
 ### added:

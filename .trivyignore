@@ -16,3 +16,5 @@ CVE-2025-7425
 # zlib1g — vulnerability affects MiniZip tool for zip files, which are not being used
 #          nginx only uses gzip-functionality from zlib1g
 CVE-2023-45853
+# gnupg - not used
+CVE-2025-68973

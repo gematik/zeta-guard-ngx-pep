@@ -286,6 +286,9 @@ static SERVER_SIG_SK_HEX: &str = "30770201010420bd37298383eb3d620da1ed367a9a0898
 static SERVER_SIG_CERT_HEX: &str = "3082017330820119a003020102021450fe87e05a3c00463e0a18387c3dbda92f4828fd300a06082a8648ce3d040302300f310d300b06035504030c0474657374301e170d3235313033303039333430395a170d3335313032383039333430395a300f310d300b06035504030c04746573743059301306072a8648ce3d020106082a8648ce3d030107034200048bf54a359336ad068fc57282552526875f0884a8d5b3bc09716edcaa7e0b4443084eea5f2445fea6cfe558edf4a9efea2732efa2d5888b66be9b5b08101448c2a3533051301d0603551d0e0416041461dd7c90fc9bdf91f8b4c3eaa0ceda715bd523f5301f0603551d2304183016801461dd7c90fc9bdf91f8b4c3eaa0ceda715bd523f5300f0603551d130101ff040530030101ff300a06082a8648ce3d0403020348003045022100d0621bf50aee3ff00713393825f2993adc88a091d1f227e8a2319bc7a33b0e4302201a0276dcceabbf9e7dae50669d9186663f3f00a954e1d9eb87b844bd8733cfe4";
 
 extern "C" fn shared_zone_init(shm_zone: *mut ngx_shm_zone_t, _data: *mut c_void) -> ngx_int_t {
+    let main_conf: &MainConfig =
+        unsafe { shm_zone.as_ref().expect("shm_zone").data.cast::<MainConfig>().as_ref() }.expect("MainConfig");
+
     let mut pool =
         unsafe { SlabPool::from_shm_zone(shm_zone.as_ref().expect("shm_zone")) }.expect("SlabPool");
 
@@ -301,8 +304,10 @@ extern "C" fn shared_zone_init(shm_zone: *mut ngx_shm_zone_t, _data: *mut c_void
             )
             .unwrap();
 
+        let asl_env = if main_conf.asl_testing { Environment::Testing } else { Environment::Production };
+        println!("asl environment: {:?}", asl_env);
         let config = MaybeUninit::new(
-            Config::new_with_keys(Environment::Testing, signed_keys, private_keys).unwrap(),
+            Config::new_with_keys(asl_env, signed_keys, private_keys).unwrap(),
         );
         let shared = Shared { map, config };
 

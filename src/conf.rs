@@ -114,6 +114,7 @@ pub struct MainConfig {
     pub http_client_connect_timeout: Duration,
     pub http_client_timeout: Duration,
     pub http_client_accept_invalid_certs: bool,
+    pub asl_testing: bool,
     pub shm_zone: *mut ngx_shm_zone_t,
 }
 
@@ -129,6 +130,7 @@ impl Default for MainConfig {
             http_client_connect_timeout: Duration::from_secs(2),
             http_client_timeout: Duration::from_secs(10),
             http_client_accept_invalid_certs: false,
+            asl_testing: false,
             shm_zone: ptr::null_mut(),
         }
     }
@@ -246,6 +248,22 @@ conf_handler!(pep_popp_issuer, MainConfig, |conf: &mut MainConfig,
 
     Ok(ngx::core::NGX_CONF_OK)
 });
+
+conf_handler!(
+    pep_asl_testing,
+    MainConfig,
+    |conf: &mut MainConfig, val: &str| -> anyhow::Result<*mut c_char> {
+        if val.eq_ignore_ascii_case("on") {
+            conf.asl_testing = true;
+        } else if val.eq_ignore_ascii_case("off") {
+            conf.asl_testing = false;
+        } else {
+            anyhow::bail!("Unable to parse asl_testing: {val}")
+        }
+
+        Ok(ngx::core::NGX_CONF_OK)
+    }
+);
 
 // LOCATION
 
@@ -413,7 +431,7 @@ conf_handler!(
     }
 );
 
-pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 17] = [
+pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 18] = [
     main_command!("pep_pdp_issuer", pep_pdp_issuer),
     main_command!("pep_popp_issuer", pep_popp_issuer),
     main_command!("pep_http_client_idle_timeout", pep_http_client_idle_timeout),
@@ -434,6 +452,7 @@ pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 17] = [
         "pep_http_client_accept_invalid_certs",
         pep_http_client_accept_invalid_certs
     ),
+    main_command!("pep_asl_testing", pep_asl_testing),
     loc_command!("pep", pep),
     loc_command!("pep_require_aud", pep_require_aud),
     loc_command!("pep_require_scope", pep_require_scope),

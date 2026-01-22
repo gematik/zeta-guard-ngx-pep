@@ -42,7 +42,7 @@ http \{
     # pep_http_client_connect_timeout 2; # s
     # pep_http_client_timeout 10; # s
     pep_http_client_accept_invalid_certs on;
-
+    pep_asl_testing on;
 
     # These options are location configs, but can be declared in http and server levels
     # also to be inherited in lower levels.

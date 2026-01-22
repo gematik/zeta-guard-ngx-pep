@@ -21,7 +21,7 @@
 # #L%
 [package]
 name = "ngx_pep"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.91.1"

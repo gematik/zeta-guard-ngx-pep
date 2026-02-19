@@ -2,7 +2,7 @@
  * #%L
  * ngx_pep
  * %%
- * (C) akquinet tech@Spree GmbH, 2025, licensed for gematik GmbH
+ * (C) tech@Spree GmbH, 2026, licensed for gematik GmbH
  * %%
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,10 +24,7 @@
 
 use anyhow::{Result, anyhow, bail};
 use http::Uri;
-use nginx_sys::{ngx_http_core_main_conf_t, ngx_http_core_srv_conf_t};
-use ngx::http::{
-    HttpModuleLocationConf, HttpModuleMainConf, HttpModuleServerConf, NgxHttpCoreModule, Request,
-};
+use ngx::http::{HttpModuleLocationConf, HttpModuleMainConf, Request};
 
 use crate::Module;
 use crate::conf::{LocationConfig, MainConfig};
@@ -59,19 +56,20 @@ fn split_authority(authority: &str) -> Result<(&str, Option<u16>)> {
 
     // IPv6 literal: [2001:db8::1]:443
     if authority.starts_with('[')
-        && let Some(end) = authority.find(']') {
-            let host = &authority[..=end]; // include brackets
-            let rest = &authority[end + 1..];
-            if let Some(port_str) = rest.strip_prefix(':') {
-                if let Ok(port) = port_str.parse::<u16>() {
-                    return Ok((host, Some(port)));
-                } else {
-                    // port indicated, but unparseable
-                    return Err(anyhow!("unparseable port {port_str}"));
-                }
+        && let Some(end) = authority.find(']')
+    {
+        let host = &authority[..=end]; // include brackets
+        let rest = &authority[end + 1..];
+        if let Some(port_str) = rest.strip_prefix(':') {
+            if let Ok(port) = port_str.parse::<u16>() {
+                return Ok((host, Some(port)));
+            } else {
+                // port indicated, but unparseable
+                return Err(anyhow!("unparseable port {port_str}"));
             }
-            return Ok((host, None));
         }
+        return Ok((host, None));
+    }
 
     // host or host:port
     if let Some(idx) = authority.rfind(':') {
@@ -112,7 +110,7 @@ fn try_parse_forwarded(forwarded: Option<&str>) -> Option<(&str, &str, Option<u1
         }
         match host {
             Some(host) => match split_authority(host) {
-                Ok((host, port)) => Some((proto.unwrap_or("https"), host, port)),
+                Ok((host, port)) => Some((proto.unwrap_or("http"), host, port)),
                 Err(_) => None,
             },
             None => None,
@@ -130,7 +128,7 @@ fn try_parse_xforwarded<'a>(
         None => xfh.trim(),
     })
     .map(|host| {
-        let xfpr = xfpr.unwrap_or("https");
+        let xfpr = xfpr.unwrap_or("http");
         let proto = match xfpr.split_once(",") {
             Some((proto, _)) => proto.trim(),
             None => xfpr.trim(),
@@ -164,7 +162,7 @@ fn try_parse_xforwarded<'a>(
 
 fn try_parse_host(host: Option<&str>) -> Option<(&str, &str, Option<u16>)> {
     host.and_then(|host| match split_authority(host.trim()) {
-        Ok((host, port)) => Some(("https", host, port)),
+        Ok((host, port)) => Some(("http", host, port)),
         Err(_) => None,
     })
 }
@@ -174,18 +172,16 @@ pub fn normalized_uri(scheme: &str, host: &str, port: Option<u16>, path: &str) -
     let host = host.to_ascii_lowercase();
     let port = port
         .or(match scheme.as_str() {
-            "https" => Some(443),
-            "http" => Some(80),
+            "https" | "wss" => Some(443),
+            "http" | "ws" => Some(80),
             _ => None,
         })
-        .ok_or_else(|| anyhow!("unknown scheme {scheme} and no port specified"))?;
+        .ok_or_else(|| anyhow!("unknown scheme {scheme}, and no port specified"))?;
 
     let uri = match (scheme.as_str(), port) {
-        ("https", 443) => format!("https://{}{}", host, path),
-        ("https", port) => format!("https://{}:{}{}", host, port, path),
-        ("http", 80) => format!("http://{}{}", host, path),
-        ("http", port) => format!("http://{}:{}{}", host, port, path),
-        (scheme, port) => format!("{}://{}:{}{}", scheme, host, port, path),
+        (scheme @ ("https" | "wss"), 443) => format!("{scheme}://{host}{path}"),
+        (scheme @ ("http" | "ws"), 80) => format!("{scheme}://{host}{path}"),
+        (scheme, port) => format!("{scheme}://{host}:{port}{path}"),
     };
     Ok(uri.parse()?)
 }
@@ -287,8 +283,6 @@ impl RequestOps for ngx::http::Request {
 pub trait ConfigOps {
     fn main_config(&self) -> Result<&MainConfig>;
     fn location_config(&self) -> Result<&LocationConfig>;
-    fn ngx_main_config(&self) -> Result<&ngx_http_core_main_conf_t>;
-    fn ngx_server_config(&self) -> Result<&ngx_http_core_srv_conf_t>;
 }
 
 impl ConfigOps for Request {
@@ -298,15 +292,6 @@ impl ConfigOps for Request {
 
     fn location_config(&self) -> Result<&LocationConfig> {
         Module::location_conf(self).ok_or_else(|| anyhow::anyhow!("no location config"))
-    }
-
-    fn ngx_main_config(&self) -> Result<&ngx_http_core_main_conf_t> {
-        NgxHttpCoreModule::main_conf(self).ok_or_else(|| anyhow::anyhow!("no nginx main config"))
-    }
-
-    fn ngx_server_config(&self) -> Result<&ngx_http_core_srv_conf_t> {
-        NgxHttpCoreModule::server_conf(self)
-            .ok_or_else(|| anyhow::anyhow!("no nginx location config"))
     }
 }
 
@@ -326,14 +311,14 @@ mod tests {
                 "Forwarded: by=someone;for=client;host=some_host;proto=http"
             ))
         );
-        // default proto https
+        // default proto http
         assert_eq!(
-            Some(("https", "some_host", None)),
+            Some(("http", "some_host", None)),
             try_parse_forwarded(Some("Forwarded: by=someone;for=client;host=some_host"))
         );
         // with port
         assert_eq!(
-            Some(("https", "some_host", Some(1234))),
+            Some(("http", "some_host", Some(1234))),
             try_parse_forwarded(Some("Forwarded: by=someone;for=client;host=some_host:1234"))
         );
         // None with unparseable port
@@ -345,7 +330,7 @@ mod tests {
         );
         // multi-valued
         assert_eq!(
-            Some(("https", "some_host", Some(1234))),
+            Some(("http", "some_host", Some(1234))),
             try_parse_forwarded(Some(
                 "Forwarded: by=someone;for=client;host=some_host:1234,by=someone-else;for=someone;host=weird_host:777"
             ))
@@ -360,9 +345,9 @@ mod tests {
             None,
             try_parse_xforwarded(Some("https"), None, Some("1234"))
         );
-        // default https
+        // default http
         assert_eq!(
-            Some(("https", "host", None)),
+            Some(("http", "host", None)),
             try_parse_xforwarded(None, Some("host"), None)
         );
         // http if specified
@@ -372,10 +357,9 @@ mod tests {
         );
         // with port
         assert_eq!(
-            Some(("https", "host", Some(1234))),
+            Some(("http", "host", Some(1234))),
             try_parse_xforwarded(None, Some("host"), Some("1234"))
         );
-        let x = try_parse_xforwarded(None, Some("host"), Some("weird"));
         // ignore unparseable port
         assert_eq!(
             Some(("https", "host", None)),
@@ -401,11 +385,9 @@ mod tests {
     #[test]
     fn test_host() {
         assert_eq!(None, try_parse_host(None));
-        // always https
-        assert_eq!(Some(("https", "host", None)), try_parse_host(Some("host")));
         // with port
         assert_eq!(
-            Some(("https", "host", Some(123))),
+            Some(("http", "host", Some(123))),
             try_parse_host(Some("host:123"))
         );
         // with unparseable port
@@ -443,6 +425,32 @@ mod tests {
         assert_eq!(
             "http://host:123/path".parse::<Uri>()?,
             normalized_uri("http", "host", Some(123), "/path")?
+        );
+
+        assert_eq!(
+            "ws://host/path".parse::<Uri>()?,
+            normalized_uri("ws", "host", Some(80), "/path")?
+        );
+        assert_eq!(
+            "ws://host/path".parse::<Uri>()?,
+            normalized_uri("ws", "host", None, "/path")?
+        );
+        assert_eq!(
+            "ws://host:123/path".parse::<Uri>()?,
+            normalized_uri("ws", "host", Some(123), "/path")?
+        );
+
+        assert_eq!(
+            "wss://host/path".parse::<Uri>()?,
+            normalized_uri("wss", "host", Some(443), "/path")?
+        );
+        assert_eq!(
+            "wss://host/path".parse::<Uri>()?,
+            normalized_uri("wss", "host", None, "/path")?
+        );
+        assert_eq!(
+            "wss://host:123/path".parse::<Uri>()?,
+            normalized_uri("wss", "host", Some(123), "/path")?
         );
         Ok(())
     }

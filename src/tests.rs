@@ -2,7 +2,7 @@
  * #%L
  * ngx_pep
  * %%
- * (C) akquinet tech@Spree GmbH, 2025, licensed for gematik GmbH
+ * (C) tech@Spree GmbH, 2026, licensed for gematik GmbH
  * %%
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,15 +24,12 @@
 
 use ambassador::Delegate;
 use anyhow::Ok;
-use nginx_sys::{ngx_http_core_main_conf_t, ngx_http_core_srv_conf_t};
 use rstest::fixture;
 
 use crate::conf::{LocationConfig, MainConfig};
 use crate::jwk_cache::reset_jwk_cache_mock;
 use crate::request_ops::*;
 use crate::request_ops::{ConfigOps, RequestOps};
-
-mod stubs;
 
 #[derive(Delegate)]
 #[delegate(RequestOps, target = "request")]
@@ -49,12 +46,6 @@ impl ConfigOps for RequestMock {
 
     fn location_config<'a>(&'a self) -> anyhow::Result<&'a LocationConfig> {
         Ok(&self.lcfg)
-    }
-    fn ngx_main_config<'a>(&'a self) -> anyhow::Result<&'a ngx_http_core_main_conf_t> {
-        todo!()
-    }
-    fn ngx_server_config<'a>(&'a self) -> anyhow::Result<&'a ngx_http_core_srv_conf_t> {
-        todo!()
     }
 }
 
@@ -82,6 +73,11 @@ impl Default for RequestMock {
 #[fixture]
 pub async fn request_mock() -> RequestMock {
     reset_jwk_cache_mock().await;
+    let mut mock = RequestMock::default();
 
-    RequestMock::default()
+    mock.request
+        .expect_ensure_header_out()
+        .returning(|_name, _value| Ok(()));
+
+    mock
 }

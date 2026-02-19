@@ -2,7 +2,7 @@
  * #%L
  * ngx_pep
  * %%
- * (C) akquinet tech@Spree GmbH, 2025, licensed for gematik GmbH
+ * (C) tech@Spree GmbH, 2026, licensed for gematik GmbH
  * %%
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use anyhow::{Result, anyhow, bail};
-use asl::{decrypt_request, encrypt_response, finish_handshake, initiate_handshake, Environment};
+use asl::{Environment, decrypt_request, encrypt_response, finish_handshake, initiate_handshake};
 use async_compat::Compat;
 use http::Method;
 use nginx_sys::{NGX_LOG_ERR, ngx_cycle};
@@ -66,8 +66,8 @@ async fn handle_m1(request: &mut Request, body: &[u8]) -> Result<Response> {
         return Ok(Response::new(HTTPStatus(406)));
     }
 
-    let (handshake_state, m2) =
-        initiate_handshake(SESSION_CACHE.server_config(), body, &[]).map_err(|e| anyhow!("{e:?}"))?;
+    let (handshake_state, m2) = initiate_handshake(SESSION_CACHE.server_config(), body, &[])
+        .map_err(|e| anyhow!("{e:?}"))?;
     let cid: String = SESSION_CACHE.init_handshake(handshake_state).await?;
 
     ngx_log_debug_http!(request, "asl: new cid {}, M2 {}b", cid, m2.len());
@@ -108,14 +108,17 @@ async fn handle_subrequest(request: &mut Request, cid: String, body: &[u8]) -> R
         return Ok(Response::new(HTTPStatus(406)));
     }
 
-    let config = SESSION_CACHE.server_config();
-    if config.env == Environment::Production && request.get_header_in("ZETA-ASL-nonPU-Tracing").is_some() {
-        return Ok(Response::new(HTTPStatus::FORBIDDEN));
+    let asl_config = SESSION_CACHE.server_config();
+
+    if asl_config.env == Environment::Production
+        && request.get_header_in("ZETA-ASL-nonPU-Tracing").is_some()
+    {
+        bail!("ZETA-ASL-nonPU-Tracing in Production");
     }
 
     let session = SESSION_CACHE.continue_session(&cid).await?;
     // TODO: validate ctr — how?
-    let (ctr, inner) = decrypt_request(config, &session, body)?;
+    let (ctr, inner) = decrypt_request(asl_config, &session, body)?;
 
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut inner_request = httparse::Request::new(&mut headers);
@@ -178,7 +181,12 @@ async fn handle_subrequest(request: &mut Request, cid: String, body: &[u8]) -> R
     // body
     response_bytes.extend_from_slice(&subresponse.bytes().await?);
 
-    let response = encrypt_response(SESSION_CACHE.server_config(), &session, ctr, &response_bytes)?;
+    let response = encrypt_response(
+        SESSION_CACHE.server_config(),
+        &session,
+        ctr,
+        &response_bytes,
+    )?;
 
     // TODO: errors become application/cbor with a structure given in A_26924, and map http reponse
     // codes

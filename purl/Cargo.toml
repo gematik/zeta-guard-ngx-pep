@@ -1,5 +1,5 @@
 # #%L
-# libasl
+# ngx_pep
 # %%
 # (C) tech@Spree GmbH, 2026, licensed for gematik GmbH
 # %%
@@ -19,18 +19,36 @@
 #
 # For additional notes and disclaimer from gematik and in case of changes by gematik find details in the "Readme" file.
 # #L%
-
 [package]
-name = "asl"
-version = "0.2.1"
-edition = "2024"
+name = "purl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
-libcrux = { version = "0.0.2-alpha.3", features = ["rand"] }
-libcrux-ml-kem = { version = "0.0.2-alpha.3" }
+anyhow = "1.0"
+ngx_pep = { path = "..", features = ["client"] }
+argp = "0.4"
+indicatif = "0.18"
+p256 = "*"
+base64ct = "*"
+futures = "*"
+hex = "*"
+http = "*"
+httparse = "*"
+reqwest = "*"
+serde = "*"
+serde_json = "*"
+sha2 = "*"
+tokio = { version = "*", features = ["macros", "fs", "rt", "rt-multi-thread", "process"] }
+asl = { path = "../libasl" }
+
+[build-dependencies]
+anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_cbor = "0.11"
-serde_bytes = "0.11"
-uuid = { version = "1.18", features = ["v4"] }
-hex = "0.4"
-thiserror = "2.0"
+serde_yaml_ng = "0.10"
+typify = "0.5"
+schemars = "0.8"
+prettyplease = "0.2"
+syn = "2.0"

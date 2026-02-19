@@ -2,7 +2,7 @@
  * #%L
  * ngx_pep
  * %%
- * (C) akquinet tech@Spree GmbH, 2025, licensed for gematik GmbH
+ * (C) tech@Spree GmbH, 2026, licensed for gematik GmbH
  * %%
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,10 +37,7 @@ pub trait JwkCacheOps {
 #[cfg(not(test))]
 mod prod {
     use anyhow::Context;
-    
     use jsonwebtoken::jwk::JwkSet;
-    
-    
 
     use {
         super::JwkCacheOps,

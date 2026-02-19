@@ -34,6 +34,79 @@ After installation, go to Settings → Direnv Settings and enable both:
 
 `.envrc` loads `.envrc.local` if present (developer-specific, .gitignore'd)
 
+## integration tests, purl, cargo-nextest
+
+You should install [cargo-nextest](https://nexte.st/):
+e.g. by: `cargo install cargo-nextest`.
+
+This is a replacement for `cargo test` with a different process model: one process per
+test (function).
+
+`.config/nextest.toml` has some useful declarations, most notably a setup-script to
+rebuild the nginx module and provision `./prefix` as needed before trying to run
+integration tests, as they don't have a direct compile-time dependency on the cdylib
+and wouldn't trigger it to rebuild on changes.
+
+Some usage examples:
+```sh
+    # run everything
+    cargo nextest run --workspace
+    # only run libasl tests and display stdout even for successful tests
+    cargo nextest run -p asl --no-capture
+    # only run unit tests
+    cargo nextest run --workspace -E '!kind(test)'
+    # test (function) name containing access, in the main crate
+    cargo nextest run access
+```
+
+To run the integration tests, the following environment variables must be set:
+
+To use the "purl" utility, the following environment variables must be set:
+
+|env               |example                                                                         |
+|---               |---                                                                             |
+|IT_AUTH           |https://zeta-cd.westeurope.cloudapp.azure.com/auth                              |
+|IT_P12            |../smb-keystore.p12                                                             |
+|IT_P12_PASS       |ichangedit                                                                      |
+|IT_POPP_P12       |../popp-token-generator/src/main/resources/popp-token-Server-Sim-nist-komp61.p12|
+|IT_POPP_P12_ALIAS |alias                                                                           |
+|IT_POPP_P12_PASS  |00                                                                              |
+
+For easier usage of the `purl` tool, these can also be defined:
+
+|env           |example                                            |
+|---           |---                                                |
+|PURL_AUTH     |https://zeta-cd.westeurope.cloudapp.azure.com/auth |
+|PURL_P12      |../smb-keystore.p12                                |
+|PURL_P12_PASS |ichangedit                                         |
+
+
+Note that `PURL_AUTH` only determines the environment to register the client and
+exchange access tokens, the request target for the `curl` and `asl` subcommands can be
+different.
+
+In combination with setting `pep_pdp_issuer` and `pep_require_aud` in the
+local nginx.conf to the same values as `PURL_AUTH`, one can test a remote client
+registration locally. See also `misc/nginx.conf.tpl` and `build.rs` for template logic.
+
+For technical reasons the integration tests spawn multiple nginx processes on unique
+ports and with unique temporary directories. The configurations get written to
+`prefix/conf/test-{port}.conf` by build.rs. The port range `8003..=8010` is provisioned
+like this currently, and the "max-threads" sempahore is set to 8 in
+`.config/nextest.toml` accordingly.
+
+For that reason, it can be a bit inconvenient to follow test logs, but a multi-file tail
+can help:
+
+`tail -F -n 20 prefix/test-*/logs/*`
+
+In CI, the nginx processes must run as (fake) root to be able to write out coverage data
+(as the main build is running as root in a container). The test configs therefore set
+`user root;`. This only has an effect when the master is started as root, i.e. not when
+running the tests locally. So the following warning can be ignored:
+`nginx: [warn] the "user" directive makes sense only if the master process runs with super-user privileges, ignored in …/prefix/conf/test-8004.conf:13`
+
+
 # nginx
 
 Via nginx-sys' "vendored" feature, a nginx source tree is managed by the nginx-source
@@ -53,7 +126,7 @@ the debug variant of the ngx_pep module enabled, and debug logging
 
 ## License
 
-(C) akquinet tech@Spree GmbH, 2025, licensed for gematik GmbH
+(C) tech@Spree GmbH, 2026, licensed for gematik GmbH
 
 Apache License, Version 2.0
 

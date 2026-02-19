@@ -2,7 +2,7 @@
  * #%L
  * ngx_pep
  * %%
- * (C) akquinet tech@Spree GmbH, 2025, licensed for gematik GmbH
+ * (C) tech@Spree GmbH, 2026, licensed for gematik GmbH
  * %%
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -335,13 +335,14 @@ async fn verify_dpop(
 
 async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> Result<Status> {
     let now = get_current_timestamp();
+
+    ensure_api_version_header_out(request)?;
     let main_config = request.main_config()?;
-    let location_config = request.location_config()?.clone();
+    let location_config = request.location_config()?;
 
     let access_token = request.get_authorization_token()?;
     let ath = Sha256::digest(&access_token).to_vec();
-    let access_token =
-        verify_acess_token(main_config, &location_config, &access_token, now).await?;
+    let access_token = verify_acess_token(main_config, location_config, &access_token, now).await?;
 
     let dpop = request
         .get_header_in("dpop")
@@ -350,7 +351,7 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> Result<Statu
     let uri: Uri = request.self_uri()?;
 
     verify_dpop(
-        &location_config,
+        location_config,
         &access_token.claims,
         &ath,
         dpop,
@@ -363,14 +364,12 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> Result<Statu
     if location_config.require_popp.unwrap_or(true) {
         match request.get_header_in("popp") {
             Some(popp) => {
-                let token_data = verify_popp(&location_config, popp, now).await?;
+                let token_data = verify_popp(location_config, popp, now).await?;
                 ensure_popp_token_header_in(request, token_data.claims)?;
             }
             None => bail!("PoPP header missing"),
         }
     }
-
-    ensure_api_version_header_out(request)?;
 
     let udat = access_token.claims.udat.context("missing udat")?;
     ensure_user_info_header_in(
@@ -543,7 +542,7 @@ mod tests {
     use super::*;
 
     static EC_PRIVATE_KEY: LazyLock<EncodingKey> = LazyLock::new(|| {
-        EncodingKey::from_ec_pem(include_bytes!("./tests/ec-private.pem")).expect("ec")
+        EncodingKey::from_ec_pem(include_bytes!("./client/ec-private.pem")).expect("ec")
     });
 
     impl Default for AccessTokenPayload {

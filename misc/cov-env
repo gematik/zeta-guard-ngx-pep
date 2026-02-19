@@ -1,0 +1,27 @@
+#!/usr/bin/env false
+#              ^ this script needs to be sourced, not run: `. misc/cov-env`
+# vim: ft=bash
+# shellcheck shell=bash
+#                  (tested: bash, zsh)
+
+if [[ -z ${CARGO_LLVM_COV:-} ]]; then
+  _OLD_RUSTFLAGS="${RUSTFLAGS:-}"
+  # shellcheck disable=SC1090
+  . <(cargo llvm-cov show-env --sh)
+  cargo llvm-cov clean --workspace
+
+  cov-env-deactivate() {
+    if [[ -n ${_OLD_RUSTFLAGS:-} ]]; then
+      RUSTFLAGS=$_OLD_RUSTFLAGS
+    else
+      unset RUSTFLAGS
+    fi
+    unset LLVM_PROFILE_FILE
+    unset CARGO_LLVM_COV_SHOW_ENV
+    unset CARGO_LLVM_COV_TARGET_DIR
+    unset CARGO_LLVM_COV_BUILD_DIR
+    unset CARGO_LLVM_COV
+  }
+
+  hash -r 2>/dev/null || :
+fi

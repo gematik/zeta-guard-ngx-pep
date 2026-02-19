@@ -13,6 +13,31 @@ common_args=(
 	--no-default-features
 )
 
+export RUST_BACKTRACE=1
+
+export NGX_CONFIGURE_ARGS="${NGX_CONFIGURE_ARGS:+"$NGX_CONFIGURE_ARGS "}--with-debug --prefix=$PWD/prefix"
+
+NGX_CFLAGS="$(pkg-config --cflags openssl zlib)"
+export NGX_CFLAGS
+NGX_LDFLAGS="$(pkg-config --libs openssl zlib)"
+export NGX_LDFLAGS
+
+printf "!! tests\n\n"
+# shellcheck disable=SC1091
+. /usr/local/share/cov-env
+
+set +e
+cargo nextest run --workspace ${NEXTEST_FILTERSET:+--filterset "$NEXTEST_FILTERSET"}
+test_result=$?
+set -e
+
+grep . prefix/test-*/logs/* || :
+
+cargo llvm-cov report
+cargo llvm-cov report --lcov --output-path coverage.lcov || :
+cargo llvm-cov clean --workspace || :
+cov-env-deactivate
+
 printf "!! cargo build\n\n"
 cargo build "${common_args[@]}" --release --lib
 
@@ -22,16 +47,11 @@ cargo clippy "${common_args[@]}" --release --lib
 printf "!! clippy json\n\n"
 cargo clippy "${common_args[@]}" --release --lib --message-format json >clippy.json
 
-printf "!! tests\n\n"
-RUST_BACKTRACE=1 cargo llvm-cov --lib "${common_args[@]}"
-
-printf "!! code coverage\n\n"
-cargo llvm-cov "${common_args[@]}" \
-	report --lcov --output-path coverage.lcov || :
-
 printf "!! write .pkg-version\n\n"
 cargo metadata --format-version 1 | jq -r '.packages | map(select(.name == "ngx_pep")) | .[0].version' \
 	>.pkg-version || :
 
 printf "!! write ngx_pep.cdx.json\n\n"
 cargo cyclonedx -f json -a
+
+exit $test_result

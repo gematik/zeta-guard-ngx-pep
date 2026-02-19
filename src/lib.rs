@@ -2,7 +2,7 @@
  * #%L
  * ngx_pep
  * %%
- * (C) akquinet tech@Spree GmbH, 2025, licensed for gematik GmbH
+ * (C) tech@Spree GmbH, 2026, licensed for gematik GmbH
  * %%
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -59,10 +59,17 @@ mod request_ops;
 mod response;
 mod session_cache;
 
-// contains test helpers and nginx stubs for tests — the harness is built as a binary, which means
-// that the linker requires all symbols to be present.
 #[cfg(test)]
 mod tests;
+
+// contains nginx stubs for tests and purl which are built as a binary, which means that the linker
+// requires all symbols to be present.
+#[cfg(any(test, feature = "stubs"))]
+mod stubs;
+
+// contains client code used in purl and integration tests
+#[cfg(any(test, feature = "client"))]
+pub mod client;
 
 #[allow(dead_code, clippy::all)]
 mod typify {
@@ -223,9 +230,39 @@ http_request_handler!(asl_handler, asl::handler);
 pub static CLIENT: OnceLock<Client> = OnceLock::new();
 
 #[cfg(not(test))]
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(not(test))]
+#[inline]
+fn format_iso8601(t: SystemTime) -> String {
+    let dur = t.duration_since(UNIX_EPOCH).unwrap();
+    let t: libc::time_t = dur.as_secs().try_into().unwrap();
+    let millis = dur.subsec_millis();
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let tm = unsafe {
+        libc::gmtime_r(&t, tm.as_mut_ptr());
+        tm.assume_init()
+    };
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        millis,
+    )
+}
+
+#[cfg(not(test))]
 extern "C" fn ngx_http_pep_init_worker(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     use reqwest::ClientBuilder;
     use reqwest::redirect::Policy;
+
+    let ts = format_iso8601(SystemTime::now());
+    log_debug!("init worker @ {ts}",);
 
     let cycle = unsafe { &mut *cycle };
     let process = unsafe { nginx_sys::ngx_process } as u32;
@@ -238,8 +275,8 @@ extern "C" fn ngx_http_pep_init_worker(cycle: *mut ngx_cycle_t) -> ngx_int_t {
 
     let conf = Module::main_conf(cycle).expect("main conf");
 
-    log_debug!("pep: conf={conf:#?}");
-    log_debug!("pep: initializing http client…");
+    log_debug!("conf={conf:#?}");
+    log_debug!("initializing http client…");
     CLIENT.get_or_init(|| {
         ClientBuilder::new()
             .redirect(Policy::none())
@@ -255,7 +292,7 @@ extern "C" fn ngx_http_pep_init_worker(cycle: *mut ngx_cycle_t) -> ngx_int_t {
             .expect("reqwest client")
     });
 
-    log_debug!("pep: initializing jwk cache…");
+    log_debug!("initializing jwk cache…");
     JwkCache::init(conf);
 
     Status::NGX_OK.into()

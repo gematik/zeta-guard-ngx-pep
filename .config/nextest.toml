@@ -1,0 +1,26 @@
+experimental = ["setup-scripts"]
+
+# Run build.rs populate prefix/ and build cdylib
+# This is required for integration tests, which start nginx in a configuration for
+# tests, but have no rust-code-level relationship to the lib otherwise, and would not
+# trigger needed rebuilds.
+[scripts.setup.build-nginx-module]
+command = [
+  "/usr/bin/env",
+  "bash",
+  "-c",
+  "printf \"Building nginx module...\\n\\n\"; LLVM_PROFILE_FILE=/dev/null cargo build --lib",
+]
+capture-stdout = false
+capture-stderr = false
+
+[test-groups]
+# semaphore because we only provision 8 nginx prefix dirs in build.rs
+integration = { max-threads = 8 }
+
+[[profile.default.overrides]]
+filter = "kind(test)"
+test-group = "integration"
+[[profile.default.scripts]]
+filter = "kind(test)"
+setup = "build-nginx-module"

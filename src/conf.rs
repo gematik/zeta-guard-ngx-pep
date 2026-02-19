@@ -2,7 +2,7 @@
  * #%L
  * ngx_pep
  * %%
- * (C) akquinet tech@Spree GmbH, 2025, licensed for gematik GmbH
+ * (C) tech@Spree GmbH, 2026, licensed for gematik GmbH
  * %%
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -291,7 +291,7 @@ impl LocationConfig {
     }
     pub fn ppop_validity(&self) -> Duration {
         self.popp_validity
-            .unwrap_or_else(|| Duration::from_secs(31536000)) // TODO: update default
+            .unwrap_or_else(|| Duration::from_secs(31536000)) // TODO: implement quarterly basis
     }
 }
 

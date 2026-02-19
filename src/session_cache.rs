@@ -2,7 +2,7 @@
  * #%L
  * ngx_pep
  * %%
- * (C) akquinet tech@Spree GmbH, 2025, licensed for gematik GmbH
+ * (C) tech@Spree GmbH, 2026, licensed for gematik GmbH
  * %%
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -201,8 +201,15 @@ impl ShmSessionCache {
     }
 
     pub async fn start_session(&'static self, cid: &str, state: SessionState) -> Result<()> {
-        // 1%
-        if fastrand::u8(0..100) == 0 {
+        #[cfg(not(coverage))]
+        // run the cleanup routine with 1% probability
+        let rand = fastrand::u8(0..100);
+
+        #[cfg(coverage)]
+        // always run the cleanup routine when running integration tests
+        let rand = 0u8;
+
+        if rand == 0 {
             tokio::task::spawn_blocking(move || {
                 self.cleanup_expired();
             });
@@ -230,7 +237,7 @@ impl ShmSessionCache {
 
         let result = {
             let map = self.shared.map.read();
-            let entry = map.get(&key).context("missing — {key}")?;
+            let entry = map.get(&key).context(format!("missing — {key}"))?;
 
             match entry {
                 ShmConnectionState::Established(state) => {

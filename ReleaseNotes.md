@@ -2,6 +2,24 @@
 
 # Release Notes ZETA PEP
 
+## Release 0.3.0
+
+### added:
+- Implement integration test harness with code coverage measurements
+  This re-uses client functionality of the purl utility, which has been extracted to the
+  new client module. purl is now a subpackage in the workspace due to crate type
+  requirements.
+
+### changed:
+- Ensure ZETA-API-Version header is set early, so it is always emitted in error cases
+- Added default ports for ws (80) and wss (443) for url normalization (relevant for DPoP
+  token verification)
+- Compile against nginx 1.28.1, upgrade rust to 1.92, and use trixie-based nginx image
+  (from bookworm)
+- Update client code to extract AdmissionSyntax from SMC-B certificate, pass telematik-id
+  to token exchange and provide client-self-assessment, client_statement, and attestation
+  challenge (IT, purl)
+
 ## Release 0.2.5
 
 ### changed:

@@ -9,6 +9,9 @@ CVE-2025-6020
 CVE-2025-64720
 CVE-2025-65018
 CVE-2025-66293
+CVE-2026-22695
+CVE-2026-22801
+CVE-2026-25646
 # libtiff6 — not used
 CVE-2023-52355
 # libxslt1.1 — not used
@@ -18,3 +21,5 @@ CVE-2025-7425
 CVE-2023-45853
 # gnupg - not used
 CVE-2025-68973
+# likely not affected, re-check for final decision
+CVE-2026-0861 exp:2026-02-28

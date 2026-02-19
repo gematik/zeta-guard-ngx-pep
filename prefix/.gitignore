@@ -1,3 +1,7 @@
 /*
 !/.gitignore
 !/modules
+!/html
+/html/*
+!/html/jwks.json
+!/html/empty.json

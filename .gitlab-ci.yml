@@ -25,7 +25,8 @@ default:
   image: $CI_REGISTRY/zeta/devops/ci-images/docker:24.0.5-zeta-0
   tags: [ zeta ]
   services:
-    - name: docker:25.0.5-dind
+    - name: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/docker:25.0.5-dind
+      alias: docker
       variables:
         HEALTHCHECK_TCP_PORT: "2376"
 
@@ -36,11 +37,9 @@ variables:
   DOCKER_TLS_CERTDIR: /certs
   DOCKER_CERT_PATH: $DOCKER_TLS_CERTDIR/client
   DOCKER_TLS_VERIFY: "1"
-  GIT_SUBMODULE_STRATEGY: recursive
-  GIT_SUBMODULE_FORCE_HTTPS: "true"
-  BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.91-slim-bookworm
+  BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.92-slim-bookworm
   # NOTE: must match major.minor of cargo-dependency `nginx-src`
-  BASE_IMAGE: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx:1.28-bookworm-otel"
+  BASE_IMAGE: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx:1.28.1-trixie-otel"
   IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
 
 before_script:
@@ -90,14 +89,24 @@ build:
       paths:
         - "${CI_PROJECT_DIR}/target"
         - "${CI_PROJECT_DIR}/.cargo-home"
+  variables:
+    IT_AUTH: https://zeta-cd.westeurope.cloudapp.azure.com/auth
   script:
     - |
       MIRROR=${AZDO_CRATES_MIRROR_URL:-} \
         TOKEN=${AZDO_CRATES_PAT:-} \
         . /usr/local/bin/cargo-env
 
-      export CARGO_HOME=".cargo-home"
+      export CARGO_HOME="${CI_PROJECT_DIR}/.cargo-home"
       mkdir -p "$CARGO_HOME"
+
+      IT_P12=$(mktemp)
+      export IT_P12
+      base64 -d "$IT_P12_B64" > "$IT_P12"
+
+      IT_POPP_P12=$(mktemp)
+      export IT_POPP_P12
+      base64 -d "$IT_POPP_P12_B64" > "$IT_POPP_P12"
 
       misc/cargo-build
 
@@ -120,19 +129,13 @@ build:
       - coverage.lcov
       - .pkg-version
       - ngx_pep.cdx.json
+      - prefix/test-*/logs
 
 sonarqube:
   stage: test
   # see https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/languages/rust
   before_script: [ ]
   cache:
-    - key: build-$CI_COMMIT_REF_SLUG
-      fallback_keys:
-        - build-$CI_DEFAULT_BRANCH
-        - build-default
-      paths:
-        - "${CI_PROJECT_DIR}/target"
-        - "${CI_PROJECT_DIR}/.cargo-home"
     - key: "${CI_JOB_NAME}"
       paths:
         - "${CI_PROJECT_DIR}/.sonar/cache"
@@ -180,12 +183,12 @@ trigger_helm:
 tag_main:
   stage: publish
   rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: on_success
     # don't trigger for nightly builds — they are supposed to check dependency issues in
     # *previously* built and released images, and not build/tag anything themselves.
     - if: $CI_PIPELINE_SOURCE == "schedule"
       when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
     - when: never
   needs:
     - job: build
@@ -198,7 +201,7 @@ tag_main:
       docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:$CI_DEFAULT_BRANCH"
       docker push "$CI_REGISTRY_IMAGE:$CI_DEFAULT_BRANCH"
 
-publish_sbom:
+publish_artifacts:
   stage: publish
   rules:
     - if: $CI_COMMIT_TAG
@@ -220,7 +223,8 @@ publish_sbom:
   script:
     - git clone https://zeta-sdk:${REPORTING_TOKEN}@tas-devtools-gitlab.spree.de/zeta/reporting.git
     - mkdir -p ./reporting/zeta-guard/ngx_pep/
-    - find . -path ./reporting -prune -o -name 'ngx_pep.cdx.json' -exec cp --parents '{}' ./reporting/zeta-guard/keycloak-zeta/ \;
+    - find . -path ./reporting -prune -o -name 'ngx_pep.cdx.json' -exec cp --parents '{}' ./reporting/zeta-guard/ngx_pep/ \;
+    - find . -path ./reporting -prune -o -name 'coverage.lcov' -exec cp --parents '{}' ./reporting/zeta-guard/ngx_pep/ \;
     - cd reporting
     - git config user.email "ci@tas-devtools-gitlab.spree.de"
     - git config  user.name "ci"

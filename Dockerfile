@@ -1,7 +1,7 @@
 # #%L
 # ngx_pep
 # %%
-# (C) akquinet tech@Spree GmbH, 2025, licensed for gematik GmbH
+# (C) tech@Spree GmbH, 2026, licensed for gematik GmbH
 # %%
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,10 +19,10 @@
 #
 # For additional notes and disclaimer from gematik and in case of changes by gematik find details in the "Readme" file.
 # #L%
-ARG BASE_IMAGE_BUILD="rust:1.91-slim-bookworm"
+ARG BASE_IMAGE_BUILD="rust:1.92-slim-bookworm"
 # NOTE: must match minor nginx version built against, see: `cargo info nginx-src`
 # alpine images might not work well due to musl
-ARG BASE_IMAGE="nginx:1.28-bookworm-otel"
+ARG BASE_IMAGE="nginx:1.28.1-trixie-otel"
 FROM ${BASE_IMAGE_BUILD} AS build-env
 ARG AZDO_CRATES_MIRROR_URL=""
 
@@ -69,12 +69,14 @@ RUN apt-get update && \
     libssl-dev \
     make \
     zlib1g-dev \
+    pkg-config \
     && \
   rm -rf /var/lib/apt/lists/*
 
 RUN rustup component add clippy llvm-tools-preview
 
 COPY misc/cargo-env /usr/local/bin/cargo-env
+COPY misc/cov-env /usr/local/share/cov-env
 
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
@@ -93,6 +95,9 @@ RUN --mount=type=cache,id=cargo-home,target=/usr/local/cargo-home,sharing=locked
 
   printf "!! install cargo-cyclonedx\n\n"
   cargo install cargo-cyclonedx --bins --locked --root /usr/local
+
+  printf "!! install cargo-nextest\n\n"
+  cargo install cargo-nextest --bins --locked --root /usr/local
 SH
 
 FROM build-env AS local-build
@@ -107,10 +112,14 @@ COPY Cargo.toml Cargo.lock /usr/src/ngx_pep/
 COPY build.rs /usr/src/ngx_pep/
 COPY src /usr/src/ngx_pep/src
 COPY libasl /usr/src/ngx_pep/libasl
+COPY misc/nginx.conf.tpl /usr/src/ngx_pep/misc/
+COPY purl /usr/src/ngx_pep/purl
+COPY tests /usr/src/ngx_pep/tests
 
 RUN \
 <<-'SH'
-  /usr/local/bin/cargo-build
+  # don't try to run integration tests for local builds
+  NEXTEST_FILTERSET="!kind(test)" /usr/local/bin/cargo-build
 SH
 
 # gitlab-ci likes to build "locally", copy .so from context

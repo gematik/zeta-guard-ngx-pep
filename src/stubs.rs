@@ -62,6 +62,9 @@ pub static mut ngx_thread_tid: c_int = 0;
 pub static mut ngx_current_msec: c_ulong = 0;
 
 #[unsafe(no_mangle)]
+pub static mut ngx_core_module: *mut c_void = std::ptr::null_mut();
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ngx_log_error_core(
     _level: c_int,
     _log: *mut c_void,

@@ -1,0 +1,12 @@
+[book]
+title = "𝝵-Guard PEP Error Reference"
+language = "en"
+src = "src"
+
+[build]
+build-dir = "out"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "navy"
+no-section-label = true

@@ -22,7 +22,7 @@
  * #L%
  */
 
-use crate::ModuleCtx;
+use crate::error::{ZetaError, ZetaResult};
 use crate::headers::{
     ensure_api_version_header_out, ensure_client_data_header_in, ensure_popp_token_header_in,
     ensure_user_info_header_in,
@@ -30,16 +30,16 @@ use crate::headers::{
 use crate::jwk_cache::JwkCacheOps;
 use crate::request_ops::{ConfigOps, RequestOps, normalized_uri};
 use crate::typify::{
-    AccessTokenPayload, AccessTokenPayloadAud, AccessTokenPayloadCdatPlatformProductId,
-    ClientInstance, DPoPProofJwtPayload, UserInfo,
+    AccessTokenPayload, AccessTokenPayloadAud, AccessTokenPayloadPlatform, ClientData,
+    ClientDataPlatform, DPoPProofJwtPayload, ZetaUserInfo,
 };
+use crate::{ModuleCtx, spawn_compat};
 use crate::{
     conf::{LocationConfig, MainConfig},
     jwk_cache::jwk_cache,
     log_debug,
 };
-use anyhow::{Context, Result, anyhow, bail};
-use async_compat::Compat;
+use anyhow::{Context, anyhow, bail};
 use base64ct::{Base64UrlUnpadded, Encoding};
 use futures::FutureExt;
 use http::Uri;
@@ -54,8 +54,7 @@ use ngx::{
     core::Status,
     http::{HTTPStatus, HttpModuleLocationConf, Request},
 };
-use ngx_tickle::spawn;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::ptr::addr_of_mut;
@@ -63,24 +62,30 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::Module;
 
-async fn verify_acess_token(
+async fn verify_access_token(
     main_config: &MainConfig,
     location_config: &LocationConfig,
     token: &str,
     now: u64,
-) -> Result<TokenData<AccessTokenPayload>> {
-    let header = decode_header(token)?;
+) -> ZetaResult<TokenData<AccessTokenPayload>> {
+    let header = decode_header(token).context("while decoding authorization token header")?;
     let kid = header.kid.ok_or_else(|| anyhow!("no kid"))?;
     if header.alg != Algorithm::ES256 {
-        anyhow::bail!("at: unsupported token alg {:?}", header.alg);
+        return Err(ZetaError::AccessToken(anyhow!(
+            "unsupported token alg {:?}",
+            header.alg
+        )));
     }
 
     let jwk = jwk_cache().get_jwk_pdp(kid).await?;
 
     if jwk.common.key_algorithm != Some(KeyAlgorithm::ES256) {
-        anyhow::bail!("at: unsupported jwk alg: {:?}", jwk.common.key_algorithm);
+        return Err(ZetaError::AccessToken(anyhow!(
+            "unsupported jwk alg: {:?}",
+            jwk.common.key_algorithm
+        )));
     }
-    let key = DecodingKey::from_jwk(&jwk)?;
+    let key = DecodingKey::from_jwk(&jwk).context("while constructing DecodingKey from jwk")?;
 
     // validate
     let mut validation = Validation::new(Algorithm::ES256);
@@ -97,18 +102,23 @@ async fn verify_acess_token(
     // iat ourselves. Technically, if both nbf and iat are provided and the validation happens
     // accross the boundary unix epoch second, iat might validate but nbf would not,
     // because jsonwebtoken produces another timestamp after this.
-    let payload = decode::<AccessTokenPayload>(token, &key, &validation)?;
+    let payload = decode::<AccessTokenPayload>(token, &key, &validation)
+        .map_err(|e| ZetaError::AccessTokenInvalid(e.into()))?;
 
-    let now: i64 = now.try_into()?;
+    let now: i64 = now.try_into().expect("now");
     let valid_since = now - payload.claims.iat;
-    let leeway: i64 = location_config.leeway().as_secs().try_into()?;
+    let leeway: i64 = location_config
+        .leeway()
+        .as_secs()
+        .try_into()
+        .context("parsing leeway")?;
     if valid_since + leeway < 0 {
-        anyhow::bail!(
-            "at: iat invalid; valid_since: want >= 0, got {}, iat = {}, leeway = {}",
+        return Err(ZetaError::AccessTokenInvalid(anyhow!(
+            "iat invalid; valid_since: want >= 0, got {}, iat = {}, leeway = {}",
             valid_since + leeway,
             payload.claims.iat,
             leeway
-        );
+        )));
     }
 
     // NOTE: not using validation.set_audience, as we want to validate that *all* required
@@ -124,11 +134,11 @@ async fn verify_acess_token(
             .map(|s| s.as_str())
             .collect();
         if !missing_auds.is_empty() {
-            anyhow::bail!(
-                "at: missing audiences: want {}, got {:#?}",
+            return Err(ZetaError::AccessTokenInvalid(anyhow!(
+                "missing audiences: want {}, got {:#?}",
                 missing_auds.join(","),
                 auds,
-            );
+            )));
         }
     }
 
@@ -147,7 +157,10 @@ async fn verify_acess_token(
             .map(|s| s.as_str())
             .collect();
         if !missing_scopes.is_empty() {
-            anyhow::bail!("at: missing scopes: {}", missing_scopes.join(","));
+            return Err(ZetaError::AccessTokenInvalid(anyhow!(
+                "missing scopes: {}",
+                missing_scopes.join(",")
+            )));
         }
     }
 
@@ -158,20 +171,20 @@ async fn verify_popp(
     location_config: &LocationConfig,
     popp: &str,
     now: u64,
-) -> Result<TokenData<Value>> {
+) -> anyhow::Result<TokenData<Value>> {
     let header = decode_header(popp)?;
 
     match &header.typ {
         Some(typ) => {
             if typ != "vnd.telematik.popp+jwt" {
-                bail!("PoPP: invalid typ {typ}");
+                bail!("invalid typ {typ}");
             }
         }
-        None => bail!("PoPP: no typ"),
+        None => bail!("no typ"),
     };
 
     if header.alg != Algorithm::ES256 {
-        anyhow::bail!("PoPP: unsupported token alg {:?}", header.alg);
+        anyhow::bail!("unsupported token alg {:?}", header.alg);
     }
     let kid = header.kid.ok_or_else(|| anyhow!("no kid"))?;
 
@@ -186,14 +199,14 @@ async fn verify_popp(
 
     let iat: u64 = token_data.claims["iat"]
         .as_u64()
-        .context("couldn't parse iat")?;
+        .context("while parsing iat")?;
     let iat: i64 = iat.try_into().context("iat u64->i64 overflow")?;
     let now: i64 = now.try_into()?;
     let valid_since = now - iat;
     let leeway: i64 = location_config.leeway().as_secs().try_into()?;
     if valid_since + leeway < 0 {
         anyhow::bail!(
-            "PoPP: iat invalid; valid_since: want >= 0, got {}, iat = {}, leeway = {}",
+            "iat invalid; valid_since: want >= 0, got {}, iat = {}, leeway = {}",
             valid_since + leeway,
             iat,
             leeway
@@ -203,7 +216,7 @@ async fn verify_popp(
     let valid_until = iat + ppop_validity + leeway;
     if valid_until < now {
         anyhow::bail!(
-            "PPoP: not longer valid: want {} + {} + {} = {} < {}",
+            "not longer valid: want {} + {} + {} = {} < {}",
             iat,
             ppop_validity,
             leeway,
@@ -223,38 +236,35 @@ async fn verify_dpop(
     now: u64,
     http_method: &str,
     request_uri: Uri,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     let header = decode_header(dpop)?;
 
     match &header.typ {
         Some(typ) => {
             if typ != "dpop+jwt" {
-                bail!("DPoP: invalid typ {typ}");
+                bail!("invalid typ {typ}");
             }
         }
-        None => bail!("DPoP: no typ"),
+        None => bail!("no typ"),
     };
 
     if header.alg != Algorithm::ES256 {
-        anyhow::bail!("DPoP: unsupported token alg {:?}", header.alg);
+        anyhow::bail!("unsupported token alg {:?}", header.alg);
     }
     let jwk = header.jwk.ok_or_else(|| anyhow!("no jwk"))?;
 
     if jwk.common.key_algorithm != Some(KeyAlgorithm::ES256) {
-        anyhow::bail!("DPoP: unsupported jwk alg: {:?}", jwk.common.key_algorithm);
+        anyhow::bail!("unsupported jwk alg: {:?}", jwk.common.key_algorithm);
     }
 
     let thumbprint = jwk.thumbprint(ThumbprintHash::SHA256);
-    let cnf = access_token_claims
-        .cnf
-        .clone()
-        .ok_or_else(|| anyhow!("DPoP: missing cnf"))?;
+    let cnf = access_token_claims.cnf.clone();
 
     if cnf.jkt != thumbprint {
         bail!(
-            "DPoP: invalid thumbprint; jkt={}, dpop={}",
-            hex::encode(ath),
-            hex::encode(thumbprint)
+            "invalid thumbprint; cnf.jkt={}, dpop={}",
+            cnf.jkt,
+            thumbprint,
         );
     }
     let key = DecodingKey::from_jwk(&jwk)?;
@@ -267,12 +277,12 @@ async fn verify_dpop(
             .claims
             .ath
             .as_ref()
-            .ok_or_else(|| anyhow!("DPoP: missing ath claim"))?,
+            .ok_or_else(|| anyhow!("missing ath claim"))?,
     )?;
 
     if ath != &claimed_ath {
         bail!(
-            "DPoP: invalid ath; access_token={}, ath={}",
+            "invalid ath; access_token={}, ath={}",
             hex::encode(ath),
             hex::encode(claimed_ath)
         );
@@ -283,7 +293,7 @@ async fn verify_dpop(
     let leeway: i64 = location_config.leeway().as_secs().try_into()?;
     if valid_since + leeway < 0 {
         anyhow::bail!(
-            "DPoP: iat invalid; valid_since: want >= 0, got {}, iat = {}, leeway = {}",
+            "iat invalid; valid_since: want >= 0, got {}, iat = {}, leeway = {}",
             valid_since + leeway,
             payload.claims.iat,
             leeway
@@ -293,7 +303,7 @@ async fn verify_dpop(
     let valid_until = payload.claims.iat + dpop_validity + leeway;
     if valid_until < now {
         anyhow::bail!(
-            "DPoP: no longer valid: want {} + {} + {} = {} < {}",
+            "no longer valid: want {} + {} + {} = {} < {}",
             payload.claims.iat,
             dpop_validity,
             leeway,
@@ -304,7 +314,7 @@ async fn verify_dpop(
 
     if http_method != payload.claims.htm {
         anyhow::bail!(
-            "DPoP: htm invalid: want {}; got {}",
+            "htm invalid: want {}; got {}",
             http_method,
             payload.claims.htm,
         );
@@ -327,28 +337,32 @@ async fn verify_dpop(
         htu.path(),
     )?;
     if request_uri != htu {
-        anyhow::bail!("DPoP: htu invalid: want {}; got {}", request_uri, htu);
+        anyhow::bail!("htu invalid: want {}; got {}", request_uri, htu);
     }
 
     Ok(())
 }
 
-async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> Result<Status> {
+async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<()> {
     let now = get_current_timestamp();
 
     ensure_api_version_header_out(request)?;
     let main_config = request.main_config()?;
     let location_config = request.location_config()?;
 
-    let access_token = request.get_authorization_token()?;
+    let access_token = request
+        .get_authorization_token()
+        .map_err(ZetaError::AccessToken)?;
     let ath = Sha256::digest(&access_token).to_vec();
-    let access_token = verify_acess_token(main_config, location_config, &access_token, now).await?;
+    let access_token =
+        verify_access_token(main_config, location_config, &access_token, now).await?;
 
     let dpop = request
         .get_header_in("dpop")
-        .context("missing DPoP header")?;
+        .context("missing DPoP header")
+        .map_err(ZetaError::DPoP)?;
     let http_method = request.method();
-    let uri: Uri = request.self_uri()?;
+    let uri: Uri = request.eigenuri_normalized()?;
 
     verify_dpop(
         location_config,
@@ -359,125 +373,48 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> Result<Statu
         &http_method,
         uri,
     )
-    .await?;
+    .await
+    .map_err(ZetaError::DPoP)?;
 
     if location_config.require_popp.unwrap_or(true) {
-        match request.get_header_in("popp") {
-            Some(popp) => {
-                let token_data = verify_popp(location_config, popp, now).await?;
-                ensure_popp_token_header_in(request, token_data.claims)?;
-            }
-            None => bail!("PoPP header missing"),
-        }
+        let popp = request
+            .get_header_in("popp")
+            .ok_or(ZetaError::PoPP(anyhow!("missing PoPP header")))?;
+        let token_data = verify_popp(location_config, popp, now)
+            .await
+            .map_err(ZetaError::PoPP)?;
+        ensure_popp_token_header_in(request, token_data.claims)?;
     }
 
-    let udat = access_token.claims.udat.context("missing udat")?;
+    let claims = access_token.claims;
     ensure_user_info_header_in(
         request,
-        UserInfo {
-            identifier: udat.telid.clone(),
-            mail: None,
-            profession_oid: udat.prof.clone(),
+        ZetaUserInfo {
+            common_name: claims.common_name.context("missing common_name")?.clone(),
+            identifier: claims.sub.clone(),
+            profession_oid: claims.profession_oid.clone(),
+            organization_name: claims.organization_name.clone(),
         },
     )?;
 
-    let cdat = access_token.claims.cdat.context("cdat missing")?;
-    let platform_product_id = cdat.platform_product_id;
-    let client_instance = match platform_product_id {
-        AccessTokenPayloadCdatPlatformProductId::AndroidProductId {
-            namespace,
-            package_name,
-            platform,
-            sha256_cert_fingerprints,
-        } => ClientInstance::Variant0 {
-            client_id: cdat.client_id.clone(),
-            manufacturer_id: cdat
-                .manufacturer_id
-                .context("manufacturer_id missing")?
-                .clone(),
-            manufacturer_name: cdat
-                .manufacturer_name
-                .context("manufacturer_name missing")?
-                .clone(),
-            name: cdat.name.clone(),
-            namespace: namespace.clone(),
-            owner_mail: None,
-            package_name: package_name.clone(),
-            platform: platform.context("platform missing")?.clone(),
-            platform_product_id: Map::new(),
-            registration_timestamp: cdat.registration_timestamp,
-            sha256_cert_fingerprints: sha256_cert_fingerprints.clone(),
-        },
-        AccessTokenPayloadCdatPlatformProductId::AppleProductId {
-            app_bundle_ids,
-            platform,
-            platform_type,
-        } => ClientInstance::Variant1 {
-            client_id: cdat.client_id.clone(),
-            manufacturer_id: cdat
-                .manufacturer_id
-                .context("manufacturer_id missing")?
-                .clone(),
-            manufacturer_name: cdat
-                .manufacturer_name
-                .context("manufacturer_name missing")?
-                .clone(),
-            name: cdat.name.clone(),
-            owner_mail: None,
-            platform_type: platform_type.clone(),
-            platform: platform.context("platform missing")?.clone(),
-            platform_product_id: Map::new(),
-            registration_timestamp: cdat.registration_timestamp,
-            app_bundle_ids: app_bundle_ids.clone(),
-        },
-        AccessTokenPayloadCdatPlatformProductId::WindowsProductId {
-            package_family_name,
-            platform,
-            store_id,
-        } => ClientInstance::Variant2 {
-            client_id: cdat.client_id.clone(),
-            manufacturer_id: cdat
-                .manufacturer_id
-                .context("manufacturer_id missing")?
-                .clone(),
-            manufacturer_name: cdat
-                .manufacturer_name
-                .context("manufacturer_name missing")?
-                .clone(),
-            name: cdat.name.clone(),
-            owner_mail: None,
-            package_family_name,
-            platform: platform.context("platform missing")?.clone(),
-            platform_product_id: Map::new(),
-            registration_timestamp: cdat.registration_timestamp,
-            store_id,
-        },
-        AccessTokenPayloadCdatPlatformProductId::LinuxProductId {
-            application_id,
-            packaging_type,
-            platform,
-        } => ClientInstance::Variant3 {
-            client_id: cdat.client_id.clone(),
-            manufacturer_id: cdat
-                .manufacturer_id
-                .context("manufacturer_id missing")?
-                .clone(),
-            manufacturer_name: cdat
-                .manufacturer_name
-                .context("manufacturer_name missing")?
-                .clone(),
-            name: cdat.name.clone(),
-            owner_mail: None,
-            application_id,
-            platform: platform.context("platform missing")?.clone(),
-            platform_product_id: Map::new(),
-            registration_timestamp: cdat.registration_timestamp,
-            packaging_type,
-        },
-    };
-    ensure_client_data_header_in(request, client_instance)?;
+    let platform = claims.platform.map(|p| match p {
+        AccessTokenPayloadPlatform::Android => ClientDataPlatform::Android,
+        AccessTokenPayloadPlatform::Apple => ClientDataPlatform::Apple,
+        AccessTokenPayloadPlatform::Windows => ClientDataPlatform::Windows,
+        AccessTokenPayloadPlatform::Linux => ClientDataPlatform::Linux,
+    });
 
-    Ok(Status::NGX_OK)
+    ensure_client_data_header_in(
+        request,
+        ClientData {
+            client_id: claims.client_id.clone(),
+            platform,
+            product_id: claims.product_id.clone(),
+            product_version: claims.product_version.clone(),
+        },
+    )?;
+
+    Ok(())
 }
 
 pub fn handler(request: &mut Request) -> Status {
@@ -493,18 +430,34 @@ pub fn handler(request: &mut Request) -> Status {
                     return HTTPStatus::INTERNAL_SERVER_ERROR.into();
                 }
                 return match task.now_or_never().expect("Task result") {
-                    Ok(status) => status,
+                    Ok(()) => Status::NGX_OK, // OK: allow access, move to next phase
                     Err(err) => {
-                        log_debug!("pep: unauthorized — {err}");
-                        HTTPStatus::UNAUTHORIZED.into()
+                        log_debug!("pep: {err}");
+                        let response = request
+                            .eigenuri_normalized()
+                            .and_then(|base| err.response(base));
+
+                        match response {
+                            Ok(response) => {
+                                response.send(request, Status::NGX_ERROR);
+                                Status::NGX_ERROR
+                            }
+                            Err(e) => {
+                                ngx_log_error!(
+                                    NGX_LOG_ERR,
+                                    request.log(),
+                                    "error building error response — {e}"
+                                );
+                                // request was *not* finalized, return fast finalization status
+                                HTTPStatus::INTERNAL_SERVER_ERROR.into()
+                            }
+                        }
                     }
                 };
             }
 
-            log_debug!("pep: enter");
-
             let r_ptr = AtomicPtr::new(request.into());
-            let task = spawn(Compat::new(async move {
+            let task = spawn_compat(async move {
                 let r_ptr = r_ptr.load(Ordering::Relaxed);
                 let request = unsafe { ngx::http::Request::from_ngx_http_request(r_ptr) };
 
@@ -514,7 +467,7 @@ pub fn handler(request: &mut Request) -> Status {
                 // trigger „write” event so nginx calls our handler again
                 unsafe { ngx_post_event((*c).write, addr_of_mut!(ngx_posted_events)) };
                 result
-            }));
+            });
 
             ModuleCtx::insert_pep_task(request, task);
 
@@ -549,23 +502,30 @@ mod tests {
         fn default() -> Self {
             Self {
                 aud: AccessTokenPayloadAud::String("aud".to_string()),
-                client_id: None,
-                cnf: None,
+                client_id: "client_id".to_string(),
+                cnf: AccessTokenPayloadCnf {
+                    jkt: "".to_string(),
+                },
+                common_name: None,
                 exp: i64::MAX,
                 iat: 0,
+                ip_address: "ip_address".to_string(),
                 iss: "issuer".to_string(),
                 jti: "jti".to_string(),
+                organization_name: None,
+                platform: None,
+                product_id: "product_id".to_string(),
+                product_version: "product_version".to_string(),
+                profession_oid: "profession_oid".to_string(),
                 scope: None,
                 sub: "sub".to_string(),
-                udat: None,
-                cdat: None,
             }
         }
     }
 
     fn make_jwt<T: Serialize>(mut header: Header, claims: T) -> String {
         header.kid = Some("kid".to_string());
-        return encode(&header, &claims, &EC_PRIVATE_KEY).expect("jwt");
+        encode(&header, &claims, &EC_PRIVATE_KEY).expect("jwt")
     }
 
     #[rstest]
@@ -597,7 +557,7 @@ mod tests {
 
         let now = 1;
         let token = make_jwt(Header::new(Algorithm::ES256), AccessTokenPayload::default());
-        let result = verify_acess_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
         assert!(result.is_ok());
 
         // aud
@@ -609,7 +569,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_acess_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
         assert!(result.is_ok());
 
         // multiple auds
@@ -628,7 +588,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_acess_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
         assert!(result.is_ok());
 
         // fail when we require more auds than present on token
@@ -638,7 +598,7 @@ mod tests {
         ]));
 
         let token = make_jwt(Header::new(Algorithm::ES256), AccessTokenPayload::default());
-        let result = verify_acess_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
         assert!(result.is_err_and(|err| err.to_string().contains("missing_aud")));
         request_mock
             .lcfg
@@ -659,7 +619,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_acess_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
         assert!(result.is_ok());
 
         // fail when missing scope(s)
@@ -670,7 +630,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_acess_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
         assert!(result.is_err_and(|err| err.to_string().contains("required_scope2")));
 
         let token = make_jwt(
@@ -680,7 +640,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_acess_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
         assert!(
             result.is_err_and(|err| err.to_string().contains("required_scope1")
                 && err.to_string().contains("required_scope2"))
@@ -693,7 +653,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_acess_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
         assert!(
             result.is_err_and(|err| err.to_string().contains("required_scope1")
                 && err.to_string().contains("required_scope2"))
@@ -707,7 +667,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_acess_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
         assert!(
             result.is_err_and(|err| err.to_string().contains("required_scope1")
                 && err.to_string().contains("required_scope2"))
@@ -722,7 +682,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_acess_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
         assert!(result.is_err_and(|err| err.to_string().contains("iat invalid")));
 
         // leeway
@@ -734,7 +694,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_acess_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
         assert!(result.is_ok());
 
         let now = 1;
@@ -745,7 +705,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_acess_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
         assert!(result.is_err_and(|err| err.to_string().contains("iat invalid")));
     }
 
@@ -764,10 +724,12 @@ mod tests {
 
         let now: u64 = 1;
 
-        let mut at = AccessTokenPayload::default();
-        at.cnf = Some(AccessTokenPayloadCnf {
-            jkt: jwk.thumbprint(ThumbprintHash::SHA256),
-        });
+        let at = AccessTokenPayload {
+            cnf: AccessTokenPayloadCnf {
+                jkt: jwk.thumbprint(ThumbprintHash::SHA256),
+            },
+            ..Default::default()
+        };
         let at_jwt = make_jwt(Header::new(Algorithm::ES256), &at);
         let ath = Sha256::digest(&at_jwt).to_vec();
         let mut dpop_header = Header::new(Algorithm::ES256);
@@ -824,10 +786,13 @@ mod tests {
         assert!(result.is_err_and(|err| err.to_string().contains("htu invalid")));
 
         // access token cnf mismatch
-        let mut invalid_at = AccessTokenPayload::default();
-        invalid_at.cnf = Some(AccessTokenPayloadCnf {
-            jkt: "invalid".to_string(),
-        });
+
+        let invalid_at = AccessTokenPayload {
+            cnf: AccessTokenPayloadCnf {
+                jkt: "invalid".to_string(),
+            },
+            ..Default::default()
+        };
 
         let result = verify_dpop(
             &request_mock.lcfg,

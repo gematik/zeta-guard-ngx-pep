@@ -24,12 +24,15 @@
 
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
-use std::ptr;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::ptr;
 
-use anyhow::{Context, Result, anyhow, bail};
-use asl::{Config, Environment, HandshakeState, SessionState, generate_asl_keys, new_cid, utc_now};
-use nginx_sys::{ngx_conf_t, ngx_int_t, ngx_shared_memory_add, ngx_shm_zone_t};
+use anyhow::{anyhow, bail, Context, Result};
+use asl::{new_cid, utc_now, Config, HandshakeState, SessionState};
+use nginx_sys::{
+    ngx_conf_t, ngx_int_t, ngx_shared_memory_add, ngx_shm_zone_t, NGX_CONF_PREFIX, NGX_PREFIX,
+};
 use ngx::allocator::Allocator;
 use ngx::collections::{RbTreeMap, Vec};
 use ngx::core::{NgxString, SlabPool, Status};
@@ -37,9 +40,10 @@ use ngx::http::HttpModuleMainConf;
 use ngx::ngx_string;
 use ngx::sync::RwLock;
 
+use crate::asl_keys::{asl_file_path, create_asl_config};
 use crate::conf::MainConfig;
 use crate::ngx_http_pep_module;
-use crate::{Module, log_debug};
+use crate::{log_debug, Module};
 
 const SESSION_CACHE_SIZE: usize = 10 << 20;
 
@@ -117,6 +121,8 @@ type Map = RbTreeMap<NgxString<SlabPool>, ShmConnectionState<SlabPool>, SlabPool
 struct Shared {
     config: MaybeUninit<Config>,
     map: RwLock<Map>,
+    #[cfg(feature = "its")]
+    always_expire: std::sync::atomic::AtomicBool,
 }
 
 pub struct ShmSessionCache {
@@ -152,28 +158,22 @@ impl ShmSessionCache {
             self.pool.clone(),
         ));
 
-        tokio::task::spawn_blocking(move || {
-            let mut map = self.shared.map.write();
-            if map.get(&key).is_some() {
-                bail!("conflict: {cid}");
-            }
-            map.try_insert(key, value)?;
-            Ok(cid)
-        })
-        .await?
+        let mut map = self.shared.map.write();
+        if map.get(&key).is_some() {
+            bail!("conflict: {cid}");
+        }
+        map.try_insert(key, value)?;
+        Ok(cid)
     }
 
     pub async fn finish_handshake(&'static self, cid: &str) -> Result<HandshakeState> {
         let key = NgxString::try_from_bytes_in(cid, self.pool.clone())?;
 
-        tokio::task::spawn_blocking(move || {
-            let mut map = self.shared.map.write();
-            match map.remove(&key).context(format!("missing: {key}"))? {
-                ShmConnectionState::Handshaking(ref state) => Ok(state.into()),
-                ShmConnectionState::Established(_) => Err(anyhow!("not handshaking: {key}")),
-            }
-        })
-        .await?
+        let mut map = self.shared.map.write();
+        match map.remove(&key).context(format!("missing: {key}"))? {
+            ShmConnectionState::Handshaking(ref state) => Ok(state.into()),
+            ShmConnectionState::Established(_) => Err(anyhow!("not handshaking: {key}")),
+        }
     }
 
     fn cleanup_expired(&'static self) {
@@ -188,7 +188,7 @@ impl ShmSessionCache {
                         if shm_session_state.expires > now {
                             None
                         } else {
-                            log_debug!("session cache: Expire session {}", k);
+                            log_debug!("cleanup_expired: expire cid {}", k);
                             Some(k.clone())
                         }
                     }
@@ -200,20 +200,24 @@ impl ShmSessionCache {
         }
     }
 
-    pub async fn start_session(&'static self, cid: &str, state: SessionState) -> Result<()> {
-        #[cfg(not(coverage))]
-        // run the cleanup routine with 1% probability
-        let rand = fastrand::u8(0..100);
-
-        #[cfg(coverage)]
-        // always run the cleanup routine when running integration tests
-        let rand = 0u8;
-
-        if rand == 0 {
+    fn maybe_cleanup_expired_sessions(&'static self) {
+        #[cfg(not(feature = "its"))]
+        // run the cleanup routine with 1% probability, in a background thread.
+        if fastrand::u8(0..100) == 0 {
             tokio::task::spawn_blocking(move || {
                 self.cleanup_expired();
             });
-        }
+        };
+
+        #[cfg(feature = "its")]
+        // either always or never expire, blockingly; can be toggled with test control client
+        if self.shared.always_expire.load(Ordering::Relaxed) {
+            self.cleanup_expired();
+        };
+    }
+
+    pub async fn start_session(&'static self, cid: &str, state: SessionState) -> Result<()> {
+        self.maybe_cleanup_expired_sessions();
 
         let key = NgxString::try_from_bytes_in(cid, self.pool.clone())?;
         let value = ShmConnectionState::Established(ShmSessionState::from_global(
@@ -221,18 +225,16 @@ impl ShmSessionCache {
             self.pool.clone(),
         ));
 
-        tokio::task::spawn_blocking(move || {
-            let mut map = self.shared.map.write();
-            if map.get(&key).is_some() {
-                bail!("conflict — {key}");
-            }
-            map.try_insert(key, value)?;
-            Ok(())
-        })
-        .await?
+        let mut map = self.shared.map.write();
+        if map.get(&key).is_some() {
+            bail!("conflict — {key}");
+        }
+        map.try_insert(key, value)?;
+        Ok(())
     }
 
     pub async fn continue_session(&'static self, cid: &str) -> Result<SessionState> {
+        self.maybe_cleanup_expired_sessions();
         let key = NgxString::try_from_bytes_in(cid, self.pool.clone())?;
 
         let result = {
@@ -244,12 +246,10 @@ impl ShmSessionCache {
                     if state.expires > utc_now() {
                         let prev = state.enc_ctr.fetch_add(1, Ordering::SeqCst);
                         return Ok(state.to_global(prev + 1));
-                    } else {
-                        // we need to upgrade our lock to expire — just signal to not deadlock
-                        Ok(None)
                     }
+                    Ok(None)
                 }
-                _ => Err(anyhow!("missing — {cid}")),
+                _ => Err(anyhow!("not established — {key}")),
             }
         };
         match result {
@@ -259,12 +259,38 @@ impl ShmSessionCache {
                     // read lock has been dropped, safe to acquire write lock
                     let mut map = self.shared.map.write();
                     let _ = map.remove(&key);
+
+                    log_debug!("continue_session: expire cid {key}");
                     Err(anyhow!("expired — {key}"))
                 })
                 .await?
             }
             Err(e) => Err(e),
         }
+    }
+
+    #[cfg(feature = "its")]
+    pub fn set_always_expire(&'static self, value: bool) {
+        log_debug!("TEST: set_always_expire {value}");
+        self.shared.always_expire.store(value, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "its")]
+    pub async fn expire_cid(&'static self, cid: &str) -> Result<()> {
+        log_debug!("TEST: expire_cid {cid}");
+        let key = NgxString::try_from_bytes_in(cid, self.pool.clone())?;
+
+        let mut map = self.shared.map.write();
+        let item = map
+            .remove(&key)
+            .ok_or_else(|| anyhow!("expire_cid: {cid} not found"))?;
+        let mut state = match item {
+            ShmConnectionState::Handshaking(_) => bail!("expire_cid: {cid} is handshaking"),
+            ShmConnectionState::Established(shm_session_state) => shm_session_state,
+        };
+        state.expires = 0;
+        map.try_insert(key, ShmConnectionState::Established(state))?;
+        Ok(())
     }
 }
 
@@ -289,12 +315,16 @@ pub fn init(cf: *mut ngx_conf_t) -> ngx_int_t {
     Status::NGX_OK.0
 }
 
-static SERVER_SIG_SK_HEX: &str = "30770201010420bd37298383eb3d620da1ed367a9a0898e02443fadff0af783e1fbbfdf8250d95a00a06082a8648ce3d030107a144034200048bf54a359336ad068fc57282552526875f0884a8d5b3bc09716edcaa7e0b4443084eea5f2445fea6cfe558edf4a9efea2732efa2d5888b66be9b5b08101448c2";
-static SERVER_SIG_CERT_HEX: &str = "3082017330820119a003020102021450fe87e05a3c00463e0a18387c3dbda92f4828fd300a06082a8648ce3d040302300f310d300b06035504030c0474657374301e170d3235313033303039333430395a170d3335313032383039333430395a300f310d300b06035504030c04746573743059301306072a8648ce3d020106082a8648ce3d030107034200048bf54a359336ad068fc57282552526875f0884a8d5b3bc09716edcaa7e0b4443084eea5f2445fea6cfe558edf4a9efea2732efa2d5888b66be9b5b08101448c2a3533051301d0603551d0e0416041461dd7c90fc9bdf91f8b4c3eaa0ceda715bd523f5301f0603551d2304183016801461dd7c90fc9bdf91f8b4c3eaa0ceda715bd523f5300f0603551d130101ff040530030101ff300a06082a8648ce3d0403020348003045022100d0621bf50aee3ff00713393825f2993adc88a091d1f227e8a2319bc7a33b0e4302201a0276dcceabbf9e7dae50669d9186663f3f00a954e1d9eb87b844bd8733cfe4";
-
 extern "C" fn shared_zone_init(shm_zone: *mut ngx_shm_zone_t, _data: *mut c_void) -> ngx_int_t {
-    let main_conf: &MainConfig =
-        unsafe { shm_zone.as_ref().expect("shm_zone").data.cast::<MainConfig>().as_ref() }.expect("MainConfig");
+    let main_conf: &MainConfig = unsafe {
+        shm_zone
+            .as_ref()
+            .expect("shm_zone")
+            .data
+            .cast::<MainConfig>()
+            .as_ref()
+    }
+    .expect("MainConfig");
 
     let mut pool =
         unsafe { SlabPool::from_shm_zone(shm_zone.as_ref().expect("shm_zone")) }.expect("SlabPool");
@@ -302,21 +332,37 @@ extern "C" fn shared_zone_init(shm_zone: *mut ngx_shm_zone_t, _data: *mut c_void
     if pool.as_mut().data.is_null() {
         let map: RwLock<Map> = RwLock::new(RbTreeMap::try_new_in(pool.clone()).expect("RbTreeMap"));
 
-        let (server_keys, private_keys) = generate_asl_keys(30, "").unwrap();
-        let signed_keys = server_keys
-            .sign(
-                &hex::decode(SERVER_SIG_CERT_HEX).unwrap(),
-                &hex::decode(SERVER_SIG_SK_HEX).unwrap(),
-                1,
-            )
-            .unwrap();
-
-        let asl_env = if main_conf.asl_testing { Environment::Testing } else { Environment::Production };
-        println!("asl environment: {:?}", asl_env);
+        let asl_conf_dir = Path::new(NGX_PREFIX.to_str().expect("NGX_PREFIX"))
+            .join(NGX_CONF_PREFIX.to_str().expect("NGX_CONF_PREFIX"));
         let config = MaybeUninit::new(
-            Config::new_with_keys(asl_env, signed_keys, private_keys).unwrap(),
+            create_asl_config(
+                main_conf.asl_testing,
+                asl_file_path(&asl_conf_dir, &main_conf.asl_signer_cert),
+                asl_file_path(&asl_conf_dir, &main_conf.asl_signer_key),
+                asl_file_path(&asl_conf_dir, &main_conf.asl_ca_cert),
+                asl_file_path(&asl_conf_dir, &main_conf.asl_roots_json),
+                main_conf.asl_root_ca.clone(),
+                main_conf.asl_ocsp_url.clone(),
+            )
+            .inspect(|config| {
+                if config.is_default() {
+                    println!("asl environment: disabled");
+                } else {
+                    println!(
+                        "asl environment: {:?} - CertData.{}",
+                        config.env,
+                        config.signed_keys.version()
+                    );
+                }
+            })
+            .unwrap(),
         );
-        let shared = Shared { map, config };
+        let shared = Shared {
+            map,
+            config,
+            #[cfg(feature = "its")]
+            always_expire: std::sync::atomic::AtomicBool::new(false),
+        };
 
         pool.as_mut().data = ngx::allocator::allocate(shared, &pool.clone())
             .expect("allocate")

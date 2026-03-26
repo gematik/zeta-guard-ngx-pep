@@ -26,7 +26,7 @@ use std::cell::RefCell;
 use std::ptr::addr_of;
 use std::sync::OnceLock;
 
-use anyhow::Result;
+use async_compat::Compat;
 use nginx_sys::{
     NGX_LOG_EMERG, NGX_LOG_WARN, ngx_http_compile_complex_value, ngx_http_compile_complex_value_t,
     ngx_http_complex_value_t, ngx_http_phases_NGX_HTTP_PRECONTENT_PHASE, ngx_str_t,
@@ -40,17 +40,20 @@ use ngx::http::{self, HttpModule, Request};
 use ngx::http::{HttpModuleMainConf, NgxHttpCoreModule};
 use ngx::ngx_conf_log_error;
 use ngx::{http_request_handler, ngx_string};
-use ngx_tickle::Task;
+use ngx_tickle::{Task, spawn};
 use reqwest::Client;
 
 use crate::conf::NGX_HTTP_PEP_COMMANDS;
+use crate::error::ZetaResult;
 use crate::request_body::RequestBody;
 #[cfg(not(test))]
 use {crate::jwk_cache::JwkCache, nginx_sys::ngx_cycle_t};
 
 mod asl;
+mod asl_keys;
 mod buffer;
 mod conf;
+mod error;
 mod headers;
 mod jwk_cache;
 mod pep;
@@ -61,6 +64,10 @@ mod session_cache;
 
 #[cfg(test)]
 mod tests;
+
+// tarpc control server embedded into the nginx module for integration tests
+#[cfg(feature = "its")]
+pub mod its;
 
 // contains nginx stubs for tests and purl which are built as a binary, which means that the linker
 // requires all symbols to be present.
@@ -83,6 +90,14 @@ macro_rules! log_debug {
     };
 }
 
+pub fn spawn_compat<F, T>(future: F) -> Task<T>
+where
+    F: Future<Output = T> + 'static,
+    T: 'static,
+{
+    spawn(Compat::new(future))
+}
+
 // Shared between asl and pep modules — technically it's only a single nginx module, so there can
 // be only one.
 #[derive(Debug, Default)]
@@ -94,7 +109,7 @@ struct ModuleCtx {
 
 #[derive(Debug, Default)]
 struct PepCtx {
-    task: Option<Task<Result<Status>>>,
+    task: Option<Task<ZetaResult<()>>>,
 }
 
 #[derive(Debug, Default)]
@@ -115,12 +130,12 @@ impl ModuleCtx {
             })
     }
 
-    pub fn take_pep_task(request: &Request) -> Option<Task<Result<Status>>> {
+    pub fn take_pep_task(request: &Request) -> Option<Task<ZetaResult<()>>> {
         let ctx = Self::get(request);
         ctx.pep.borrow_mut().task.take()
     }
 
-    pub fn insert_pep_task(request: &Request, task: Task<Result<Status>>) {
+    pub fn insert_pep_task(request: &Request, task: Task<ZetaResult<()>>) {
         let ctx = Self::get(request);
         #[allow(clippy::let_underscore_future)]
         let _ = ctx.pep.borrow_mut().task.insert(task);
@@ -185,6 +200,9 @@ impl http::HttpModule for Module {
             }
             *h = Some(asl_handler);
 
+            // This is required in handle_subrequest — a nginx Request doesn't know the original
+            // server port (easily), but we want to send inner to the same server that handles
+            // outer.
             let mut asl_self_url = ngx_string!("http://localhost:$server_port");
             let mut ccv: ngx_http_compile_complex_value_t = std::mem::zeroed();
             ccv.cf = cf;
@@ -265,6 +283,7 @@ extern "C" fn ngx_http_pep_init_worker(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     log_debug!("init worker @ {ts}",);
 
     let cycle = unsafe { &mut *cycle };
+
     let process = unsafe { nginx_sys::ngx_process } as u32;
     if !matches!(
         process,
@@ -294,6 +313,27 @@ extern "C" fn ngx_http_pep_init_worker(cycle: *mut ngx_cycle_t) -> ngx_int_t {
 
     log_debug!("initializing jwk cache…");
     JwkCache::init(conf);
+
+    #[cfg(feature = "its")]
+    {
+        // work up from the pid file path to get to control path dir: ./prefix/test-{port}/control
+        let ccf: &nginx_sys::ngx_core_conf_t = unsafe {
+            &*cycle
+                .conf_ctx
+                .add(nginx_sys::ngx_core_module.index)
+                .read()
+                .cast()
+        };
+        let pid = unsafe { ngx::core::NgxStr::from_ngx_str(ccf.pid).to_str().unwrap() };
+        let control_path = std::path::Path::new(pid)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("control");
+
+        its::start(&control_path);
+    }
 
     Status::NGX_OK.into()
 }

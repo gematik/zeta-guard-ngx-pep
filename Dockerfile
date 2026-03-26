@@ -19,10 +19,11 @@
 #
 # For additional notes and disclaimer from gematik and in case of changes by gematik find details in the "Readme" file.
 # #L%
-ARG BASE_IMAGE_BUILD="rust:1.92-slim-bookworm"
-# NOTE: must match minor nginx version built against, see: `cargo info nginx-src`
-# alpine images might not work well due to musl
-ARG BASE_IMAGE="nginx:1.28.1-trixie-otel"
+
+ARG BASE_IMAGE_BUILD="rust:1.94-slim-bookworm"
+ARG NGINX_VERSION=1.29.5 # NOTE: keep in sync with .cargo/config.toml and .gitlab-ci.yml
+ARG BASE_IMAGE="nginxinc/nginx-unprivileged:$NGINX_VERSION-trixie-otel"
+
 FROM ${BASE_IMAGE_BUILD} AS build-env
 ARG AZDO_CRATES_MIRROR_URL=""
 
@@ -70,6 +71,7 @@ RUN apt-get update && \
     make \
     zlib1g-dev \
     pkg-config \
+    gnupg \
     && \
   rm -rf /var/lib/apt/lists/*
 
@@ -83,12 +85,14 @@ SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 RUN --mount=type=cache,id=cargo-home,target=/usr/local/cargo-home,sharing=locked \
     --mount=type=secret,id=azdo_pat \
 <<-'SH'
-  MIRROR=${AZDO_CRATES_MIRROR_URL:-} \
-    TOKEN=$(cat /run/secrets/azdo_pat 2>/dev/null) \
-    . /usr/local/bin/cargo-env
+  # build-env
 
   export CARGO_HOME=/usr/local/cargo-home
   mkdir -p "$CARGO_HOME"
+
+  MIRROR=${AZDO_CRATES_MIRROR_URL:-} \
+    TOKEN=$(cat /run/secrets/azdo_pat 2>/dev/null) \
+    . /usr/local/bin/cargo-env
 
   printf "!! install cargo-llvm-cov\n\n"
   cargo install cargo-llvm-cov --bins --locked --root /usr/local
@@ -97,7 +101,11 @@ RUN --mount=type=cache,id=cargo-home,target=/usr/local/cargo-home,sharing=locked
   cargo install cargo-cyclonedx --bins --locked --root /usr/local
 
   printf "!! install cargo-nextest\n\n"
-  cargo install cargo-nextest --bins --locked --root /usr/local
+  # TODO: 0.9.127 not installable due to yanked zip@7.3
+  cargo install cargo-nextest@0.9.126 --bins --locked --root /usr/local
+
+  printf "!! install mdbook\n\n"
+  cargo install mdbook --bins --locked --root /usr/local
 SH
 
 FROM build-env AS local-build
@@ -115,23 +123,44 @@ COPY libasl /usr/src/ngx_pep/libasl
 COPY misc/nginx.conf.tpl /usr/src/ngx_pep/misc/
 COPY purl /usr/src/ngx_pep/purl
 COPY tests /usr/src/ngx_pep/tests
+COPY .cargo /usr/src/ngx_pep/.cargo
+COPY .config /usr/src/ngx_pep/.config
+COPY xtask /usr/src/ngx_pep/xtask
+COPY book /usr/src/ngx_pep/book
 
+ARG NGINX_VERSION
+ENV NGINX_VERSION="$NGINX_VERSION"
 RUN \
 <<-'SH'
+  # local build
+
   # don't try to run integration tests for local builds
-  NEXTEST_FILTERSET="!kind(test)" /usr/local/bin/cargo-build
+  NEXTEST_FILTERSET="!kind(test)" \
+    /usr/local/bin/cargo-build
 SH
 
-# gitlab-ci likes to build "locally", copy .so from context
+# gitlab-ci likes to build "locally", copy .so and book from context
 FROM ${BASE_IMAGE} AS ci
+
+USER root
+RUN apt purge -y nginx-module-njs nginx-module-xslt nginx-module-image-filter curl libgcrypt20 libxml2 passwd && apt autoremove -y && apt update && apt upgrade -y
+RUN apt purge --allow-remove-essential -y bash ncurses-base ncurses-bin perl-base apt debian-archive-keyring libapt-pkg7.0  liblz4-1  libseccomp2  libxxhash0  sqv util-linux liblastlog2-2  libsqlite3-0  libudev1  libuuid1
+USER nginx
 
 COPY misc/docker/nginx.conf /etc/nginx/nginx.conf
 COPY misc/docker/default.conf /etc/nginx/conf.d/
 COPY target/release/libngx_pep.so /etc/nginx/modules/
+COPY book/out /usr/share/nginx/html/doc
 
-# default target, i.e. for interactive usage, copy so. from local-build stage
+# default target, i.e. for interactive usage, copy book and so. from local-build stage
 FROM ${BASE_IMAGE}
+
+USER root
+RUN apt purge -y nginx-module-njs nginx-module-xslt nginx-module-image-filter curl libgcrypt20 libxml2 passwd && apt autoremove -y && apt update && apt upgrade -y
+RUN apt purge --allow-remove-essential -y bash ncurses-base ncurses-bin perl-base apt debian-archive-keyring libapt-pkg7.0  liblz4-1  libseccomp2  libxxhash0  sqv util-linux liblastlog2-2  libsqlite3-0  libudev1  libuuid1
+USER nginx
 
 COPY misc/docker/nginx.conf /etc/nginx/nginx.conf
 COPY misc/docker/default.conf /etc/nginx/conf.d/
 COPY --from=local-build /usr/src/ngx_pep/target/release/libngx_pep.so /etc/nginx/modules/
+COPY --from=local-build /usr/src/ngx_pep/book/out /usr/share/nginx/html/doc

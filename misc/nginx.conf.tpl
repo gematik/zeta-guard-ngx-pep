@@ -18,7 +18,7 @@ user root;
 load_module modules/{target}/libngx_pep.{libsuff};
 
 error_log {error_log};
-pid {temp_prefix}/logs/nginx.pid;
+pid {temp_prefix}logs/nginx.pid;
 
 events \{
     worker_connections  1024;
@@ -30,6 +30,16 @@ http \{
       default upgrade;
       ''      '';
     }
+
+    # A_26920: ZETA/ASL mindestens HTTP-Version 1.1
+    map $server_protocol $reject_proto \{
+        "HTTP/1.1"    0;  # fast-path
+        "HTTP/2.0"    0;
+        ~*^HTTP/1\.1$ 0;  # case-insensitive
+        ~*^HTTP/2\.0$ 0;
+        default       1;  # reject everything else
+    }
+
     proxy_read_timeout 300s;
 
     include       mime.types;
@@ -53,8 +63,11 @@ http \{
 
     keepalive_timeout  65;
 
+    # pep_pdp_issuer http://localhost:18080/realms/zeta-guard;
     pep_pdp_issuer https://zeta-cd.westeurope.cloudapp.azure.com/auth/realms/zeta-guard;
+    # pep_pdp_issuer https://zeta-dev.westeurope.cloudapp.azure.com/auth/realms/zeta-guard;
     # pep_pdp_issuer https://zeta-staging.spree.de/auth/realms/zeta-guard;
+
     pep_popp_issuer http://localhost:{port};
     # pep_http_client_idle_timeout 30; # s
     # pep_http_client_max_idle_per_host 64;
@@ -63,6 +76,12 @@ http \{
     # pep_http_client_timeout 10; # s
     pep_http_client_accept_invalid_certs on;
     pep_asl_testing on;
+    pep_asl_signer_cert signer_cert.pem;
+    pep_asl_signer_key signer_key.pem;
+    pep_asl_ca_cert issuer_cert.pem;
+    pep_asl_roots_json roots.json;
+    pep_asl_root_ca FAKE.RCA1;
+    # pep_asl_ocsp_url http://example.org/ocsp
 
     # These options are location configs, but can be declared in http and server levels
     # also to be inherited in lower levels.
@@ -70,8 +89,11 @@ http \{
     # # enable access phase handler to check access tokens, DPoP and, optionally, PoPP?
     pep                  on;
     # # space separated list of required audiences
+    # pep_require_aud      "http://localhost:18080";
     pep_require_aud      "https://zeta-cd.westeurope.cloudapp.azure.com";
+    # pep_require_aud      "https://zeta-dev.westeurope.cloudapp.azure.com";
     # pep_require_aud      "https://zeta-staging.spree.de";
+
     # # space separated list of required scopes
     # pep_require_scope    "openid profile email";
     # # clock leeway when checking exp,nbf,iat claims in seconds, default: 60
@@ -87,9 +109,19 @@ http \{
         listen       {port};
         server_name  localhost;
 
+        # A_26920: ZETA/ASL mindestens HTTP-Version 1.1
+        if ($reject_proto) \{
+            return 444;
+        }
+
         location /proxy \{
             proxy_http_version 1.1;
             proxy_pass "http://localhost:8001";
+        }
+
+        location /CertData. \{
+            asl on;
+            pep off;
         }
 
         location /ASL \{
@@ -107,8 +139,15 @@ http \{
           autoindex        off;
         }
 
+        # mock /pep/achelos_testfachdienst/hellozeta, e.g. for local asl testing
+        location /pep/achelos_testfachdienst/hellozeta \{
+          default_type     application/json;
+          alias            html/empty.json;
+          autoindex        off;
+        }
+
         # for integration tests
-        location /ready \{
+        location /ready/ \{
           pep              off;
           asl              off;
           return 200;
@@ -123,6 +162,10 @@ http \{
           alias            html/empty.json;
           autoindex        off;
           pep_require_popp on;
+        }
+
+        location /doc \{
+          pep off;
         }
 
         # see tests/common/echo.rs

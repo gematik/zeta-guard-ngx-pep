@@ -1,25 +1,6 @@
-# libaom3 — not used
-CVE-2023-6879
-CVE-2023-39616
-# libldap-2.5-0 — not used
-CVE-2023-2953
-# libpam — not used
-CVE-2025-6020
-# lippng - not used
-CVE-2025-64720
-CVE-2025-65018
-CVE-2025-66293
-CVE-2026-22695
-CVE-2026-22801
-CVE-2026-25646
-# libtiff6 — not used
-CVE-2023-52355
-# libxslt1.1 — not used
-CVE-2025-7425
-# zlib1g — vulnerability affects MiniZip tool for zip files, which are not being used
-#          nginx only uses gzip-functionality from zlib1g
-CVE-2023-45853
-# gnupg - not used
-CVE-2025-68973
-# likely not affected, re-check for final decision
-CVE-2026-0861 exp:2026-02-28
+###############################################
+# Please only temporary ignores in this file
+# - also create an entry in the vulnerabilites.openvex.json as under_investigation
+# - Keep the expiry 1 week before the next planned release
+# - If it is determined that we are unaffected please make use of vulnerabilites.openvex.json
+###############################################

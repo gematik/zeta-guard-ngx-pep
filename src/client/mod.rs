@@ -356,16 +356,16 @@ pub fn create_dpop_proof(
     registration: &ClientRegistration,
     htm: &str,
     htu: &str,
-    ath: Option<String>,
-    nonce: Option<String>,
+    ath: Option<&str>,
+    nonce: Option<&str>,
 ) -> Result<String> {
     registration.sign_jwt(
         Some("dpop+jwt".to_string()),
         DPoPProofJwtPayload {
             htm: htm.to_string(),
             htu: htu.to_string(),
-            ath,
-            nonce,
+            ath: ath.map(|x| x.to_string()),
+            nonce: nonce.map(|x| x.to_string()),
             iat: get_current_timestamp().try_into()?,
             jti: Uuid::new_v4().to_string(),
         },
@@ -380,10 +380,13 @@ async fn create_client_assertion(
     let now: i64 = get_current_timestamp().try_into().unwrap();
     let nonce = Base64UrlUnpadded::decode_vec(&nonce).expect("nonce");
 
-    let public_key_hash: [u8; 32] = Sha256::digest(PUBLIC_KEY.clone()).into();
-    let attestation_challenge: [u8; 32] =
-        Sha256::digest([public_key_hash.to_vec(), nonce].concat()).into();
-    let attestation_challenge = Base64::encode_string(&attestation_challenge);
+    let encoding_key = EncodingKey::from_ec_pem(&PEM)?;
+    let jwk = Jwk::from_encoding_key(&encoding_key, Algorithm::ES256)?;
+    let thumbprint =
+        Base64UrlUnpadded::decode_vec(&jwk.thumbprint(jsonwebtoken::jwk::ThumbprintHash::SHA256))?;
+
+    let attestation_challenge: [u8; 32] = Sha256::digest([thumbprint, nonce].concat()).into();
+    let attestation_challenge = Base64UrlUnpadded::encode_string(&attestation_challenge);
 
     // TODO: client_assertion can't be constructed from the schema currently, because
     // client-self-assessment is not defined. Remove the json!() invocation below when this is fixed
@@ -495,7 +498,7 @@ pub fn get_with_dpop(
         registration,
         "GET",
         url.as_str(),
-        Some(Base64UrlUnpadded::encode_string(&Sha256::digest(
+        Some(&Base64UrlUnpadded::encode_string(&Sha256::digest(
             access_token,
         ))),
         None,
@@ -516,13 +519,20 @@ pub fn post_with_dpop(
         registration,
         "POST",
         url.as_str(),
-        Some(Base64UrlUnpadded::encode_string(&Sha256::digest(
+        Some(&Base64UrlUnpadded::encode_string(&Sha256::digest(
             access_token,
         ))),
         None,
     )?;
+    let host = url.host().context("url needs a host")?;
+    let hostport = match url.port() {
+        Some(port) => format!("{}:{}", host, port),
+        None => host.to_string(),
+    };
     Ok(client
         .post(url)
         .bearer_auth(access_token)
+        .header("host", hostport)
         .header("dpop", &dpop))
 }
+

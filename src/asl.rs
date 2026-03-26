@@ -25,49 +25,52 @@
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use anyhow::{Result, anyhow, bail};
-use asl::{Environment, decrypt_request, encrypt_response, finish_handshake, initiate_handshake};
-use async_compat::Compat;
+use anyhow::{Context, anyhow};
+use asl::{
+    AslError, Environment, decrypt_request, encrypt_response, finish_handshake, initiate_handshake,
+};
 use http::Method;
 use nginx_sys::{NGX_LOG_ERR, ngx_cycle};
-use ngx::async_::spawn;
 use ngx::core::Status;
 use ngx::http::{HTTPStatus, HttpModuleLocationConf, HttpModuleMainConf, Request};
 use ngx::{ngx_log_debug_http, ngx_log_error};
 use reqwest::Url;
 
 use crate::conf::MainConfig;
+use crate::error::{ToHttpResponse, ZetaAslResult};
 use crate::request_body::read_request_body;
 use crate::request_ops::RequestOps;
-use crate::response::{Body, Response, finalize_request};
+use crate::response::{Body, Response};
 use crate::session_cache::ShmSessionCache;
-use crate::{CLIENT, Module, ModuleCtx, SELF_URL_CV};
+use crate::{CLIENT, Module, ModuleCtx, SELF_URL_CV, spawn_compat};
 
 /// see also: https://github.com/http-rs/async-h1/blob/main/src/lib.rs#L100
 static MAX_HEADERS: usize = 128;
 
-static SESSION_CACHE: LazyLock<ShmSessionCache> = LazyLock::new(|| {
+pub(crate) static SESSION_CACHE: LazyLock<ShmSessionCache> = LazyLock::new(|| {
     let main_conf: &mut MainConfig =
         unsafe { Module::main_conf_mut(&*ngx_cycle).expect("main_conf") };
     ShmSessionCache::new(unsafe { main_conf.shm_zone.as_mut().expect("as_mut") })
         .expect("ShmSessionCache")
 });
 
-static ERROR_RESPONSE: Response = Response {
-    status: HTTPStatus::INTERNAL_SERVER_ERROR,
-    content_type: None,
-    body: Body(vec![]),
-};
+// we can't format the error as application/cbor when that is not acceptable → text/plain
+static UNACCEPTABLE: LazyLock<Response> = LazyLock::new(|| {
+    Response::new_with_body(
+        HTTPStatus(406),
+        "text/plain",
+        "Not Acceptable: application/cbor".as_bytes().to_vec(),
+    )
+});
 
-async fn handle_m1(request: &mut Request, body: &[u8]) -> Result<Response> {
+async fn handle_m1(request: &mut Request, body: &[u8]) -> ZetaAslResult<Response> {
     ngx_log_debug_http!(request, "asl: M1 read, {}b", body.len());
 
     if !request.acceptable("application/cbor")? {
-        return Ok(Response::new(HTTPStatus(406)));
+        return Ok(UNACCEPTABLE.clone());
     }
 
-    let (handshake_state, m2) = initiate_handshake(SESSION_CACHE.server_config(), body, &[])
-        .map_err(|e| anyhow!("{e:?}"))?;
+    let (handshake_state, m2) = initiate_handshake(SESSION_CACHE.server_config(), body, &[])?;
     let cid: String = SESSION_CACHE.init_handshake(handshake_state).await?;
 
     ngx_log_debug_http!(request, "asl: new cid {}, M2 {}b", cid, m2.len());
@@ -80,32 +83,35 @@ async fn handle_m1(request: &mut Request, body: &[u8]) -> Result<Response> {
     ))
 }
 
-async fn handle_m3(request: &mut Request, cid: String, body: &[u8]) -> Result<Response> {
+async fn handle_m3(request: &mut Request, cid: String, body: &[u8]) -> ZetaAslResult<Response> {
     ngx_log_debug_http!(request, "asl: M3 read, {}b", body.len());
 
     if !request.acceptable("application/cbor")? {
-        return Ok(Response::new(HTTPStatus(406)));
+        return Ok(UNACCEPTABLE.clone());
     }
 
     let handshake_state = SESSION_CACHE.finish_handshake(&cid).await?;
 
-    let (session, m4) = finish_handshake(SESSION_CACHE.server_config(), handshake_state, body)
-        .map_err(|e| anyhow!("libasl — {e:?}"))?;
+    let (session, m4) = finish_handshake(SESSION_CACHE.server_config(), handshake_state, body)?;
 
     SESSION_CACHE.start_session(&cid, session).await?;
 
-    Ok(Response {
-        status: HTTPStatus::OK,
-        content_type: Some("application/cbor".to_string()),
-        body: Body(m4),
-    })
+    Ok(Response::new_with_body(
+        HTTPStatus::OK,
+        "application/cbor",
+        m4,
+    ))
 }
 
-async fn handle_subrequest(request: &mut Request, cid: String, body: &[u8]) -> Result<Response> {
+async fn handle_subrequest(
+    request: &mut Request,
+    cid: String,
+    body: &[u8],
+) -> ZetaAslResult<Response> {
     ngx_log_debug_http!(request, "asl: data read, {}b", body.len());
 
     if !request.acceptable("application/octet-stream")? {
-        return Ok(Response::new(HTTPStatus(406)));
+        return Ok(UNACCEPTABLE.clone());
     }
 
     let asl_config = SESSION_CACHE.server_config();
@@ -113,52 +119,71 @@ async fn handle_subrequest(request: &mut Request, cid: String, body: &[u8]) -> R
     if asl_config.env == Environment::Production
         && request.get_header_in("ZETA-ASL-nonPU-Tracing").is_some()
     {
-        bail!("ZETA-ASL-nonPU-Tracing in Production");
+        return Err(AslError::BadRequest(anyhow!(
+            "ZETA-ASL-nonPU-Tracing in Production"
+        )));
     }
 
     let session = SESSION_CACHE.continue_session(&cid).await?;
-    // TODO: validate ctr — how?
     let (ctr, inner) = decrypt_request(asl_config, &session, body)?;
 
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut inner_request = httparse::Request::new(&mut headers);
-    let status = inner_request.parse(&inner)?;
+    let status = inner_request
+        .parse(&inner)
+        .context("unparseable inner request")?;
     if status.is_partial() {
-        anyhow::bail!("partial request");
+        return Err(AslError::BadRequest(anyhow!("partial request")));
     }
     let header_len = status.unwrap();
     let body: Vec<u8> = inner[header_len..].into();
 
     let method = inner_request
         .method
-        .ok_or_else(|| anyhow::anyhow!("missing method"))?;
+        .ok_or_else(|| AslError::BadRequest(anyhow!("missing method")))?;
     let path = inner_request
         .path
-        .ok_or_else(|| anyhow::anyhow!("missing path"))?;
+        .ok_or_else(|| AslError::BadRequest(anyhow!("missing path")))?;
 
-    let mut parsed_headers = Vec::new();
-    for h in &mut *inner_request.headers {
-        parsed_headers.push((
-            String::from_utf8_lossy(h.name.as_bytes()).into_owned(),
-            String::from_utf8_lossy(h.value).into_owned(),
-        ));
-    }
-
-    let method = Method::from_bytes(method.as_bytes())?;
-    let client = CLIENT.get().expect("reqwest client");
+    let method = Method::from_bytes(method.as_bytes())
+        .context("unparseable method")
+        .map_err(AslError::BadRequest)?;
+    let client = CLIENT
+        .get()
+        .ok_or_else(|| anyhow!("CLIENT not initialized"))?;
 
     let url = request
-        .get_complex_value(unsafe { (&raw const SELF_URL_CV).as_ref().expect("SELF_URL_CV") })
-        .expect("get_complex_value")
-        .to_str()?;
-    let url = Url::parse(url)?.join(path)?;
+        .get_complex_value(unsafe { (&raw const SELF_URL_CV).as_ref().unwrap() })
+        .context("SELF_URL_CV as_ref")?
+        .to_str()
+        .context("SELF_URL_CV: invalid utf-8")?;
+    let url = Url::parse(url)
+        .context(format!("unparseable url: {url}"))?
+        .join(path)
+        .context(format!("invalid path: {path}"))?;
     let mut subrequest = client.request(method, url);
 
     for header in inner_request.headers.iter() {
-        subrequest = subrequest.header(header.name, header.value);
+        match header.name.to_lowercase().as_str() {
+            "forwarded" | "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host"
+            | "x-forwarded-port" => {}
+            _ => subrequest = subrequest.header(header.name, header.value),
+        };
     }
 
-    let subresponse = subrequest.body(body).send().await?;
+    let (scheme, host, port) = request.eigenuri_parts()?;
+    let forwarded = match port {
+        Some(port) => format!("host={host}:{port};proto={scheme}"),
+        None => format!("host={host};proto={scheme}"),
+    };
+
+    subrequest = subrequest.header("forwarded", forwarded);
+
+    let subresponse = subrequest
+        .body(body)
+        .send()
+        .await
+        .context("unable to send inner request")?;
     let status = subresponse.status();
 
     let mut response_bytes = Vec::new();
@@ -179,7 +204,12 @@ async fn handle_subrequest(request: &mut Request, cid: String, body: &[u8]) -> R
     response_bytes.extend_from_slice(b"\r\n");
 
     // body
-    response_bytes.extend_from_slice(&subresponse.bytes().await?);
+    response_bytes.extend_from_slice(
+        &subresponse
+            .bytes()
+            .await
+            .context("unable to construct inner response")?,
+    );
 
     let response = encrypt_response(
         SESSION_CACHE.server_config(),
@@ -188,8 +218,6 @@ async fn handle_subrequest(request: &mut Request, cid: String, body: &[u8]) -> R
         &response_bytes,
     )?;
 
-    // TODO: errors become application/cbor with a structure given in A_26924, and map http reponse
-    // codes
     Ok(Response {
         status: HTTPStatus::OK,
         content_type: Some("application/octet-stream".to_string()),
@@ -197,13 +225,37 @@ async fn handle_subrequest(request: &mut Request, cid: String, body: &[u8]) -> R
     })
 }
 
-async fn asl_handler(request: &mut Request) -> Result<Response> {
-    if request.method() != "POST" {
+fn handle_cert_data(request: &mut Request, path: String) -> ZetaAslResult<Response> {
+    ngx_log_debug_http!(request, "asl: Requested {}", path);
+
+    if request.method() != "GET" {
         return Ok(Response::new(HTTPStatus::NOT_ALLOWED));
     }
 
+    let config = SESSION_CACHE.server_config();
+    if !path.ends_with(&config.signed_keys.version()) {
+        return Ok(Response::new(HTTPStatus::NOT_FOUND));
+    }
+
+    let cert_data = config.cert_data.to_vec()?;
+
+    Ok(Response {
+        status: HTTPStatus::OK,
+        content_type: Some("application/cbor".to_string()),
+        body: Body(cert_data),
+    })
+}
+
+async fn asl_handler(request: &mut Request) -> ZetaAslResult<Response> {
     let path = request.path().to_string();
     let path = path.strip_suffix("/").unwrap_or(&path);
+
+    if path.starts_with("/CertData.") {
+        return handle_cert_data(request, path.to_string());
+    }
+    if request.method() != "POST" {
+        return Ok(Response::new(HTTPStatus::NOT_ALLOWED));
+    }
 
     let body = match read_request_body(request).await? {
         Ok(body) => body,
@@ -217,7 +269,7 @@ async fn asl_handler(request: &mut Request) -> Result<Response> {
         }
     };
     if body.is_empty() {
-        bail!("empty body");
+        return Err(AslError::BadRequest(anyhow!("empty body")));
     }
 
     if path == "/ASL" {
@@ -249,20 +301,17 @@ pub fn handler(request: &mut Request) -> Status {
             ngx_log_debug_http!(request, "asl: enter");
 
             let r_ptr = AtomicPtr::new(request.into());
-            let task = spawn(Compat::new(async move {
+            let task = spawn_compat(async move {
                 let r_ptr = r_ptr.load(Ordering::Relaxed);
                 let request = unsafe { ngx::http::Request::from_ngx_http_request(r_ptr) };
 
                 let response = asl_handler(request).await.unwrap_or_else(|e| {
                     ngx_log_error!(NGX_LOG_ERR, request.log(), "asl: error — {e:?}");
-                    ERROR_RESPONSE.clone()
+                    e.to_http_resposnse()
                 });
 
-                if let Err(e) = response.send(request) {
-                    ngx_log_error!(NGX_LOG_ERR, request.log(), "error sending response — {e}");
-                };
-                finalize_request(request, Status::NGX_DONE.0);
-            }));
+                response.send(request, Status::NGX_OK);
+            });
 
             ModuleCtx::insert_asl_task(request, task);
 

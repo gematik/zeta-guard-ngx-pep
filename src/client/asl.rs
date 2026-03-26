@@ -22,11 +22,12 @@
  * #L%
  */
 
+use std::collections::HashMap;
 use std::io::Write;
 
 use anyhow::{Context, Result, bail};
 use base64ct::{Base64UrlUnpadded, Encoding};
-use http::{Method, Uri};
+use http::{HeaderMap, HeaderValue, Method, Uri};
 use reqwest::{Client, Url};
 use sha2::{Digest, Sha256};
 
@@ -34,9 +35,10 @@ use asl::client::{
     HandshakeKeys, SessionState, continue_handshake, finish_handshake, initiate_handshake_with_keys,
 };
 use asl::client::{decrypt_response, encrypt_request};
-use asl::{Environment, raw_keys_from_bytes};
+use asl::{Environment, ErrorResponse, raw_keys_from_bytes};
 
 use crate::client::{ClientRegistration, create_dpop_proof, post_with_dpop};
+use crate::typify::HttpZetaErrorResponse;
 
 const CLIENT_ECDH_SK_HEX: &str = "3bdbaa604b9f5be68d938b543464f1515d24535974e0cbeb2c7779b35e9a6a93";
 const CLIENT_ECDH_PK_HEX: &str = "be58f717ff585fd57a21ceaa17f9153180e379048947ad22820e1f359b52019fb9a8dfce2b054f426db806387f3e918a8daa9d286caf54e8ff37e1165ead5cd8";
@@ -63,9 +65,9 @@ pub async fn asl_handshake(
     let (state, m1) = initiate_handshake_with_keys(Environment::Testing, client_keys.clone())?;
 
     let response = post_with_dpop(
-        &registration,
+        registration,
         client.clone(),
-        &access_token,
+        access_token,
         url.join("ASL/")?,
     )?
     .header("content-type", "application/cbor")
@@ -80,9 +82,10 @@ pub async fn asl_handshake(
     let cid = cid[0].to_str()?.to_string();
     let m2 = response.bytes().await?.to_vec().clone();
 
-    let (state, m3) = continue_handshake(state, &m2)?;
+    // TODO: should verify ASL signed keys via verify lambda
+    let (state, m3) = continue_handshake(state, &m2, |_| true)?;
 
-    let m4 = post_with_dpop(&registration, client, &access_token, url.join(&cid)?)?
+    let m4 = post_with_dpop(registration, client, access_token, url.join(&cid)?)?
         .header("content-type", "application/cbor")
         .body(m3)
         .send()
@@ -96,36 +99,30 @@ pub async fn asl_handshake(
     Ok((cid, state))
 }
 
-pub fn encode_http_request(
-    registration: &ClientRegistration,
-    method: Method,
+pub fn encode_http_request_with_dpop(
     uri: Uri,
     access_token: &str,
+    dpop: String,
+    extra_headers: Option<HashMap<&str, &str>>,
 ) -> Result<Vec<u8>> {
     let hostport = format!(
         "{}:{}",
         uri.host().context("host")?,
         uri.port_u16().unwrap_or(443)
     );
-    let req = http::Request::builder()
+    let mut req = http::Request::builder()
         .method(Method::GET)
         .uri(uri.clone())
         .header("host", hostport)
-        .header("authorization", format!("Bearer {access_token}"))
-        .header(
-            "dpop",
-            create_dpop_proof(
-                registration,
-                method.as_str(),
-                &uri.to_string(),
-                Some(Base64UrlUnpadded::encode_string(&Sha256::digest(
-                    &access_token,
-                ))),
-                None,
-            )?,
-        )
-        .body(&[] as &[u8])
-        .context("request builder")?;
+        .header("authorization", format!("DPoP {access_token}"))
+        .header("dpop", dpop);
+    if let Some(headers) = extra_headers {
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+    };
+    let req = req.body(&[] as &[u8]).context("request builder")?;
+
     let (parts, body) = req.into_parts();
     let mut buf = Vec::new();
 
@@ -150,6 +147,115 @@ pub fn encode_http_request(
     Ok(buf)
 }
 
+pub fn encode_http_request(
+    registration: &ClientRegistration,
+    method: Method,
+    uri: Uri,
+    access_token: &str,
+    extra_headers: Option<HashMap<&str, &str>>,
+) -> Result<Vec<u8>> {
+    let dpop = create_dpop_proof(
+        registration,
+        method.as_str(),
+        &uri.to_string(),
+        Some(&Base64UrlUnpadded::encode_string(&Sha256::digest(
+            access_token,
+        ))),
+        None,
+    )?;
+    encode_http_request_with_dpop(uri, access_token, dpop, extra_headers)
+}
+
+#[derive(Debug)]
+pub enum AslResponse {
+    Body(Vec<u8>),
+    Error(ErrorResponse),
+    HttpError(HttpZetaErrorResponse),
+}
+
+#[allow(clippy::too_many_arguments)] // no, clippy, this is just the right amount of arguments!
+pub async fn asl_request_with_dpop(
+    dpop: &str,
+    client: Client,
+    access_token: &str,
+    target: Url,
+    cid: &str,
+    state: &mut SessionState,
+    req_ctr: u64,
+    inner: &[u8],
+    extra_headers: Option<HeaderMap<HeaderValue>>,
+) -> Result<AslResponse> {
+    let inner_enc = encrypt_request(state, req_ctr, inner)?;
+
+    let url = target.join(cid)?;
+    let host = url.host().context("url needs a host")?;
+    let hostport = match url.port() {
+        Some(port) => format!("{}:{}", host, port),
+        None => host.to_string(),
+    };
+
+    let mut request = client
+        .post(url)
+        .bearer_auth(access_token)
+        .header("host", hostport)
+        .header("dpop", dpop)
+        .header("content-type", "application/octet-stream");
+
+    if let Some(headers) = extra_headers {
+        request = request.headers(headers);
+    }
+
+    let response = request.body(inner_enc).send().await?;
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .cloned()
+        .expect("content-type");
+    let content_type = content_type.to_str()?;
+
+    let status = response.status();
+    let response_bitez = response.bytes().await?.clone();
+
+    if status.is_success() {
+        assert!(
+            content_type == "application/octet-stream",
+            "unexpected content-type; want \"application/octet-stream\", got \"{content_type}\""
+        );
+        let response_bytes = decrypt_response(state, req_ctr, &response_bitez)?;
+
+        let mut headers = [httparse::EMPTY_HEADER; 128];
+        let mut response = httparse::Response::new(&mut headers);
+        let parse_status = response.parse(&response_bytes)?;
+
+        if parse_status.is_partial() {
+            anyhow::bail!("partial response");
+        }
+        let header_len = parse_status.unwrap();
+        let body: Vec<u8> = response_bytes[header_len..].into();
+
+        let status = response.code.expect("code");
+        let reason = response.reason.expect("reason");
+        if status != 200 {
+            bail!("inner status: {} {}", status, reason);
+        }
+
+        Ok(AslResponse::Body(body))
+    } else {
+        match content_type {
+            "application/json" => {
+                let err: HttpZetaErrorResponse = serde_json::from_slice(&response_bitez)?;
+                Ok(AslResponse::HttpError(err))
+            }
+            "application/cbor" => {
+                let err: ErrorResponse = serde_cbor::from_slice(&response_bitez)?;
+                Ok(AslResponse::Error(err))
+            }
+            _ => panic!("neither http nor asl error, should not happen"),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // no, clippy, this is just the right amount of arguments!
 pub async fn asl_request(
     registration: &ClientRegistration,
     client: Client,
@@ -159,34 +265,28 @@ pub async fn asl_request(
     state: &mut SessionState,
     req_ctr: u64,
     inner: &[u8],
-) -> Result<Vec<u8>> {
-    let request = encrypt_request(state, req_ctr, inner)?;
+    extra_headers: Option<HeaderMap<HeaderValue>>,
+) -> Result<AslResponse> {
+    let dpop = create_dpop_proof(
+        registration,
+        "POST",
+        target.join(cid)?.as_str(),
+        Some(&Base64UrlUnpadded::encode_string(&Sha256::digest(
+            access_token,
+        ))),
+        None,
+    )?;
 
-    let response = post_with_dpop(&registration, client, access_token, target.join(cid)?)?
-        .header("content-type", "application/octet-stream")
-        .body(request)
-        .send()
-        .await?
-        .bytes()
-        .await?;
-
-    let response_bytes = decrypt_response(&state, req_ctr as u64, &response)?;
-
-    let mut headers = [httparse::EMPTY_HEADER; 128];
-    let mut response = httparse::Response::new(&mut headers);
-    let parse_status = response.parse(&response_bytes)?;
-
-    if parse_status.is_partial() {
-        anyhow::bail!("partial response");
-    }
-    let header_len = parse_status.unwrap();
-    let body: Vec<u8> = response_bytes[header_len..].into();
-
-    let status = response.code.expect("code");
-    let reason = response.reason.expect("reason");
-    if status != 200 {
-        bail!("{} {}", status, reason);
-    }
-
-    Ok(body)
+    asl_request_with_dpop(
+        &dpop,
+        client,
+        access_token,
+        target,
+        cid,
+        state,
+        req_ctr,
+        inner,
+        extra_headers,
+    )
+    .await
 }

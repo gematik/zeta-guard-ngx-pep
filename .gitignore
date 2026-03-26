@@ -1,6 +1,9 @@
 /target
+/xtask/target
 
 .envrc.local
+.nginx
+.nginx-cache
 
 .idea
 

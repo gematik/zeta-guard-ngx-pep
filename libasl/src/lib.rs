@@ -33,6 +33,7 @@ pub use server::*;
 
 pub mod keys;
 pub use keys::*;
+pub mod roots;
 
 pub mod client;
 

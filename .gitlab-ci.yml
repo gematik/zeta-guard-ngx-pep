@@ -6,6 +6,16 @@ spec:
       default: false
 
 ---
+# prevent duplicate pipelines
+# https://docs.gitlab.com/ci/jobs/job_rules/#avoid-duplicate-pipelines
+# https://docs.gitlab.com/ci/yaml/workflow/#switch-between-branch-pipelines-and-merge-request-pipelines
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
 stages:
   - build
   - test
@@ -13,13 +23,14 @@ stages:
   - publish
 
 include:
-  - component: "$CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-scanning@v0.3.1"
+  - component: "$CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-scanning@v0.4.2"
     inputs:
       analyzer-image: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/aquasec/trivy:latest"
       cs-image: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
       git-strategy: fetch
       severity: HIGH,CRITICAL
       job-stage: test
+      openvex-file: "vulnerabilites.openvex.json"
 
 default:
   image: $CI_REGISTRY/zeta/devops/ci-images/docker:24.0.5-zeta-0
@@ -37,9 +48,9 @@ variables:
   DOCKER_TLS_CERTDIR: /certs
   DOCKER_CERT_PATH: $DOCKER_TLS_CERTDIR/client
   DOCKER_TLS_VERIFY: "1"
-  BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.92-slim-bookworm
-  # NOTE: must match major.minor of cargo-dependency `nginx-src`
-  BASE_IMAGE: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx:1.28.1-trixie-otel"
+  BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.94-slim-bookworm
+  NGINX_VERSION: "1.29.5" # NOTE: keep in sync with .cargo/config.toml and Dockerfile
+  BASE_IMAGE: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginxinc/nginx-unprivileged:$NGINX_VERSION-trixie-otel"
   IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
 
 before_script:
@@ -89,16 +100,18 @@ build:
       paths:
         - "${CI_PROJECT_DIR}/target"
         - "${CI_PROJECT_DIR}/.cargo-home"
+        - "${CI_PROJECT_DIR}/.nginx"
+        - "${CI_PROJECT_DIR}/.nginx-cache"
   variables:
     IT_AUTH: https://zeta-cd.westeurope.cloudapp.azure.com/auth
   script:
     - |
+      export CARGO_HOME="${CI_PROJECT_DIR}/.cargo-home"
+      mkdir -p "$CARGO_HOME"
+
       MIRROR=${AZDO_CRATES_MIRROR_URL:-} \
         TOKEN=${AZDO_CRATES_PAT:-} \
         . /usr/local/bin/cargo-env
-
-      export CARGO_HOME="${CI_PROJECT_DIR}/.cargo-home"
-      mkdir -p "$CARGO_HOME"
 
       IT_P12=$(mktemp)
       export IT_P12
@@ -172,6 +185,8 @@ trigger_helm:
       when: never
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_success
     - when: never
   trigger:
     project: zeta/devops/zeta-guard-helm
@@ -231,3 +246,38 @@ publish_artifacts:
     - git add .
     - git commit -m "$COMMIT_MESSAGE"
     - git push
+
+publish_to_dependencytrack:
+  image: alpine/curl:8.17.0
+  stage: publish
+  rules:
+    - if: $CI_COMMIT_TAG
+      variables:
+        VERSION: "$CI_COMMIT_TAG"
+      when: on_success
+    - if: $CI_COMMIT_BRANCH == "staging"
+      variables:
+        VERSION: "staging $CI_COMMIT_SHORT_SHA"
+      when: on_success
+    - if: $CI_COMMIT_BRANCH == "release"
+      variables:
+        VERSION: "release $CI_COMMIT_SHORT_SHA"
+      when: on_success
+    - if: $CI_MERGE_REQUEST_ID
+      variables:
+        VERSION: "MR $CI_MERGE_REQUEST_ID"
+      when: on_success
+    - when: never
+  needs:
+    - job: build
+      artifacts: true
+  before_script: []
+  script:
+    - >-
+      curl -X POST https://tas-devtools-dependencytrack.westeurope.azurecontainer.io/api/v1/bom
+      -H "Content-Type: multipart/form-data"
+      -H "X-API-Key: ${DEPENDENCYTRACK_TOKEN}"
+      -F "projectName=ngx_pep"
+      -F "projectVersion=${VERSION}"
+      -F "autoCreate=true"
+      -F "bom=@ngx_pep.cdx.json"

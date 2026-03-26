@@ -32,7 +32,7 @@ use std::{
     ffi::{c_char, c_void},
     time::Duration,
 };
-
+use anyhow::anyhow;
 use ngx::{
     ffi::{ngx_command_t, ngx_conf_t, ngx_str_t},
     http::{HttpModuleLocationConf, HttpModuleMainConf, Merge, MergeConfigError},
@@ -104,6 +104,7 @@ macro_rules! loc_command {
 
 // MAIN
 #[derive(Debug, Clone)]
+#[cfg_attr(test, allow(unused))]
 pub struct MainConfig {
     pub pdp_issuer: Option<String>,
     pub popp_issuer: Option<String>,
@@ -115,6 +116,12 @@ pub struct MainConfig {
     pub http_client_timeout: Duration,
     pub http_client_accept_invalid_certs: bool,
     pub asl_testing: bool,
+    pub asl_signer_cert: Option<String>,
+    pub asl_signer_key: Option<String>,
+    pub asl_ca_cert: Option<String>,
+    pub asl_roots_json: Option<String>,
+    pub asl_root_ca: Option<String>,
+    pub asl_ocsp_url: Option<String>,
     pub shm_zone: *mut ngx_shm_zone_t,
 }
 
@@ -131,6 +138,12 @@ impl Default for MainConfig {
             http_client_timeout: Duration::from_secs(10),
             http_client_accept_invalid_certs: false,
             asl_testing: false,
+            asl_signer_cert: None,
+            asl_signer_key: None,
+            asl_ca_cert: None,
+            asl_roots_json: None,
+            asl_root_ca: None,
+            asl_ocsp_url: None,
             shm_zone: ptr::null_mut(),
         }
     }
@@ -249,21 +262,85 @@ conf_handler!(pep_popp_issuer, MainConfig, |conf: &mut MainConfig,
     Ok(ngx::core::NGX_CONF_OK)
 });
 
-conf_handler!(
-    pep_asl_testing,
-    MainConfig,
-    |conf: &mut MainConfig, val: &str| -> anyhow::Result<*mut c_char> {
-        if val.eq_ignore_ascii_case("on") {
-            conf.asl_testing = true;
-        } else if val.eq_ignore_ascii_case("off") {
-            conf.asl_testing = false;
-        } else {
-            anyhow::bail!("Unable to parse asl_testing: {val}")
-        }
-
-        Ok(ngx::core::NGX_CONF_OK)
+#[inline(always)]
+fn non_empty(name: &str, val: &str) -> anyhow::Result<String> {
+    if val.trim().is_empty() {
+        Err(anyhow!("{} empty", name))
+    } else {
+        Ok(val.to_string())
     }
-);
+}
+
+conf_handler!(pep_asl_signer_cert, MainConfig, |conf: &mut MainConfig,
+                                                val: &str|
+ -> anyhow::Result<
+    *mut c_char,
+> {
+    conf.asl_signer_cert = Some(non_empty("pep_asl_signer_cert", val)?);
+    Ok(ngx::core::NGX_CONF_OK)
+});
+
+conf_handler!(pep_asl_signer_key, MainConfig, |conf: &mut MainConfig,
+                                                val: &str|
+ -> anyhow::Result<
+    *mut c_char,
+> {
+    conf.asl_signer_key = Some(non_empty("pep_asl_signer_key", val)?);
+    Ok(ngx::core::NGX_CONF_OK)
+});
+
+conf_handler!(pep_asl_ca_cert, MainConfig, |conf: &mut MainConfig,
+                                                val: &str|
+ -> anyhow::Result<
+    *mut c_char,
+> {
+    conf.asl_ca_cert = Some(non_empty("pep_asl_ca_cert", val)?);
+    Ok(ngx::core::NGX_CONF_OK)
+});
+
+conf_handler!(pep_asl_roots_json, MainConfig, |conf: &mut MainConfig,
+                                                val: &str|
+ -> anyhow::Result<
+    *mut c_char,
+> {
+    conf.asl_roots_json = Some(non_empty("pep_asl_roots_json", val)?);
+    Ok(ngx::core::NGX_CONF_OK)
+});
+
+conf_handler!(pep_asl_root_ca, MainConfig, |conf: &mut MainConfig,
+                                                val: &str|
+ -> anyhow::Result<
+    *mut c_char,
+> {
+    conf.asl_root_ca = Some(non_empty("pep_asl_root_ca", val)?);
+    Ok(ngx::core::NGX_CONF_OK)
+});
+
+conf_handler!(pep_asl_ocsp_url, MainConfig, |conf: &mut MainConfig,
+                                                val: &str|
+ -> anyhow::Result<
+    *mut c_char,
+> {
+    conf.asl_ocsp_url = Some(non_empty("pep_asl_ocsp_url", val)?);
+    Ok(ngx::core::NGX_CONF_OK)
+});
+
+
+conf_handler!(pep_asl_testing, MainConfig, |conf: &mut MainConfig,
+                                            val: &str|
+ -> anyhow::Result<
+    *mut c_char,
+> {
+    if val.eq_ignore_ascii_case("on") {
+        conf.asl_testing = true;
+    } else if val.eq_ignore_ascii_case("off") {
+        conf.asl_testing = false;
+    } else {
+        anyhow::bail!("Unable to parse asl_testing: {val}")
+    }
+
+    Ok(ngx::core::NGX_CONF_OK)
+});
 
 // LOCATION
 
@@ -431,7 +508,7 @@ conf_handler!(
     }
 );
 
-pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 18] = [
+pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 24] = [
     main_command!("pep_pdp_issuer", pep_pdp_issuer),
     main_command!("pep_popp_issuer", pep_popp_issuer),
     main_command!("pep_http_client_idle_timeout", pep_http_client_idle_timeout),
@@ -453,6 +530,12 @@ pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 18] = [
         pep_http_client_accept_invalid_certs
     ),
     main_command!("pep_asl_testing", pep_asl_testing),
+    main_command!("pep_asl_signer_cert", pep_asl_signer_cert),
+    main_command!("pep_asl_signer_key", pep_asl_signer_key),
+    main_command!("pep_asl_ca_cert", pep_asl_ca_cert),
+    main_command!("pep_asl_roots_json", pep_asl_roots_json),
+    main_command!("pep_asl_root_ca", pep_asl_root_ca),
+    main_command!("pep_asl_ocsp_url", pep_asl_ocsp_url),
     loc_command!("pep", pep),
     loc_command!("pep_require_aud", pep_require_aud),
     loc_command!("pep_require_scope", pep_require_scope),

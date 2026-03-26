@@ -96,7 +96,7 @@ pub async fn ws_request(uri: Uri, auth: &str, dpop: &str, msg: u8) -> Result<u8>
         .header(HOST, &hostport)
         .uri(paq)
         .header(UPGRADE, "echo")
-        .header(AUTHORIZATION, format!("Bearer {auth}"))
+        .header(AUTHORIZATION, format!("DPoP {auth}"))
         .header("dpop", dpop)
         .body(Empty::<Bytes>::new())?;
 

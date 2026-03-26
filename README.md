@@ -9,7 +9,11 @@ You need the following programs:
 - pkg-config
 - C toolchain (clang works best)
 - gnu make
-- [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov)
+- gnupg to verify nginx tarballs
+- cargo tools (install with `cargo install --locked …`):
+    - [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov)
+    - [mdbook](https://github.com/rust-lang/mdBook)
+    - [cargo-nextest](https://github.com/nextest-rs/nextest)
 
 Required C libraries and headers:
 - pcre2
@@ -25,6 +29,39 @@ The nginx configure script will yell at you when something is missing.
 
 # environment
 
+## nginx sources
+
+A nginx source tree is required to build the module, and to run the integration tests.
+The `NGINX_VERSION` is configured in `.cargo/config.toml`, but an exported env variable
+can override it.
+
+> [!IMPORTANT]  
+> Once initially, and for every `NGINX_VERSION` change, `cargo xtask configure` must be
+> run. This fetches tarballs into `.nginx-cache`, verifies signatures, and configures the
+> source tree in `.nginx`. This is built automatically and installed into `./prefix` by
+> `build.rs`.
+
+> [!IMPORTANT]  
+> The current `NGINX_VERSION` is mentioned in `Dockerfile` (for the local docker build),
+> and `.gitlab-ci` for the base images. Keep in sync with `.cargo/config.toml`!
+
+`prefix` is set as nginx' prefix, so most paths are relative to that directory,
+e.g.:
+- nginx will look in ./prefix/conf/nginx.conf instead of /etc/nginx.conf
+- "load_module modules/debug/libngx_pep.so;" will load ./prefix/modules/debug/libngx_pep.so
+  (which is a symlink that points to the libnx_pep.so built by "cargo build")
+- temp files are written to ./prefix/*_temp/
+- etc.
+
+`./prefix/sbin/nginx` without arguments starts the server and listens on port 8000 with
+the debug variant of the ngx_pep module enabled, and debug logging
+(`ngx_log_debug_http!`, etc.) enabled.
+
+`misc/nginx.conf.tpl` is a [TinyTemplate](https://github.com/bheisler/TinyTemplate)
+generating the main nginx.conf (for just running `prefix/sbin/nginx`) and test-specific
+configs.
+
+## shell/IDE environment
 To manage project-specific environment variables the `direnv` tool is used.
 When using a JetBrains IDE, the [Direnv Integration](https://plugins.jetbrains.com/plugin/15285-direnv-integration)
 plugin is known to work to make the env available during "import" tasks calling cargo.
@@ -36,10 +73,7 @@ After installation, go to Settings → Direnv Settings and enable both:
 
 ## integration tests, purl, cargo-nextest
 
-You should install [cargo-nextest](https://nexte.st/):
-e.g. by: `cargo install cargo-nextest`.
-
-This is a replacement for `cargo test` with a different process model: one process per
+cargo-nextest is a replacement for `cargo test` with a different process model: one process per
 test (function).
 
 `.config/nextest.toml` has some useful declarations, most notably a setup-script to
@@ -68,9 +102,6 @@ To use the "purl" utility, the following environment variables must be set:
 |IT_AUTH           |https://zeta-cd.westeurope.cloudapp.azure.com/auth                              |
 |IT_P12            |../smb-keystore.p12                                                             |
 |IT_P12_PASS       |ichangedit                                                                      |
-|IT_POPP_P12       |../popp-token-generator/src/main/resources/popp-token-Server-Sim-nist-komp61.p12|
-|IT_POPP_P12_ALIAS |alias                                                                           |
-|IT_POPP_P12_PASS  |00                                                                              |
 
 For easier usage of the `purl` tool, these can also be defined:
 
@@ -105,24 +136,6 @@ In CI, the nginx processes must run as (fake) root to be able to write out cover
 `user root;`. This only has an effect when the master is started as root, i.e. not when
 running the tests locally. So the following warning can be ignored:
 `nginx: [warn] the "user" directive makes sense only if the master process runs with super-user privileges, ignored in …/prefix/conf/test-8004.conf:13`
-
-
-# nginx
-
-Via nginx-sys' "vendored" feature, a nginx source tree is managed by the nginx-source
-crate. ./build.rs additionally calls `make install` in that tree to populate ./prefix
-for easier testing.
-This directory is set as nginx' prefix, so most paths are relative to that directory,
-e.g.:
-- nginx will look in ./prefix/conf/nginx.conf instead of /etc/nginx.conf
-- "load_module modules/debug/libngx_pep.so;" will load ./prefix/modules/debug/libngx_pep.so
-  (which is a symlink that points to the libnx_pep.so built by "cargo build")
-- temp files are written to ./prefix/*_temp/
-- etc.
-
-`./prefix/sbin/nginx` without arguments starts the server and listens on port 8000 with
-the debug variant of the ngx_pep module enabled, and debug logging
-(`ngx_log_debug_http!`, etc.) enabled.
 
 ## License
 

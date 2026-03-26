@@ -23,6 +23,7 @@
  */
 
 use super::model::*;
+use anyhow::{Context, anyhow};
 use libcrux::{aead, digest, drbg::Drbg, hkdf, kem};
 use libcrux_ml_kem::mlkem768;
 use std::cell::RefCell;
@@ -49,9 +50,9 @@ pub(crate) fn hkdf_expand(secret: &[u8], out_len: usize) -> Result<Vec<u8>, AslE
     let salt = [0u8; 32]; // 32 zeroes block
     let info = [0u8; 0]; // empty
     let res = hkdf::hkdf(hkdf::Algorithm::Sha256, &salt, &secret, &info, out_len)
-        .map_err(|_| AslError::InternalError)?;
+        .map_err(|_| anyhow!("hkdf failure"))?;
     if res.len() != out_len {
-        return Err(AslError::InternalError);
+        return Err(anyhow!("hkdf len mismatch; want={out_len}, got={}", res.len()).into());
     }
     Ok(res)
 }
@@ -76,7 +77,7 @@ pub(crate) fn validate_pqc_pk(pk: &[u8]) -> Result<[u8; PQC_PK_SIZE], AslError> 
     if pk.len() != PQC_PK_SIZE {
         return Err(AslError::MissingParameters);
     }
-    let arr: [u8; PQC_PK_SIZE] = pk.try_into().map_err(|_| AslError::DecodingError)?;
+    let arr: [u8; PQC_PK_SIZE] = pk.try_into().to_error().map_err(AslError::DecodingError)?;
     Ok(arr)
 }
 
@@ -92,18 +93,18 @@ pub(crate) fn derive_handshake_material(
 ) -> Result<HandshakeMaterial, AslError> {
     let ecdh_pk_bytes = validate_ecdh_pk(ecdh_pk)?;
     let ecdh_pk_obj = kem::PublicKey::decode(kem::Algorithm::Secp256r1, &ecdh_pk_bytes)
-        .map_err(|_| AslError::DecodingError)?;
+        .to_error()
+        .map_err(AslError::DecodingError)?;
 
     let pqc_pk_bytes = validate_pqc_pk(pqc_pk)?;
     let pqc_pk_obj = libcrux_ml_kem::MlKemPublicKey::from(pqc_pk_bytes);
 
-    let (ss_p, ecdh_ct, pqc_ct) = RNG.with_borrow_mut(|rng| {
-        let (ss_p_ecdh_t1, ecdh_ct_t) =
-            kem::encapsulate(&ecdh_pk_obj, rng).map_err(|_| AslError::InternalError)?;
+    let (ss_p, ecdh_ct, pqc_ct) = RNG.with_borrow_mut(|rng| -> Result<_, AslError> {
+        let (ss_p_ecdh_t1, ecdh_ct_t) = kem::encapsulate(&ecdh_pk_obj, rng).to_error()?;
         let mut ss_p_ecdh_t = ss_p_ecdh_t1.encode();
         ss_p_ecdh_t.truncate(32); // restrict to X coordinate, like in TLS 1.3 (RFC 8446 7.4.2)
 
-        let pqc_random: [u8; 32] = rng.generate_array().map_err(|_| AslError::InternalError)?;
+        let pqc_random: [u8; 32] = rng.generate_array().to_error()?;
         let (pqc_ct_t, ss_p_pqc_t) = mlkem768::encapsulate(&pqc_pk_obj, pqc_random);
 
         let mut ss_p_t = ss_p_ecdh_t;
@@ -180,15 +181,15 @@ pub(crate) fn derive_session_keys(ss_e: &[u8], ss_s: &[u8]) -> Result<SessionKey
 
 pub(crate) fn encrypt_handshake(key: &[u8], plain: &[u8]) -> Result<Vec<u8>, AslError> {
     let key_obj = aead::Key::from_slice(aead::Algorithm::Aes256Gcm, key)
-        .map_err(|_| AslError::DecodingError)?;
+        .to_error()
+        .map_err(AslError::DecodingError)?;
     let iv: aead::Iv = RNG.with_borrow_mut(|rng| aead::Iv::generate(rng));
     let aad: [u8; 0] = []; // unused
 
     let mut res: Vec<u8> = Vec::with_capacity(12 + plain.len() + 16);
     res.extend(&iv.0);
 
-    let (tag, ct) =
-        aead::encrypt_detached(&key_obj, plain, iv, aad).map_err(|_| AslError::InternalError)?;
+    let (tag, ct) = aead::encrypt_detached(&key_obj, plain, iv, aad).to_error()?;
     res.extend(&ct);
     res.extend(tag.as_ref());
 
@@ -196,20 +197,17 @@ pub(crate) fn encrypt_handshake(key: &[u8], plain: &[u8]) -> Result<Vec<u8>, Asl
 }
 
 pub(crate) fn decrypt_handshake(key: &[u8], crypt: &[u8]) -> Result<Vec<u8>, AslError> {
-    let key_obj = aead::Key::from_slice(aead::Algorithm::Aes256Gcm, key)
-        .map_err(|_| AslError::InternalError)?;
+    let key_obj = aead::Key::from_slice(aead::Algorithm::Aes256Gcm, key).to_error()?;
     if crypt.len() < 12 + 16 {
         return Err(AslError::DecryptionFailure);
     };
-    let iv_bytes: &[u8; 12] = &crypt[..12]
-        .try_into()
-        .map_err(|_| AslError::InternalError)?;
+    let iv_bytes: &[u8; 12] = &crypt[..12].try_into().to_error()?;
     let tag_bytes: &[u8] = &crypt[crypt.len() - 16..];
     let msg: &[u8] = &crypt[12..crypt.len() - 16];
     let aad: [u8; 0] = []; // unused
 
     let iv = aead::Iv(*iv_bytes);
-    let tag = aead::Tag::from_slice(&tag_bytes).map_err(|_| AslError::InternalError)?;
+    let tag = aead::Tag::from_slice(&tag_bytes).to_error()?;
     let plain = aead::decrypt_detached(&key_obj, &msg, iv, &aad, &tag);
     let res = plain.map_err(|_| AslError::DecryptionFailure)?;
 
@@ -235,19 +233,16 @@ pub(crate) fn encrypt_session(
     header.extend(req_ctr_bytes);
     header.extend(key_id);
 
-    let iv_random = RNG
-        .with_borrow_mut(|rng| rng.generate_vec(4))
-        .map_err(|_| AslError::InternalError)?;
+    let iv_random = RNG.with_borrow_mut(|rng| rng.generate_vec(4)).to_error()?;
     let mut iv_bytes: Vec<u8> = Vec::with_capacity(12);
     iv_bytes.extend(iv_random);
     iv_bytes.extend(enc_ctr_bytes);
-    let iv: aead::Iv = aead::Iv::new(&iv_bytes).map_err(|_| AslError::InternalError)?;
+    let iv: aead::Iv = aead::Iv::new(&iv_bytes).to_error()?;
 
     let mut res: Vec<u8> = Vec::with_capacity(12 + plain.len() + 16);
     res.extend(&header);
     res.extend(&iv.0);
-    let (tag, ct) =
-        aead::encrypt_detached(&key, plain, iv, &header).map_err(|_| AslError::InternalError)?;
+    let (tag, ct) = aead::encrypt_detached(&key, plain, iv, &header).to_error()?;
 
     res.extend(&ct);
     res.extend(tag.as_ref());
@@ -296,12 +291,12 @@ pub(crate) fn decrypt_session(
     };
     let iv_bytes: &[u8; 12] = &crypt[..12]
         .try_into()
-        .map_err(|_| AslError::InternalError)?;
+        .context("unable to get iv_bytes slice")?;
     let tag_bytes: &[u8] = &crypt[crypt.len() - 16..];
     let msg: &[u8] = &crypt[12..crypt.len() - 16];
 
     let iv = aead::Iv(*iv_bytes);
-    let tag = aead::Tag::from_slice(&tag_bytes).map_err(|_| AslError::InternalError)?;
+    let tag = aead::Tag::from_slice(&tag_bytes).map_err(|_| anyhow!("unable to get aead tag"))?;
     let plain = aead::decrypt_detached(&key, &msg, iv, &header, &tag);
     let res = plain.map_err(|_| AslError::DecryptionFailure)?;
 

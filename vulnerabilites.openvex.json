@@ -1,0 +1,238 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://openvex.dev/docs/public/vex-9f78659d69d5c3a33e770fcafa904ea9af0d85ac2d2679aa13c7b856f4553441",
+  "author": "Unknown Author",
+  "version": 10,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "CVE-2023-2953"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libldap-2.5-0"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T15:05:53.610558694Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-6020"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpam-modules"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T15:57:28.186692447Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-65018"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T15:59:04.732183729Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-66293"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T15:59:22.853556725Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-22695"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T15:59:38.589755781Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-22801"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T15:59:52.312576843Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2023-45853"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/zlib1g"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:00:29.243743083Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-68973"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/gpgv"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-64720"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16t64"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-65018"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16t64"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-66293"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16t64"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-22695"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16t64"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-22801"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16t64"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-25646"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16t64"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-61144"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libtiff6"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-68431"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libheif-plugin-dav1d"
+        },
+        {
+          "@id": "pkg:deb/debian/libheif-plugin-libde265"
+        },
+        {
+          "@id": "pkg:deb/debian/libheif1"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-4105"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libsystemd0"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Trifft nur zu, wenn auch systemd-machined installiert ist, was hier nicht zutrifft. Siehe https://github.com/systemd/systemd/security/advisories/GHSA-4h6x-r8vx-3862",
+      "justification": "vulnerable_code_not_present",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    }
+  ],
+  "timestamp": "2026-02-13T12:54:56Z",
+  "last_updated": "2026-03-04T09:55:41Z"
+}

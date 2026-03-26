@@ -263,10 +263,11 @@ async fn asl(
                 &registration,
                 Method::GET,
                 cmd.target_url()?
-                    .join("/.well-known/oauth-protected-resource")?
+                    .join("/pep/achelos_testfachdienst/hellozeta")?
                     .as_str()
                     .parse()?,
                 &access_token,
+                None,
             )?;
 
             for req_ctr in 0..N_MESSAGES {
@@ -280,6 +281,7 @@ async fn asl(
                     &mut state,
                     req_ctr as u64,
                     &inner,
+                    None,
                 )
                 .await?;
                 times.push(Instant::now().duration_since(start).as_secs_f32());
@@ -303,14 +305,14 @@ async fn curl(
         registration,
         &cmd.request,
         &cmd.target,
-        Some(Base64UrlUnpadded::encode_string(&Sha256::digest(
+        Some(&Base64UrlUnpadded::encode_string(&Sha256::digest(
             access_token,
         ))),
         None,
     )?;
     let mut curl_args = vec![
         "--header".to_string(),
-        format!("authorization: Bearer {access_token}"),
+        format!("authorization: DPoP {access_token}"),
         "--header".to_string(),
         format!("dpop: {dpop}"),
         "--request".to_string(),

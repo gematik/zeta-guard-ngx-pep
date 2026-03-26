@@ -28,7 +28,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::request_ops::RequestOps;
-use crate::typify::{ClientInstance, UserInfo};
+use crate::typify::{ClientData, ZetaUserInfo};
 
 fn to_base64_encoded_json<T: Serialize>(value: &T) -> Result<String> {
     let json = serde_json::to_string_pretty(&value)?;
@@ -42,7 +42,7 @@ pub fn ensure_api_version_header_out<R: RequestOps>(request: &mut R) -> Result<(
 
 pub fn ensure_user_info_header_in<R: RequestOps>(
     request: &mut R,
-    user_info: UserInfo,
+    user_info: ZetaUserInfo,
 ) -> Result<()> {
     request.ensure_header_in("ZETA-User-Info", &to_base64_encoded_json(&user_info)?)
 }
@@ -59,10 +59,7 @@ pub fn ensure_popp_token_header_in<R: RequestOps>(
 
 pub fn ensure_client_data_header_in<R: RequestOps>(
     request: &mut R,
-    client_instance: ClientInstance,
+    client_data: ClientData,
 ) -> Result<()> {
-    request.ensure_header_in(
-        "ZETA-Client-Data",
-        &to_base64_encoded_json(&client_instance)?,
-    )
+    request.ensure_header_in("ZETA-Client-Data", &to_base64_encoded_json(&client_data)?)
 }

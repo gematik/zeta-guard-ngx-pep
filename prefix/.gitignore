@@ -5,3 +5,4 @@
 /html/*
 !/html/jwks.json
 !/html/empty.json
+!/html/doc

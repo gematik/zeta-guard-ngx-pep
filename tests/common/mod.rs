@@ -22,18 +22,20 @@
  * #L%
  */
 
-use std::env;
 use std::fs::{File, OpenOptions};
 use std::net::TcpListener;
 use std::ops::RangeInclusive;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
 use http::StatusCode;
+use ngx_pep::its::TestControlClient;
 use reqwest::{Client, ClientBuilder, Url};
 use rstest::fixture;
 use tokio::process::Command;
@@ -41,6 +43,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
+use tokio_serde::formats::Json;
 
 use ngx_pep::client::{
     ClientRegistration, create_smcb_token, exchange_access_token, get_nonce, register_client,
@@ -95,10 +98,11 @@ pub fn reserve_port(prefix: &Path, range: RangeInclusive<u16>) -> Result<PortLoc
             continue;
         };
 
-        // try to bind chosen port
+        // try to bind chosen ports
         match (
             TcpListener::bind(("127.0.0.1", port)),
-            TcpListener::bind(("127.1.33.7", port + 100)), // embedded echo server
+            // embedded echo server to test upstream
+            TcpListener::bind(("127.1.33.7", port + 100)),
         ) {
             (Ok(listener_nginx), Ok(listener_echo)) => {
                 // ports are bindable, drop sockets so nginx and echo server can bind on it
@@ -119,6 +123,7 @@ pub fn reserve_port(prefix: &Path, range: RangeInclusive<u16>) -> Result<PortLoc
 
 struct State {
     prefix: PathBuf,
+    control_path: PathBuf,
     started: bool,
     port_lock: PortLock,
 }
@@ -139,9 +144,17 @@ fn manager() -> Manager {
 
     MANAGER
         .get_or_init(|| {
+            let prefix = Path::new("./prefix").to_path_buf();
+            let control_path = prefix.join(format!("test-{}/control", port_lock.port));
+            if control_path.exists() {
+                fs::remove_dir_all(&control_path)
+                    .expect(&format!("remove {}", control_path.display()));
+            }
+            fs::create_dir_all(&control_path).expect(&format!("create {}", control_path.display()));
             Manager(Arc::new(NginxManager {
                 state: Mutex::new(State {
-                    prefix: Path::new("./prefix").to_path_buf(),
+                    prefix,
+                    control_path,
                     started: false,
                     port_lock,
                 }),
@@ -257,28 +270,77 @@ impl NginxLease {
     }
 
     pub async fn wait_ready(&self) -> Result<()> {
-        let url = self.url().await?.join("ready")?;
-        timeout(Duration::from_secs(5), async move {
+        // not to be confused with echo-server /ready; this is tested on-demand, in start_echo_server
+        let nginx_ready = async move {
+            let url = self.url().await?.join("ready/")?;
             loop {
-                if let Ok(resp) = reqwest::get(url.clone()).await {
-                    if resp.status() == StatusCode::OK {
-                        return Ok(());
-                    }
+                if let Ok(resp) = reqwest::get(url.clone()).await
+                    && resp.status() == StatusCode::OK
+                {
+                    return anyhow::Ok(());
                 }
                 sleep(Duration::from_millis(10)).await;
             }
+        };
+        let control_ready = async move {
+            loop {
+                if let Ok(_) = self.control_client().await {
+                    return anyhow::Ok(());
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        let _ = timeout(Duration::from_secs(5), async move {
+            futures::try_join!(nginx_ready, control_ready)
         })
-        .await?
+        .await?;
+        Ok(())
+    }
+
+    pub async fn control_sockets(&self) -> Result<Vec<PathBuf>> {
+        let mut sockets: Vec<PathBuf> = Vec::new();
+        let mut read_dir =
+            tokio::fs::read_dir(self.mgr.0.state.lock().await.control_path.as_path()).await?;
+        while let Some(socket) = read_dir.next_entry().await? {
+            let file_type = socket.file_type().await?;
+            if file_type.is_socket() {
+                sockets.push(socket.path());
+            }
+        }
+        Ok(sockets)
+    }
+
+    async fn make_control_client(&self, socket: PathBuf) -> Result<TestControlClient> {
+        let transport = tarpc::serde_transport::unix::connect(&socket, Json::default).await?;
+        Ok(TestControlClient::new(tarpc::client::Config::default(), transport).spawn())
+    }
+
+    /// Picks the first available socket and constructs a client to it.
+    /// NOTE: Every worker process has its own control socket, but as the JWK cache is distributed
+    /// we only need to control one to manipulate it.
+    pub async fn control_client(&self) -> Result<TestControlClient> {
+        let sockets = self.control_sockets().await?;
+        if sockets.len() == 0 {
+            bail!(
+                "0 sockets found at {}",
+                self.mgr.0.state.lock().await.control_path.display()
+            )
+        }
+
+        let socket = sockets.first().unwrap().clone();
+        self.make_control_client(socket).await
     }
 
     pub async fn start_echo_server(&self) -> JoinHandle<()> {
         let port = self.mgr.0.state.lock().await.port_lock.port + 100; // eg 8003 + 100 → 8103
         let task = tokio::spawn(async move { echo_server(port).await.expect("echo_server") });
-        let ready = Url::parse(&format!("http://127.1.33.7:{port}/ready/")).expect("ready url");
+        let echo_ready =
+            Url::parse(&format!("http://127.1.33.7:{port}/ready/")).expect("ready url");
 
         timeout(Duration::from_secs(5), async move {
             loop {
-                if let Ok(resp) = reqwest::get(ready.clone()).await {
+                if let Ok(resp) = reqwest::get(echo_ready.clone()).await {
                     if resp.status() == StatusCode::OK {
                         break;
                     }

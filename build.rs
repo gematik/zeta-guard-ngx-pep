@@ -28,39 +28,22 @@ use std::{
     io::{self, ErrorKind},
     path::{Path, PathBuf},
     process::Command,
+    process::Stdio,
 };
 
 use anyhow::{Context, Result};
-use cargo_metadata::MetadataCommand;
 use schemars::schema::RootSchema;
 use schemars::visit::{Visitor, visit_schema_object};
 use serde::Serialize;
 use tinytemplate::TinyTemplate;
-use typify::TypeSpace;
+use typify::{TypeSpace, TypeSpaceSettings};
 
-// Use cargo_metadata to find nginx-src's embedded nginx source tree, as it doesn't cleanly export
-// that, but we want to call `make install` in it to populate the prefix.
-fn get_nginx_src_path() -> Result<PathBuf> {
-    let metadata = MetadataCommand::new().exec().unwrap();
-    let nginx_src = metadata
-        .packages
-        .iter()
-        .find(|package| package.name.as_str() == "nginx-src");
-    nginx_src
-        .map(|p| p.manifest_path.parent().unwrap().join("nginx").into())
-        .context("nginx source folder")
-}
-
-fn nproc() -> usize {
-    Command::new("nproc")
-        .output()
-        .map(|o| {
-            String::from_utf8(o.stdout)
-                .expect("nproc output")
-                .parse()
-                .expect("nproc parse")
-        })
-        .unwrap_or(1)
+fn get_nginx_source_dir(build_dir: &Path) -> PathBuf {
+    // nginx-sys sets build_dir = source_dir.join("objs"), so the parent is the source dir
+    build_dir
+        .parent()
+        .expect("nginx build_dir has a parent")
+        .to_path_buf()
 }
 
 #[derive(Serialize)]
@@ -72,10 +55,11 @@ struct ConfigFile {
     error_log: String,
     access_log: String,
     port: u16,
+    // IT: embedded echo server port for upstream tests
     echo_port: u16,
     temp_prefix: String,
-    as_root: bool, // adds 'user root;' for CI (coverage), no effect when master is not root (e.g.
-                   // locally)
+    // adds 'user root;' for CI (coverage), no effect when master is not root (e.g. locally)
+    as_root: bool,
 }
 
 impl ConfigFile {
@@ -164,11 +148,15 @@ pub fn make_install() -> Result<()> {
     println!("cargo:rerun-if-env-changed=MAKE");
 
     let make = env::var("MAKE").unwrap_or_else(|_| "make".to_string());
-    let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| format!("{}", nproc()));
+    let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| {
+        std::thread::available_parallelism()
+            .map(|n| n.to_string())
+            .unwrap_or("1".to_string())
+    });
 
     let build_dir = std::env::var("DEP_NGINX_BUILD_DIR").unwrap();
     let build_dir = Path::new(&build_dir);
-    let source_dir = get_nginx_src_path()?;
+    let source_dir = get_nginx_source_dir(build_dir);
 
     eprintln!(
         "running `{make} -f {}/Makefile -j{jobs} install` in {}",
@@ -229,13 +217,14 @@ fn generate_schema() -> Result<()> {
     let schemas = vec![
         resolve_schema(Path::new("./src/schema/access-token.yaml").to_path_buf())?,
         resolve_schema(Path::new("./src/schema/popp-token.yaml").to_path_buf())?,
-        resolve_schema(Path::new("./src/schema/client-instance.yaml").to_path_buf())?,
-        resolve_schema(Path::new("./src/schema/user-info.yaml").to_path_buf())?,
+        resolve_schema(Path::new("./src/schema/client-data.yaml").to_path_buf())?,
+        resolve_schema(Path::new("./src/schema/zeta-user-info.yaml").to_path_buf())?,
         resolve_schema(Path::new("./src/schema/dpop-token.yaml").to_path_buf())?,
-        resolve_schema(Path::new("./src/schema/client-assertion-jwt.yaml").to_path_buf())?,
+        resolve_schema(Path::new("./src/schema/zeta-error.yaml").to_path_buf())?,
     ];
 
-    let mut type_space = TypeSpace::default();
+    let mut type_space =
+        TypeSpace::new(TypeSpaceSettings::default().with_derive("PartialEq".to_string()));
     for schema in schemas {
         type_space.add_root_schema(schema)?;
     }
@@ -244,6 +233,64 @@ fn generate_schema() -> Result<()> {
         prettyplease::unparse(&syn::parse2::<syn::File>(type_space.to_stream()).unwrap());
     let out_file = Path::new(&env::var("OUT_DIR").unwrap()).join("typify.rs");
     fs::write(out_file, contents)?;
+    Ok(())
+}
+
+fn generate_book() -> Result<()> {
+    println!("cargo:rerun-if-changed=book/src");
+    println!("cargo:rerun-if-changed=book/book.toml");
+
+    let status = Command::new("/usr/bin/env")
+        .arg("sh")
+        .arg("-c")
+        .arg("command -v mdbook 1>/dev/null 2>&1")
+        .status()?;
+
+    if status.success() {
+        let mut mdbook = Command::new("/usr/bin/env");
+        mdbook
+            .arg("mdbook")
+            .arg("build")
+            .arg("book")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        let mdbook_status = mdbook.status()?;
+
+        if !mdbook_status.success() {
+            panic!("`{:?}` failed, rc={mdbook_status}", mdbook,);
+        }
+    } else {
+        println!("cargo::warning=unable to find mdbook command, skipping generation");
+    }
+
+    Ok(())
+}
+
+fn copy_aslkeys() -> Result<()> {
+    let source = Path::new("libasl/fixtures/signer_cert.pem");
+    println!("cargo:rerun-if-changed={}", source.display());
+    let target = Path::new("prefix/conf/signer_cert.pem");
+    println!("cargo:rerun-if-changed={}", target.display());
+    fs::copy(source, target)?;
+
+    let source = Path::new("libasl/fixtures/signer_key.pem");
+    println!("cargo:rerun-if-changed={}", source.display());
+    let target = Path::new("prefix/conf/signer_key.pem");
+    println!("cargo:rerun-if-changed={}", target.display());
+    fs::copy(source, target)?;
+
+    let source = Path::new("libasl/fixtures/issuer_cert.pem");
+    println!("cargo:rerun-if-changed={}", source.display());
+    let target = Path::new("prefix/conf/issuer_cert.pem");
+    println!("cargo:rerun-if-changed={}", target.display());
+    fs::copy(source, target)?;
+
+    let source = Path::new("libasl/fixtures/roots.json");
+    println!("cargo:rerun-if-changed={}", source.display());
+    let target = Path::new("prefix/conf/roots.json");
+    println!("cargo:rerun-if-changed={}", target.display());
+    fs::copy(source, target)?;
+
     Ok(())
 }
 
@@ -257,6 +304,8 @@ fn main() -> Result<()> {
 
     make_install()?;
     generate_schema()?;
+    generate_book()?;
+    copy_aslkeys()?;
 
     println!("cargo::rustc-check-cfg=cfg(coverage)");
     Ok(())

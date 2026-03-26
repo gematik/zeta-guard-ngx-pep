@@ -22,16 +22,14 @@
  * #L%
  */
 
-use std::mem;
-use std::ptr::{self, addr_of_mut, copy_nonoverlapping};
+use std::ptr::{self, copy_nonoverlapping};
 
 use anyhow::{Result, bail};
-use nginx_sys::{
-    ngx_buf_t, ngx_chain_t, ngx_delete_posted_event, ngx_event_t, ngx_http_finalize_request,
-    ngx_http_output_filter, ngx_http_request_t, ngx_int_t, ngx_post_event, ngx_posted_events,
-};
+use nginx_sys::{NGX_LOG_ERR, ngx_buf_t, ngx_chain_t, ngx_http_output_filter};
+use ngx::core::Status;
 use ngx::http::{HTTPStatus, Request};
-use ngx::log::ngx_cycle_log;
+use ngx::ngx_log_error;
+use ngx_tickle::finalize_request;
 
 use crate::request_ops::RequestOps;
 
@@ -101,11 +99,20 @@ impl Body {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Response {
     pub status: HTTPStatus,
     pub content_type: Option<String>,
     pub body: Body,
+}
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.status)
+            .field("content_type", &self.content_type)
+            .field("body", &format!("({} bytes)", self.body.0.len()))
+            .finish()
+    }
 }
 
 impl Response {
@@ -125,60 +132,39 @@ impl Response {
         }
     }
 
-    pub fn send(&self, request: &mut Request) -> Result<()> {
+    pub fn send(&self, request: &mut Request, finalization_status: Status) {
         request.set_status(self.status);
 
         let content_length = self.body.len();
         request.set_content_length_n(content_length);
         if content_length > 0
             && let Some(content_type) = &self.content_type
+            && let Err(e) = request.ensure_header_out("content-type", content_type)
         {
-            request.ensure_header_out("Content-Type", content_type)?;
-        }
+            ngx_log_error!(
+                NGX_LOG_ERR,
+                request.log(),
+                "error setting content-type: {content_type} — {e}"
+            );
+            finalize_request(request, Status::NGX_ERROR);
+        };
 
         let rc = request.send_header();
         if !rc.is_ok() {
-            bail!("send_header: {rc:?}");
+            ngx_log_error!(NGX_LOG_ERR, request.log(), "error sending header — {rc:?}");
+            finalize_request(request, rc);
         }
+        let rc = self.body.send(request);
 
-        self.body.send(request)?;
-
-        Ok(())
-    }
-}
-
-pub struct Finalization {
-    event: ngx_event_t,
-    request: *mut ngx_http_request_t,
-    rc: ngx_int_t,
-}
-
-impl Drop for Finalization {
-    fn drop(&mut self) {
-        if self.event.posted() != 0 {
-            unsafe { ngx_delete_posted_event(&mut self.event) };
-        }
-    }
-}
-
-pub fn finalize_request(request: &mut Request, rc: ngx_int_t) {
-    unsafe {
-        let pool = request.pool();
-        let mut event: ngx_event_t = mem::zeroed();
-        event.handler = Some(fini);
-        event.log = ngx_cycle_log().as_ptr();
-
-        let request: *mut ngx_http_request_t = request.into();
-        let fin = pool.allocate(Finalization { event, request, rc });
-        (*fin).event.data = fin.cast();
-
-        ngx_post_event(addr_of_mut!((*fin).event), addr_of_mut!(ngx_posted_events));
-    }
-}
-
-extern "C" fn fini(ev: *mut ngx_event_t) {
-    unsafe {
-        let fin: *mut Finalization = (*ev).data.cast();
-        ngx_http_finalize_request((*fin).request, (*fin).rc);
+        finalize_request(
+            request,
+            match rc {
+                Ok(()) => finalization_status,
+                Err(e) => {
+                    ngx_log_error!(NGX_LOG_ERR, request.log(), "error sending response — {e}");
+                    Status::NGX_ERROR
+                }
+            },
+        );
     }
 }

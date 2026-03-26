@@ -26,7 +26,7 @@ use jsonwebtoken::jwk::Jwk;
 #[cfg(test)]
 use mockall::automock;
 
-#[cfg_attr(test, automock)]
+#[cfg_attr(test, automock, allow(unused))]
 pub trait JwkCacheOps {
     async fn fetch_pdp(&self) -> anyhow::Result<()>;
     async fn get_jwk_pdp(&self, kid: String) -> anyhow::Result<Jwk>;
@@ -39,10 +39,11 @@ mod prod {
     use anyhow::Context;
     use jsonwebtoken::jwk::JwkSet;
 
+    use crate::spawn_compat;
+
     use {
         super::JwkCacheOps,
         crate::{CLIENT, conf::MainConfig, log_debug},
-        async_compat::Compat,
         jsonwebtoken::jwk::Jwk,
         ngx::async_::sleep,
         scc::HashMap,
@@ -69,8 +70,6 @@ mod prod {
 
     impl JwkCache {
         pub fn init(conf: &MainConfig) {
-            use ngx_tickle::spawn;
-
             let cache = JWK_CACHE.get_or_init(|| JwkCache {
                 pdp_issuer: conf.pdp_issuer.as_ref().expect("issuer").clone(),
                 pdp_jwks: HashMap::new(),
@@ -78,7 +77,7 @@ mod prod {
                 popp_jwks: HashMap::new(),
                 refresh_interval: conf.jwks_refresh_interval,
             });
-            spawn(Compat::new(cache.cache_worker())).detach();
+            spawn_compat(cache.cache_worker()).detach();
         }
 
         async fn cache_worker(&'static self) {
@@ -141,6 +140,7 @@ mod prod {
                 .clone()
                 .context("no pep_popp_issuer configured")?;
 
+            // TODO: fetch openid-configuration to determine jwks_uri (as soon as PoPP test server available)
             let well_known = format!("{}/jwks.json", issuer.trim_end_matches('/'));
 
             let client = CLIENT.get().expect("client");

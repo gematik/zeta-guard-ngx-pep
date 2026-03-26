@@ -7,7 +7,7 @@
 if [[ -z ${CARGO_LLVM_COV:-} ]]; then
   _OLD_RUSTFLAGS="${RUSTFLAGS:-}"
   # shellcheck disable=SC1090
-  . <(cargo llvm-cov show-env --sh)
+  . <(cargo llvm-cov show-env --export-prefix)
   cargo llvm-cov clean --workspace
 
   cov-env-deactivate() {

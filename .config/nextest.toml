@@ -9,7 +9,7 @@ command = [
   "/usr/bin/env",
   "bash",
   "-c",
-  "printf \"Building nginx module...\\n\\n\"; LLVM_PROFILE_FILE=/dev/null cargo build --lib",
+  "printf \"Building nginx module...\\n\\n\"; LLVM_PROFILE_FILE=/dev/null cargo build --features its --lib",
 ]
 capture-stdout = false
 capture-stderr = false

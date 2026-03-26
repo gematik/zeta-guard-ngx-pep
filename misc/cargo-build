@@ -15,28 +15,38 @@ common_args=(
 
 export RUST_BACKTRACE=1
 
-export NGX_CONFIGURE_ARGS="${NGX_CONFIGURE_ARGS:+"$NGX_CONFIGURE_ARGS "}--with-debug --prefix=$PWD/prefix"
-
-NGX_CFLAGS="$(pkg-config --cflags openssl zlib)"
-export NGX_CFLAGS
-NGX_LDFLAGS="$(pkg-config --libs openssl zlib)"
-export NGX_LDFLAGS
+printf "!! configure nginx\n\n"
+cargo xtask configure
 
 printf "!! tests\n\n"
-# shellcheck disable=SC1091
-. /usr/local/share/cov-env
+tests() {
+	set +e
+	(
+		shopt -s nullglob
+		# shellcheck disable=SC1091
+		. /usr/local/share/cov-env
 
-set +e
-cargo nextest run --workspace ${NEXTEST_FILTERSET:+--filterset "$NEXTEST_FILTERSET"}
-test_result=$?
+		cargo nextest run --workspace ${NEXTEST_FILTERSET:+--filterset "$NEXTEST_FILTERSET"}
+		local result=$?
+
+		if [[ -n "$(printf "%s" prefix/test-*/logs/*)" ]]; then
+			grep . prefix/test-*/logs/* || :
+		fi
+
+		cargo llvm-cov report
+		cargo llvm-cov report --lcov --output-path coverage.lcov || :
+		cargo llvm-cov clean --workspace || :
+		exit $result
+	)
+	result=$?
+	set -e
+	return $result
+}
+
 set -e
-
-grep . prefix/test-*/logs/* || :
-
-cargo llvm-cov report
-cargo llvm-cov report --lcov --output-path coverage.lcov || :
-cargo llvm-cov clean --workspace || :
-cov-env-deactivate
+tests
+test_result=$?
+set +e
 
 printf "!! cargo build\n\n"
 cargo build "${common_args[@]}" --release --lib
@@ -53,5 +63,8 @@ cargo metadata --format-version 1 | jq -r '.packages | map(select(.name == "ngx_
 
 printf "!! write ngx_pep.cdx.json\n\n"
 cargo cyclonedx -f json -a
+
+printf "!! mdbook\n\n"
+mdbook build book
 
 exit $test_result

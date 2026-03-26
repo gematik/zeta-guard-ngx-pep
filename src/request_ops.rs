@@ -34,13 +34,13 @@ use {ambassador::delegatable_trait, mockall::automock};
 
 #[cfg_attr(test, delegatable_trait)]
 #[cfg_attr(test, automock)]
+#[allow(clippy::needless_lifetimes)] // automock
 pub trait RequestOps {
     fn method(&self) -> String;
-    fn self_uri(&self) -> anyhow::Result<http::Uri>;
+    fn eigenuri_parts<'a>(&'a self) -> anyhow::Result<(&'a str, &'a str, Option<u16>)>;
+    fn eigenuri_normalized(&self) -> anyhow::Result<http::Uri>;
     fn get_authorization_token(&self) -> anyhow::Result<String>;
-    #[allow(clippy::needless_lifetimes)] // automock
     fn get_header_in<'a, 'b>(&'a self, name: &'b str) -> Option<&'a str>;
-    #[allow(clippy::needless_lifetimes)] // automock
     fn get_header_out<'a, 'b>(&'a self, name: &'b str) -> Option<&'a str>;
     // additional *request* headers, e.g. passed to upstream
     fn ensure_header_in(&mut self, name: &str, value: &str) -> anyhow::Result<()>;
@@ -63,10 +63,8 @@ fn split_authority(authority: &str) -> Result<(&str, Option<u16>)> {
         if let Some(port_str) = rest.strip_prefix(':') {
             if let Ok(port) = port_str.parse::<u16>() {
                 return Ok((host, Some(port)));
-            } else {
-                // port indicated, but unparseable
-                return Err(anyhow!("unparseable port {port_str}"));
             }
+            return Err(anyhow!("unparseable port {port_str}"));
         }
         return Ok((host, None));
     }
@@ -77,10 +75,8 @@ fn split_authority(authority: &str) -> Result<(&str, Option<u16>)> {
         let port_str = &p[1..];
         if let Ok(port) = port_str.parse::<u16>() {
             return Ok((h, Some(port)));
-        } else {
-            // port indicated, but unparseable
-            return Err(anyhow!("unparseable port {port_str}"));
         }
+        return Err(anyhow!("unparseable port {port_str}"));
     }
 
     Ok((authority, None))
@@ -172,6 +168,8 @@ pub fn normalized_uri(scheme: &str, host: &str, port: Option<u16>, path: &str) -
     let host = host.to_ascii_lowercase();
     let port = port
         .or(match scheme.as_str() {
+            // NOTE: wss? shouldn't be possible from either eigenuri nor dpop — it's a client-side
+            // concern; the protocol is https?. We'll allow it for compatibility reasons only.
             "https" | "wss" => Some(443),
             "http" | "ws" => Some(80),
             _ => None,
@@ -191,9 +189,8 @@ impl RequestOps for ngx::http::Request {
         self.method().to_string()
     }
 
-    /// returns request uri, without query
-    fn self_uri(&self) -> Result<Uri> {
-        let (scheme, host, port) = try_parse_forwarded(self.get_header_in("forwarded"))
+    fn eigenuri_parts(&self) -> Result<(&str, &str, Option<u16>)> {
+        try_parse_forwarded(self.get_header_in("forwarded"))
             .or_else(|| {
                 try_parse_xforwarded(
                     self.get_header_in("x-forwarded-proto"),
@@ -202,7 +199,12 @@ impl RequestOps for ngx::http::Request {
                 )
             })
             .or_else(|| try_parse_host(self.get_header_in("host")))
-            .ok_or_else(|| anyhow!("unable to determine self uri from Request"))?;
+            .ok_or_else(|| anyhow!("unable to determine eigenuri from Request"))
+    }
+
+    /// NOTE: does not contain query, per rfc9449 (DPoP)
+    fn eigenuri_normalized(&self) -> Result<Uri> {
+        let (scheme, host, port) = self.eigenuri_parts()?;
         normalized_uri(scheme, host, port, self.path().to_str()?)
     }
 

@@ -7,8 +7,10 @@ set -o pipefail
 if [[ -n ${MIRROR:-} ]] && [[ -n ${TOKEN:-} ]]; then
 	printf "!! configure crates mirror %q\n\n" "$MIRROR"
 
-	mkdir -p .cargo
-	cat >.cargo/config.toml <<-CONFIG
+	export CARGO_HOME="${CARGO_HOME:-~/.cargo}"
+	mkdir -p "$CARGO_HOME"
+
+	cat >"$CARGO_HOME"/config.toml <<-CONFIG
 		[registry]
 		global-credential-providers = ["cargo:token"]
 

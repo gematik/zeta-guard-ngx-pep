@@ -2,6 +2,30 @@
 
 # Release Notes ZETA PEP
 
+## Release 0.4.0
+
+### added:
+- openvex-based CVE management
+- structured errors:
+  - ZETA/high-level errors as application/json (schema: zeta-error.yaml)
+  - embedded html error pages for long-form descriptions
+  - pass errors on the ASL channel as application/cbor to the caller (type: ErrorResponse)
+- ASL
+  - certificate config (`pep_asl_*` options)
+  - /CertData endpoint
+
+### changed:
+- switch to custom nginx build to not be constrained by ngx/vendored and to allow usage
+  of nginxinc/nginx-unprivileged base images
+- dependency upgrades, notable:
+  - Rust 1.94.0
+  - nginx 1.29.5
+  - ngx-tickle 0.2.0
+- sync JSON schemas from gematik/zeta for VSDM2-interop
+  - client-data.yaml: ZETA-Client-Data upstream header
+  - zeta-user-info.yaml: ZETA-User-Info upstream header
+- trim unneeded dependencies from prod. images as part of ongoing CVE mitigations
+
 ## Release 0.3.0
 
 ### added:

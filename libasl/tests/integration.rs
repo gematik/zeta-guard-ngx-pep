@@ -24,13 +24,13 @@
 
 use asl::client::HandshakeKeys;
 use asl::{
-    Config, Environment, MemorySessionCache, SessionCache, client, decrypt_request,
+    CertData, Config, Environment, MemorySessionCache, SessionCache, client, decrypt_request,
     encrypt_response, finish_handshake, generate_asl_keys, initiate_handshake, raw_keys_from_bytes,
 };
 
 #[test]
 fn it_performs_roundtrip() {
-    const SERVER_SIG_SK_HEX: &str = "30770201010420bd37298383eb3d620da1ed367a9a0898e02443fadff0af783e1fbbfdf8250d95a00a06082a8648ce3d030107a144034200048bf54a359336ad068fc57282552526875f0884a8d5b3bc09716edcaa7e0b4443084eea5f2445fea6cfe558edf4a9efea2732efa2d5888b66be9b5b08101448c2";
+    const SERVER_SIG_SK_HEX: &str = "BD37298383EB3D620DA1ED367A9A0898E02443FADFF0AF783E1FBBFDF8250D95";
     const SERVER_SIG_CERT_HEX: &str = "3082017330820119a003020102021450fe87e05a3c00463e0a18387c3dbda92f4828fd300a06082a8648ce3d040302300f310d300b06035504030c0474657374301e170d3235313033303039333430395a170d3335313032383039333430395a300f310d300b06035504030c04746573743059301306072a8648ce3d020106082a8648ce3d030107034200048bf54a359336ad068fc57282552526875f0884a8d5b3bc09716edcaa7e0b4443084eea5f2445fea6cfe558edf4a9efea2732efa2d5888b66be9b5b08101448c2a3533051301d0603551d0e0416041461dd7c90fc9bdf91f8b4c3eaa0ceda715bd523f5301f0603551d2304183016801461dd7c90fc9bdf91f8b4c3eaa0ceda715bd523f5300f0603551d130101ff040530030101ff300a06082a8648ce3d0403020348003045022100d0621bf50aee3ff00713393825f2993adc88a091d1f227e8a2319bc7a33b0e4302201a0276dcceabbf9e7dae50669d9186663f3f00a954e1d9eb87b844bd8733cfe4";
 
     const CLIENT_ECDH_SK_HEX: &str =
@@ -49,8 +49,14 @@ fn it_performs_roundtrip() {
             1,
         )
         .unwrap();
+    let cert_data = CertData {
+        cert: hex::decode(SERVER_SIG_CERT_HEX).unwrap(),
+        ca: vec![],
+        rca_chain: vec![],
+    };
+    let ocsp_url = Some("https://ocsp2.example.org/".to_string());
     let server_config =
-        Config::new_with_keys(Environment::Testing, signed_keys, private_keys).unwrap();
+        Config::new_with_keys(Environment::Testing, signed_keys, private_keys, cert_data, ocsp_url).unwrap();
     let server_cache = MemorySessionCache::new();
 
     // Step 1: Client initiates Handshake with M1 to generic /ASL endpoint
@@ -82,7 +88,7 @@ fn it_performs_roundtrip() {
     println!("M2: {}", hex::encode(&m2));
 
     // Step 3: Client continues Handshake with M2, sends M3 to endpoint from ZETA-ASL-CID header
-    let maybe_m3 = client::continue_handshake(client_handshake, &m2);
+    let maybe_m3 = client::continue_handshake(client_handshake, &m2, |_| true);
     assert!(maybe_m3.is_ok());
     let (client_continuation, m3) = maybe_m3.unwrap();
     println!("M3: {}", hex::encode(&m3));

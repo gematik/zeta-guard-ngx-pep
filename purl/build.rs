@@ -75,10 +75,9 @@ fn generate_schema() -> Result<()> {
     let schemas = vec![
         resolve_schema(Path::new("../src/schema/access-token.yaml").to_path_buf())?,
         resolve_schema(Path::new("../src/schema/popp-token.yaml").to_path_buf())?,
-        resolve_schema(Path::new("../src/schema/client-instance.yaml").to_path_buf())?,
-        resolve_schema(Path::new("../src/schema/user-info.yaml").to_path_buf())?,
+        resolve_schema(Path::new("../src/schema/client-data.yaml").to_path_buf())?,
+        resolve_schema(Path::new("../src/schema/zeta-user-info.yaml").to_path_buf())?,
         resolve_schema(Path::new("../src/schema/dpop-token.yaml").to_path_buf())?,
-        resolve_schema(Path::new("../src/schema/client-assertion-jwt.yaml").to_path_buf())?,
     ];
 
     let mut type_space = TypeSpace::default();

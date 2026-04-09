@@ -24,8 +24,9 @@
 
 use super::model::*;
 use super::util::*;
-use libcrux::{aead, digest, kem};
+use libcrux_kem as kem;
 use libcrux_ml_kem::mlkem768;
+use rand::Rng;
 
 pub struct HandshakeState {
     env: Environment,
@@ -36,19 +37,19 @@ pub struct HandshakeState {
 
 pub struct ContinuationState {
     env: Environment,
-    key_id: Vec<u8>,
-    k2_c2s_app_data: Vec<u8>,
-    k2_s2c_app_data: Vec<u8>,
-    k2_s2c_key_confirmation: Vec<u8>,
-    expected_hash: Vec<u8>,
+    key_id: [u8; 32],
+    k2_c2s_app_data: [u8; 32],
+    k2_s2c_app_data: [u8; 32],
+    k2_s2c_key_confirmation: [u8; 32],
+    expected_hash: [u8; 32],
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct SessionState {
     pub env: Environment,
-    pub key_id: Vec<u8>,
-    pub k2_c2s_app_data: Vec<u8>,
-    pub k2_s2c_app_data: Vec<u8>,
+    pub key_id: [u8; 32],
+    pub k2_c2s_app_data: [u8; 32],
+    pub k2_s2c_app_data: [u8; 32],
     pub enc_ctr: u64,
 }
 
@@ -66,7 +67,7 @@ pub fn generate_handshake_keys() -> Result<HandshakeKeys, AslError> {
     RNG.with_borrow_mut(|rng| {
         let (ecdh_sk, ecdh_pk) = kem::key_gen(kem::Algorithm::Secp256r1, rng).to_error()?;
 
-        let rv: [u8; 64] = rng.generate_array().to_error()?;
+        let rv: [u8; 64] = rng.random();
         let keys = mlkem768::generate_key_pair(rv);
 
         Ok(HandshakeKeys {
@@ -108,7 +109,7 @@ pub fn continue_handshake(
     msg2: &[u8],
     verify: impl Fn(&SignedAslKeys) -> bool,
 ) -> Result<(ContinuationState, Vec<u8>), AslError> {
-    let m2: Message2 = serde_cbor::from_slice(&msg2)
+    let m2: Message2 = serde_cbor::from_slice(msg2)
         .to_error()
         .map_err(AslError::DecodingError)?;
     let ss_e = derive_shared_secret(
@@ -119,7 +120,8 @@ pub fn continue_handshake(
     )?;
     let hk = derive_handshake_keys(&ss_e)?;
 
-    let sig_pk_bytes = decrypt_handshake(&hk.k1_s2c, &m2.aead_ct)?;
+    let mut sig_pk_bytes = vec![0u8; m2.aead_ct.len() - HANDSHAKE_OVERHEAD];
+    decrypt_handshake(&hk.k1_s2c, &m2.aead_ct, &mut sig_pk_bytes)?;
     let sig_pk: SignedAslKeys = serde_cbor::from_slice(&sig_pk_bytes)
         .to_error()
         .map_err(AslError::DecodingError)?;
@@ -140,13 +142,16 @@ pub fn continue_handshake(
         eso: false,
     };
     let inner_cbor = serde_cbor::to_vec(&inner).to_error()?;
-    let ct_msg_3 = encrypt_handshake(&hk.k1_c2s, &inner_cbor)?;
+    let mut ct_msg_3 = vec![0u8; HANDSHAKE_OVERHEAD + inner_cbor.len()];
+    encrypt_handshake(&hk.k1_c2s, &inner_cbor, &mut ct_msg_3)?;
 
-    let client_hash = digest::hash(
-        digest::Algorithm::Sha256,
-        &[&handshake.msg1, msg2, &ct_msg_3].concat(),
-    );
-    let ct_msg_3_key_confirmation = encrypt_handshake(&sk.k2_c2s_key_confirmation, &client_hash)?;
+    let client_hash = libcrux_sha2::sha256(&[&handshake.msg1, msg2, &ct_msg_3].concat());
+    let mut ct_msg_3_key_confirmation = vec![0u8; HANDSHAKE_OVERHEAD + client_hash.len()];
+    encrypt_handshake(
+        &sk.k2_c2s_key_confirmation,
+        &client_hash,
+        &mut ct_msg_3_key_confirmation,
+    )?;
 
     let m3 = Message3 {
         message_type: String::from(MESSAGE_TYPE_3),
@@ -155,10 +160,7 @@ pub fn continue_handshake(
     };
     let msg3 = serde_cbor::to_vec(&m3).to_error()?;
 
-    let server_hash = digest::hash(
-        digest::Algorithm::Sha256,
-        &[&handshake.msg1, msg2, &msg3].concat(),
-    );
+    let server_hash = libcrux_sha2::sha256(&[&handshake.msg1, msg2, &msg3].concat());
 
     let state = ContinuationState {
         env: handshake.env,
@@ -176,13 +178,15 @@ pub fn finish_handshake(
     continuation: ContinuationState,
     msg4: &[u8],
 ) -> Result<SessionState, AslError> {
-    let m4: Message4 = serde_cbor::from_slice(&msg4)
+    let m4: Message4 = serde_cbor::from_slice(msg4)
         .to_error()
         .map_err(AslError::DecodingError)?;
 
-    let server_hash = decrypt_handshake(
+    let mut server_hash = [0u8; 32];
+    decrypt_handshake(
         &continuation.k2_s2c_key_confirmation,
         &m4.aead_ct_key_confirmation,
+        &mut server_hash,
     )?;
     if server_hash != continuation.expected_hash {
         return Err(AslError::TranscriptError);
@@ -190,54 +194,78 @@ pub fn finish_handshake(
 
     let session = SessionState {
         env: continuation.env,
-        key_id: continuation.key_id.clone(),
-        k2_c2s_app_data: continuation.k2_c2s_app_data.clone(),
-        k2_s2c_app_data: continuation.k2_s2c_app_data.clone(),
+        key_id: continuation.key_id,
+        k2_c2s_app_data: continuation.k2_c2s_app_data,
+        k2_s2c_app_data: continuation.k2_s2c_app_data,
         enc_ctr: 0,
     };
 
     Ok(session)
 }
 
+/// Encrypt an ASL session request. `out` must be `request.len() + SESSION_OVERHEAD` bytes.
 pub fn encrypt_request(
     state: &mut SessionState,
     req_ctr: u64,
     request: &[u8],
-) -> Result<Vec<u8>, AslError> {
-    let key =
-        aead::Key::from_slice(aead::Algorithm::Aes256Gcm, &state.k2_c2s_app_data).to_error()?;
-
+    out: &mut [u8],
+) -> Result<(), AslError> {
     state.enc_ctr += 1;
-    let res = encrypt_session(
-        &key,
+    encrypt_session(
+        &state.k2_c2s_app_data,
         &state.key_id,
         state.env,
         MessageMode::Request,
         req_ctr,
         state.enc_ctr,
         request,
-    )?;
-    Ok(res)
+        out,
+    )
 }
 
+/// Decrypt an ASL session response. `out` must be `response.len() - SESSION_OVERHEAD` bytes.
 pub fn decrypt_response(
     state: &SessionState,
     expect_req_ctr: u64,
     response: &[u8],
-) -> Result<Vec<u8>, AslError> {
-    let key =
-        aead::Key::from_slice(aead::Algorithm::Aes256Gcm, &state.k2_s2c_app_data).to_error()?;
-    let (req_ctr, res) = decrypt_session(
-        &key,
+    out: &mut [u8],
+) -> Result<(), AslError> {
+    let req_ctr = decrypt_session(
+        &state.k2_s2c_app_data,
         &state.key_id,
         state.env,
         MessageMode::Response,
         response,
+        out,
     )?;
     if req_ctr != expect_req_ctr {
         return Err(AslError::NotRequest);
     }
-    Ok(res)
+    Ok(())
+}
+
+pub fn raw_keys_from_bytes(
+    ecdh_sk_bytes: &[u8],
+    ecdh_pk_bytes: &[u8],
+    pqc_sk_bytes: &[u8],
+    pqc_pk_bytes: &[u8],
+) -> Result<(PublicKeys, PrivateKeys), AslError> {
+    let ecdh_sk = kem::PrivateKey::decode(kem::Algorithm::Secp256r1, ecdh_sk_bytes)
+        .map_err(|_| AslError::BadFormat)?;
+    let ecdh_pk = kem::PublicKey::decode(kem::Algorithm::Secp256r1, ecdh_pk_bytes)
+        .map_err(|_| AslError::BadFormat)?;
+
+    let pqc_sk_bytes: &[u8; PQC_SK_SIZE] =
+        pqc_sk_bytes.try_into().map_err(|_| AslError::BadFormat)?;
+    let pqc_pk_bytes: &[u8; PQC_PK_SIZE] =
+        pqc_pk_bytes.try_into().map_err(|_| AslError::BadFormat)?;
+    let pqc_sk = libcrux_ml_kem::MlKemPrivateKey::from(pqc_sk_bytes);
+    let pqc_pk = libcrux_ml_kem::MlKemPublicKey::from(pqc_pk_bytes);
+
+    Ok((
+        PublicKeys { ecdh_pk, pqc_pk },
+        PrivateKeys { ecdh_sk, pqc_sk },
+    ))
 }
 
 #[cfg(test)]
@@ -314,16 +342,16 @@ mod tests {
         const MESSAGE2_HEX: &str = "a46b4d65737361676554797065624d3267454344485f6374a36363727665502d32353661785820195ad65c4e6f097925619b525a018648b8481c11fb0f8b2dc5e0df50c1f0c75f617958200104663a1bd204c4b42ef3d4f1a4c7accc6457dfd7809143f52d00cfb65ee2656d4d4c2d4b454d2d3736385f6374590440abe51943161fd9f6662fb5622a389633c33e98d7a9d02847b427263490db2a3def73b6de8b1f6f392fcdd3af9f9c1fc0641811b133784b43b22cf8dc60cdc166284286630662845ae44e2bbf5ab6ccb739a08cbbea1be0a0a266b5674c1ba35d0d6615ac1d389eceb2e5e5e2bc4966d8f3ac554b23734a8bda89031bad983410d4b58961f68d47f714bfa32e253e702b48279d06128a7d60ac002807d9079b9ec52baf3bca7c87f9350327e13f9fee1a25ba0bd36e5315445505ca188fec78d63f394c4fb60e99e5af0dcf67c59766b10b244313a5c833a56b4e3d12d16604da5c02bf85fbc57c0948aa6306b31a76b69b82ec4f5c4ef7ccdd05dc3492bd83974d76cd8f3299aa72ea67bde9deb64adf3687c0b4829d10e74617a31ad53982b2b6f3e9bb02de1e034c3c68b3c2b348caa22467541170f115d46e9d9846aefacecd7aea36f79730835344a0c4791e47cb9913e83470f07d8578391e7a2e6f8e3b663ab909115933b4b13f10225a7fc177545ce24972999656a4d228ea63b02f93e62a1f16996fb51efc555b812ece96f89704b4d92e720d6759fbb0754c3c6dd8b22b829123d78a6e621d86c8eb9da7406f2b6e6bbcfd82518962633656c8d912d4ae73d2533c6beaacb4b53350789b721afbbd1d6ab2478b559ac32cc5c25c6b0c3453695e29efc905f487a9d56057e49ca177b657010966e1049ef2d8284cf6327ce95e21dfe7d42523b47aad81355ecf22b9d5b5fda9d8f1b180e7f4347e1d075b8c58493062cf54a2f948b1709ebb678fc842dbba9aef764f791d44fc110cbccd169709ac1dcb5487770e3e3723f55826a88b5ce6b7f9edbb4ea2eb5935ef181f71e9870c9737cd2dc12e60ea348395dd1e700c17911849bb4833e8a711966fee6f48faa8d525753aeb81d6d1c314e769372c78de9b7c3214da9d5bf631b5441be27f9ff5c8c1f0e69fae041ef692b2a7694fd45f6d82daf6938afc67ee41661ec2e92d4eb5dbc1ddf81d45478e25fbca4bc10ba16a69ed487c598873fc6ef1669d8054cb1b573d6854883982996c9a0e92356b088a4d1c9353a8edae5ff4200be5689cfa5b87d3256a0519189360ac7a68c681dc26d386cba427ef6ae4d4b9c531aa4b47810373a0cdb209354b951a075f6319da42bc3060f0964c974f167d60a2c80d4575c063dadf8b23f816af0acfeb132573d88274401d20e3634e63ce01ed7650f635b57214392a1abf28f4d5029949bc19d10ecc597c8066253dae173427b50acff05269b352f1c07c6171c0bec7f3defc3b73ff35642708992fbd4b45703394308b372095713717c3078bebcebf960aef4d866907997c7bd1d2082aa238faec27c41c85ebe1f3d99a8102f794946a2afb27d2c4d445b3be8639b92265d9514b610c35b2d12744c0cd826709ea1188b854b389bda0a69dfc728443d9aa88effd77bf9e5b558c356f08c4af0747134e4db654e77ca85648c9fe5bc0651660ae5bd5688a6205e7cf2145e0cd1222a0fb20e38d539b99c413e15d468467414541445f6374590588e21d696f91ced9072e13c809a98f78c16a33000f5c96652d5f28f9eda9db4417a42421d6fe756d20711b8375fb486ec74795234d43e04c8048305defd79e8d47e0252a887d3244e190394c11ab7ed0616ac151da692b1870073e9a9aa72897735284f0f824a4da61ca58616cc3a77d3b049aedd1e0778c3cb652db3a22218fc8488c478574fd022ce3874b806f234b4fb84cea3fd1955b494c64912fba2c059a2cfe52bdb7b968de7fa8803153bf23f0aeaa0cf3c63ec5d64b41c0f2ba8fc7bf08fd1c4cefd01e7be653f35aad39ec00310691b42e2503cb9efb8f3f689e749af7adc47a9349c1def90c25a0aa64c7873dff01b1d1194cf88ae1a3799ce571bbfbf7157de0833f6a32f2a66f8cde59321d87535636d39139e5cad102fa2eaa9324a122e03fea6f9f5bf400c9542c0ba37316f907dd6479920f1d21f76b743b75cf6db0696d71b5aa881646564e84d288a5d3f4556fd5665dd7e1abe9c8915d8661689a13252c243a932d37a5efa9f106932c0a3ea323e487aa6c91754fff4f1f8165925e87a48a278cd35e8b0bad2a123204cfcb462b4f4a429355d9778f557734fa0f96294528719d20e8aace62fa83e5e668f45524e7c12bd81a5664d499da752246ed2df83e197e770bd83078b7d75e9d2631455a6786021724bdfd042f8c1ac6c410e50dc15b36af0e8be242369a07cad3a937c714ca5d394c5e0819823c0b10775832fd030513df3bc038da7dcb755174eb74ded3eb1d83fc96c69b7dd7afee00f07562f77dbab245b2ae351aaaf538973b9bcc2b8b0bf3dcc3162a71dfb5a3ee848907cce0112e78b5efb5f79f357886f35ee5d4b2671ec4b52416bbebed12304b4f06a259530280c4257a4752e8d96d68d342a16ca6cc98e7ce889f764960192a1cedca2aaa6aad04a3b6911b8a78d75330360a145bbcfa1ae0e3f7ce9560bbc7d087a00951a4f94c371ccf2deb559f32e02f2cdff2940eeaababec0dc8c9a77f8a9dab4f61ed553fca051fea5e7d187152c52718fb409c98e04b4c7fd8d6f33e1fe14e25fd1e442b51ff1c2d702068b615661115674aca25305bb93fcde9c10e8aa16745fe3ce7264edc9519348b92c88be383b4d803063665b52106b0d6e05e32001f3aaf3f738c2c8edaf1eee3f001fabd53b58a4b9ead954e6719730084777ab62911672e24fdfa471108caa6df3b828609ac44f6073f85651699cfff35ae1c2d4618a5600053091ed22940bf915ba2085b0ebd90c7c405d6b162878de3fa3bbd93d57b42f7de9f2ceabac849bcc4ff874b0494b7f86ac6fbb567efa8c736024a73a89a119409e888cb8ce19470d9a035020de7baa60c96bf4cafc67bb936228938d7d97999f4019e75c7454671fd994632b5e7f6bb4875ec1d3b62b3971aadb3ccdd8052d1060891f5aa13d9adfcb526c9e444e47cc133f9e417031b456a1f58c93cc627723333fe0024e2f2ba41b100a7c0b5860714a5b9d99b83ac2fe16c6235511f3630765b1f8c20570745261793c378ac64a20166d4a3bf3cd1dcfd5556e6a04cde7eec5332a64a077553eaa3c242888053b21c957f6cfa2555e19856b74cffe6806157420dc4edc920d8e212968e206b4fb7001e3d129b2800796b4e5f22bdab7f8063b1cac2316af608b57cb939fb386f3437e58494987e85f22c1f7a0521033b0143922eb643f5ad3f338b5506d85caf40e5ae8a9f0311dc3e8a65fd3371a4f43e6335a657ad3f5a20a4fecfd624b16fd758ac2993acdc1bd130b8e657edcb3682e8d82d620596908e46c461d8259e78353d4f0a4864a227054ed085bf44deb71053b1c3e6e0f5fbcd920b71c12cfc8f566b21ea3f669cc253a78073dd2ef5418ebca733dca910b30cab480a1835b4894fc0c232a78f34f1a80d27bac9d525423ff852abb5f5ac4c281e93c49bab5857b2c2a7b4dcba8a9babd3874b42f8c1eb639ce75f78671955765d3a1c61681463c113a94df792ea289452b78f652f";
 
         const EXPECTED_KEY_ID: &str =
-            "12f7d9166a0a2a238daa23e1460e27aed4f50e68311144c35ca8da81e742a600";
+            "107b4cfb201f6aa06dda59c7fcdefcbdd8dea5f62e8484c550bad01cd61b2cdb";
         const EXPECTED_C2S_KEY: &str =
-            "476992a033724b61d62f9f6be22a068cf38b9ad19760d548e71dc30cdd6f7120";
+            "2c674df78f802183c0607a9f0e64ce76fb915a211ce079f8dfc37a15ed4d054d";
         const EXPECTED_S2C_KEY: &str =
-            "fa4162cdf06f5fae8cd577f45da9ec486216d5a7bd93fab5f1096253b03c2ff7";
+            "e4d3303b73c165c101e69abf0794cdc310b1261c5dd50ad4c1b071bb31f5df58";
         const EXPECTED_S2C_KEY_CONFIRM: &str =
-            "4af17a95fed83bc975eaefbf4bd94de958349f3d6ccdb3946b5aeefdb007d884";
+            "20aea14b87388e932e2e3a91b4af816e8d192222f8952a248ab9627fb29fb83a";
         const EXPECTED_HASH: &str =
-            "f102630b966c46af5aa90b521da8495e3bc284b85d619b1295356b2601a3cbf8";
-        const EXPECTED_MESSAGE_3: &str = "a36b4d65737361676554797065624d3367414541445f63745904d34c4b508293ff209988b4bfd2fdc199605ca46800065aaab6b79882494505ba22d13e01fa05177bb742f432831601571ebb210c1fe1a978ac48ccc3efa7ac3253e983d5ef7acd8c408ca1e8314c2fdf006de55a810ec6d49061c44c0708f8a8f7c3e3b0d5950a2fab00fd1777a1a21ccc8cd2769b5c04a51452c82fc08e7f4b4d75e1117fd2deb41f8bad7f62a105d09e207e758b0aea7843b7c6f184c378fd556ab4f2c5f5b3c58895dd73af341877117379de538726658c2a175c832e246eee3adc4fbc73e543b3a579fafbe1ca031ea7574c763c812af8458a4871b481ecf143a301b8e6a1c2aa1dfa0e3f4cd98e3bea3a33d6c00aeaed6c7cb982514cdb9f8b47d83f1e032f1ff0afe5e31af10d5ce3145e688a7231066c257275ef4d7521fdefec077fb2aa762dc00e22e656e3745a3f559526842cc9fa4d8755b4b23dda5bb1e432479aa84521399baa9890063d2402c44ce1544be7360dc80c600055cb6f268a6218130362402b944324ab8ced88198618a0be4fb3be6b7fff348b1d27770c5204a2f96b46c383251a38f50058495db45e9411ee7b20cb052c555322ee7c769456383499357dfe4f4a84aa4029517caae94d2a4feea045c387dd35ab768abd406e16f08aee3bd51cbb373c2cdd3933d9a43c469b2253e243b47fe4b2bc789629611a7f443edc69348700100741952070560b48042592d05313d21578b7a6b7e3deefa13f6a5a8f006adf94d9b147c813e95fca1b48b1ad5f4f17cdf96eb994c271183a4db5cfab2222e9c0c0ac3262c394ecb2dd1bb6b53171c9bf4b32f6b3fa2408c57d3295eca87f3eb19027da7bd0a2ec4e34dcc31a7d9fed11e0e73cf2100450ced242306273c74adf46fbfd09cf515de6a06059cdaaec6e6e668497d1c2bdd2885d46833cc28ad8be5845bd750494e2f6fafe76393ea866bb7e391a37ff9c6a384599aeabc4d0fd8adf827bde1c6cd2f4e926b3245277a08b351517c440da299be6ae33c5bce704ab0c89aa5511f24c0f08d9c1f5ab1beadf7af9f9224f0cacc94d5ea59fa9b0c3fa26799e3e3e3215c201847903d408baf3ec2e92efe01d7182e4d2ed058af4c1387baa9d2455c86705952932ffe73bb31f734ac6e3a7e091d4a88437d51168f42c7f0e3f2975c47747b7d024484888a569bac909337e65cde53830e5c6dc91b01d02631ced2c37852059719b03c998bb8313592edcb2c196bc7a5b7c5d5f2d099f0d7449691d3553f0398ab827edab9bcb07af95ce14c6fc708b9fdff303677a39b215c7da8e01d79d1fb1316f1cbe03978099f049b10ece4ef949e3d782554c205f187a95b8fed04f38dc6d2f45a3e8548517923fb4d700a98236264c2f6161bfb692987b67dcb3c2cbebcf6ade7c47cc7f43779bddce512f2ec0a0a25187f99535c39a5cf0bd3d687fb993c440971c27f0a55704fda8107a6b0a25535e59e1c5ce3acc4a8fc88ea3eb167b79f13d7edef433a2756073b985c97bb8d4b07a48b9eb00469d8a838067a30ca14c656b66ca7a6400f30053ed45f3bc3720aeb6b8164c5113887248323f444499d10c8bd14b55d72b73075060023796334d8f3534dde9dd38b70b4fc174f46b00c29a8515036e0771c0c9df60765430c8f48b74c411eb92ee4e46b3576d6358ac12c71f6028afa491c5803759abcabe925818948590587ab5f3c3a8723de04748b4c6dfab977c1437ef4a4d4bbeb0b352abc81104f39f11fca6787818414541445f63745f6b65795f636f6e6669726d6174696f6e583cd31b6a07b3024810f009b51878e6a2823935bd42d574646be9a3607f5cdc35d10a94100872f8a84f5cb96132856bde7579e74294a2f18ac89ba15156";
+            "385fe2a2d6519c36a2862ca4d2d1dde3f660983d126a9312d62611ecb063cb65";
+        const EXPECTED_MESSAGE_3: &str = "a36b4d65737361676554797065624d3367414541445f63745904d335a3e0dfb8e639fc9afaa2285c907b75b120a7ff8a95d287e74b129c85de0498b1985767b870eba16e8f7e13c6e14ddf56ac3720624efae97d44b27f6f328e8aaa55c3a9617731888c6fd53c05836801bd67cb3abae3839ad9807eef32f57468b502f05c878aff0d4362147597741ebcce69b2e6b674167a35a4c148b30d0f946c66a7f722cc1857179b2eee0caa9d4798183d694e8e6b2107f77063d620f6edcea0204680d70168aadf852c2706d1201f56302bb793dcfef82b99c41379575e5560af20c52eb0ff5068ecf62702169c851cdd99782b91382513ca8fc7cccb5f1b425f63362c67bf6e9e3dd8cdfdd991bce813591d2a7c885085e9d880e542b44138aca1ffab8833a39a6f7b89943c9a58dd3ef285ddfff21a4ffa6f6a17b4b6a70c850d143efd9a1de81e146e9a7554f421d194c339fe48aa29e07f30d5377b1788f3649ca725593cb5e5fe9ece4b02c0af65d1228e647e5fabd2bd147a49fbd0bf66902f1a6980aa3cf7255cd2a3841b049a068ebac87730d68fcdf5c0f81be88ae393dd86bc2915bd776732d886d58770dcb2ab7a27c5115fb3c8f59d0821f9abd4a8a59cf0ac1ee0499419154c828306fb3ed4e9cf49a6d4ca96e12071203d87ee228513e2d6675dcb2e6b9a60b561a15b6bdc591deceaab1e97622078be2204da7cf2c1e132ec49272576d73e9a1f85339b098f6da22c2465f8e21413c83a1ac889665f69519632f8a2cc34ce0bcd47f555c7339f76eb0880b1579744acc250fc4b47b7e34ee38aead141b762f4dc61911c128aa8d550a045f6ce509172504daf027ff1f13bb80b0fd97f77c2980ba1f2387e4f6a68d239e7a3e9fddb454c641f55bdfdb22d3bb4a41b97382224ab912b6a38917208993c82f8dff251344bd92e39974f9424f592d276d23ffd4350621a31e6c7a96a6a890604227b960ed35e303a80462bdc6f20a4ab863167f929a8b315d204f2dd2f5b996d326e898a5ef1c184bc58c3ff014d9cabe79c485dfbd2ab1c00949d475a357433c25f993a06303e492cfe11e879a8c71eb087c8c81acdb4bbb39570497c6ae9c945d46c5695d760b5acef341fa912146d3d94642a219e683feb27cf15746f05d8f8852b637007cca233887a3d32c7cd37380cb4761b0c06034238c70e1712beb3a269ffcda0dad2f184d9456f83a55096b4b0b77d9f64ef0a8c6694443382dc557d97129142613612d4159205371d1b2580fc134d6f5e5f78fc9bb1bbcc365351ced1d3148ce76cb4113e9bdd67a41ce9a1368641bfae73fa1f3592078ca5b24505ab8b3c1e4ce869441e42d0142cddbce0bd65c381ff42e334f072be6ffa14bad81b058df0098a79913e8bec61f55abe9bf7bfb8942451142d577b16f3392c41fa1d5865e9fd7307e080a5a7fa59fddb44bb60ba6e697c071166a92d488df9aed2b8a17690b62d2bbd216f1d28e7e8decd87443fc60eaecaeb5d65817f7b62849031621f38e159580630adfed46ccbd226da26d886bf5f60da127be98904fa1ef8044fff7bc853c34bfcd6f8094c3c37b2e0c2bc55f4fc9c45ee0ab1567ed72818ff42bd087a2892dc028d28a8b6bd760e147cf77ed8f9985824fcae37a042b208bfd0ccf62237576c3fba3618f7178a7736883a83fe537066b3e4534c805798de30ee2f655348fb917586e05fa9da5adb3a87522ec3c101631d52d982a93c33fc9e9412cdb62883c9c750b2c21fd737879d2cdb2b5eb87818414541445f63745f6b65795f636f6e6669726d6174696f6e583c64d0092ed5bb5f5cb986b206bc04348e37f7ff6a01ddee2d81e938b4f154a37cbd1848c3295539c04348a6e619eb0b044236962996ec5b6490510a63";
 
         let handshake = HandshakeState {
             env: Environment::Testing,
@@ -344,22 +372,25 @@ mod tests {
         assert!(result.is_ok());
 
         let (continuation, msg3) = result.unwrap();
-        assert_eq!(continuation.key_id, hex::decode(EXPECTED_KEY_ID).unwrap());
         assert_eq!(
-            continuation.k2_c2s_app_data,
-            hex::decode(EXPECTED_C2S_KEY).unwrap()
+            &continuation.key_id[..],
+            hex::decode(EXPECTED_KEY_ID).unwrap().as_slice()
         );
         assert_eq!(
-            continuation.k2_s2c_app_data,
-            hex::decode(EXPECTED_S2C_KEY).unwrap()
+            &continuation.k2_c2s_app_data[..],
+            hex::decode(EXPECTED_C2S_KEY).unwrap().as_slice()
         );
         assert_eq!(
-            continuation.k2_s2c_key_confirmation,
-            hex::decode(EXPECTED_S2C_KEY_CONFIRM).unwrap()
+            &continuation.k2_s2c_app_data[..],
+            hex::decode(EXPECTED_S2C_KEY).unwrap().as_slice()
         );
         assert_eq!(
-            continuation.expected_hash,
-            hex::decode(EXPECTED_HASH).unwrap()
+            &continuation.k2_s2c_key_confirmation[..],
+            hex::decode(EXPECTED_S2C_KEY_CONFIRM).unwrap().as_slice()
+        );
+        assert_eq!(
+            &continuation.expected_hash[..],
+            hex::decode(EXPECTED_HASH).unwrap().as_slice()
         );
         assert!(msg3.len() >= 32 + 1088 + 32); // enough to contain both ct parameters and hash
         assert_eq!(msg3, hex::decode(EXPECTED_MESSAGE_3).unwrap());
@@ -379,7 +410,7 @@ mod tests {
                 kem::Algorithm::Secp256r1,
                 &hex::decode(CLIENT_ECDH_SK_HEX).unwrap(),
             )
-                .unwrap(),
+            .unwrap(),
             pqc_sk: libcrux_ml_kem::MlKemPrivateKey::from(
                 &hex::decode(CLIENT_PQC_SK_HEX).unwrap().try_into().unwrap(),
             ),
@@ -395,7 +426,7 @@ mod tests {
         assert!(matches!(result, Err(AslError::VerificationError)));
     }
 
-        #[test]
+    #[test]
     fn it_finishes_handshake() {
         const KEY_ID: &str = "062f1873787311d017de56d12751af016cb61e5bbf4ea94d5bdbae4d7045e9ba";
         const C2S_KEY: &str = "39b357fb5ec83760a36d78a422878dbff8835efb4d22a7b0220b72c366083ffa";
@@ -407,17 +438,17 @@ mod tests {
 
         const MESSAGE4_HEX: &str = "bf6b4d65737361676554797065624d347818414541445f63745f6b65795f636f6e6669726d6174696f6e583c07fb703bf65fdb1fe619dbebea620894b0416f2559db06e31e2b328698a406a10c1f7a9e0251e18c1a50e82e729ca9f84aa0dd35b7cdc4a20229d510ff";
 
-        let key_id = hex::decode(KEY_ID).unwrap();
-        let k2_c2s_app_data = hex::decode(C2S_KEY).unwrap();
-        let k2_s2c_app_data = hex::decode(S2C_KEY).unwrap();
+        let key_id: [u8; 32] = hex::decode(KEY_ID).unwrap().try_into().unwrap();
+        let k2_c2s_app_data: [u8; 32] = hex::decode(C2S_KEY).unwrap().try_into().unwrap();
+        let k2_s2c_app_data: [u8; 32] = hex::decode(S2C_KEY).unwrap().try_into().unwrap();
 
         let continuation = ContinuationState {
             env: Environment::Testing,
-            key_id: key_id.clone(),
-            k2_c2s_app_data: k2_c2s_app_data.clone(),
-            k2_s2c_app_data: k2_s2c_app_data.clone(),
-            k2_s2c_key_confirmation: hex::decode(S2C_KEY_CONFIRM).unwrap(),
-            expected_hash: hex::decode(EXPECTED_HASH).unwrap(),
+            key_id,
+            k2_c2s_app_data,
+            k2_s2c_app_data,
+            k2_s2c_key_confirmation: hex::decode(S2C_KEY_CONFIRM).unwrap().try_into().unwrap(),
+            expected_hash: hex::decode(EXPECTED_HASH).unwrap().try_into().unwrap(),
         };
 
         let msg4 = hex::decode(MESSAGE4_HEX).unwrap();
@@ -438,22 +469,20 @@ mod tests {
             "39b357fb5ec83760a36d78a422878dbff8835efb4d22a7b0220b72c366083ffa";
         const MESSAGE_HEX: &str = "48656c6c6f20576f726c64"; // "Hello World"
 
-        const EXPECTED_REQUEST_HEX: &str = "0200010000000000000001062f1873787311d017de56d12751af016cb61e5bbf4ea94d5bdbae4d7045e9ba3ff8c36d0000000000000001e12afd34f14e4d0383c26aa402dafe738fb7e69b0dd6a465084042";
+        const EXPECTED_REQUEST_HEX: &str = "0200010000000000000001062f1873787311d017de56d12751af016cb61e5bbf4ea94d5bdbae4d7045e9ba8c1500aa0000000000000001ee713342cd6ba9f355ac7625e5bc39cfa63c5398c0c806a441b1eb";
 
         let mut session = SessionState {
             env: Environment::Testing,
-            key_id: hex::decode(KEY_ID_HEX).unwrap(),
-            k2_c2s_app_data: hex::decode(C2S_KEY_HEX).unwrap(),
-            k2_s2c_app_data: vec![], // unused
+            key_id: hex::decode(KEY_ID_HEX).unwrap().try_into().unwrap(),
+            k2_c2s_app_data: hex::decode(C2S_KEY_HEX).unwrap().try_into().unwrap(),
+            k2_s2c_app_data: [0u8; 32], // unused
             enc_ctr: 0,
         };
 
         let msg = hex::decode(MESSAGE_HEX).unwrap();
 
-        let result = encrypt_request(&mut session, 1, &msg);
-        assert!(result.is_ok());
-
-        let request = result.unwrap();
+        let mut request = vec![0u8; msg.len() + SESSION_OVERHEAD];
+        encrypt_request(&mut session, 1, &msg, &mut request).unwrap();
         assert!(request.len() > 72); // enough for header, iv, mac, plus at least 1 byte message
         assert_eq!(request, hex::decode(EXPECTED_REQUEST_HEX).unwrap());
     }
@@ -469,18 +498,16 @@ mod tests {
 
         let session = SessionState {
             env: Environment::Testing,
-            key_id: hex::decode(KEY_ID_HEX).unwrap(),
-            k2_c2s_app_data: vec![], // unused
-            k2_s2c_app_data: hex::decode(S2C_KEY_HEX).unwrap(),
+            key_id: hex::decode(KEY_ID_HEX).unwrap().try_into().unwrap(),
+            k2_c2s_app_data: [0u8; 32], // unused
+            k2_s2c_app_data: hex::decode(S2C_KEY_HEX).unwrap().try_into().unwrap(),
             enc_ctr: 0, // unused
         };
 
         let msg = hex::decode(MESSAGE_HEX).unwrap();
 
-        let result = decrypt_response(&session, 1, &msg);
-        assert!(result.is_ok());
-
-        let response = result.unwrap();
+        let mut response = vec![0u8; msg.len() - SESSION_OVERHEAD];
+        decrypt_response(&session, 1, &msg, &mut response).unwrap();
         assert_eq!(response, hex::decode(EXPECTED_RESPONSE_HEX).unwrap());
     }
 }

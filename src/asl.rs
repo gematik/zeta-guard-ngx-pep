@@ -27,7 +27,8 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 use anyhow::{Context, anyhow};
 use asl::{
-    AslError, Environment, decrypt_request, encrypt_response, finish_handshake, initiate_handshake,
+    AslError, Environment, SESSION_OVERHEAD, decrypt_request, encrypt_response, finish_handshake,
+    initiate_handshake,
 };
 use http::Method;
 use nginx_sys::{NGX_LOG_ERR, ngx_cycle};
@@ -38,6 +39,7 @@ use reqwest::Url;
 
 use crate::conf::MainConfig;
 use crate::error::{ToHttpResponse, ZetaAslResult};
+use crate::ocsp_cache::ocsp_cache;
 use crate::request_body::read_request_body;
 use crate::request_ops::RequestOps;
 use crate::response::{Body, Response};
@@ -70,7 +72,13 @@ async fn handle_m1(request: &mut Request, body: &[u8]) -> ZetaAslResult<Response
         return Ok(UNACCEPTABLE.clone());
     }
 
-    let (handshake_state, m2) = initiate_handshake(SESSION_CACHE.server_config(), body, &[])?;
+    let ocsp_response = ocsp_cache().get_ocsp().await;
+
+    let (handshake_state, m2) = initiate_handshake(
+        SESSION_CACHE.server_config(),
+        body,
+        ocsp_response.as_deref(),
+    )?;
     let cid: String = SESSION_CACHE.init_handshake(handshake_state).await?;
 
     ngx_log_debug_http!(request, "asl: new cid {}, M2 {}b", cid, m2.len());
@@ -125,7 +133,10 @@ async fn handle_subrequest(
     }
 
     let session = SESSION_CACHE.continue_session(&cid).await?;
-    let (ctr, inner) = decrypt_request(asl_config, &session, body)?;
+    let inner_len = body.len() - SESSION_OVERHEAD;
+    let mut inner = ngx::collections::Vec::with_capacity_in(inner_len, request.pool());
+    inner.resize(inner_len, 0u8);
+    let ctr = decrypt_request(asl_config, &session, body, &mut inner)?;
 
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut inner_request = httparse::Request::new(&mut headers);
@@ -171,7 +182,7 @@ async fn handle_subrequest(
         };
     }
 
-    let (scheme, host, port) = request.eigenuri_parts()?;
+    let (scheme, host, port) = request.eigenurl_parts()?;
     let forwarded = match port {
         Some(port) => format!("host={host}:{port};proto={scheme}"),
         None => format!("host={host};proto={scheme}"),
@@ -186,7 +197,7 @@ async fn handle_subrequest(
         .context("unable to send inner request")?;
     let status = subresponse.status();
 
-    let mut response_bytes = Vec::new();
+    let mut response_bytes = ngx::collections::Vec::new_in(request.pool());
     let status_code = status.as_u16();
     let reason = status.canonical_reason().unwrap_or("Unknown");
 
@@ -211,17 +222,24 @@ async fn handle_subrequest(
             .context("unable to construct inner response")?,
     );
 
-    let response = encrypt_response(
+    let enc_len = response_bytes.len() + SESSION_OVERHEAD;
+    let enc_ptr = request.pool().calloc(enc_len) as *mut u8;
+    if enc_ptr.is_null() {
+        return Err(AslError::InternalError(anyhow!("pool alloc failed")));
+    }
+    let enc_buf = unsafe { std::slice::from_raw_parts_mut(enc_ptr, enc_len) };
+    encrypt_response(
         SESSION_CACHE.server_config(),
         &session,
         ctr,
         &response_bytes,
+        enc_buf,
     )?;
 
     Ok(Response {
         status: HTTPStatus::OK,
         content_type: Some("application/octet-stream".to_string()),
-        body: Body(response),
+        body: unsafe { Body::from_pool(enc_ptr, enc_len) },
     })
 }
 
@@ -242,7 +260,7 @@ fn handle_cert_data(request: &mut Request, path: String) -> ZetaAslResult<Respon
     Ok(Response {
         status: HTTPStatus::OK,
         content_type: Some("application/cbor".to_string()),
-        body: Body(cert_data),
+        body: Body::Heap(cert_data),
     })
 }
 

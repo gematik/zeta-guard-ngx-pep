@@ -33,10 +33,61 @@ use ngx_tickle::finalize_request;
 
 use crate::request_ops::RequestOps;
 
-#[derive(Debug, Default, Clone)]
-pub struct Body(pub Vec<u8>);
+/// A raw pointer to pool-allocated memory. Send+Sync is safe because nginx request
+/// processing is single-threaded, and the pool outlives the Response.
+pub(crate) struct PoolBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+unsafe impl Send for PoolBuf {}
+unsafe impl Sync for PoolBuf {}
+
+impl std::fmt::Debug for PoolBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PoolBuf({} bytes)", self.len)
+    }
+}
+
+impl Clone for PoolBuf {
+    fn clone(&self) -> Self {
+        // Pool memory can't be cloned — this is only reachable for the UNACCEPTABLE static
+        // which uses Body::Heap, never Body::Pool.
+        unreachable!("PoolBuf::clone should never be called")
+    }
+}
+
+/// Response body. Heap-allocated data gets copied to the pool on send.
+/// Pool-allocated data is used directly — zero copy.
+#[derive(Debug, Clone)]
+pub enum Body {
+    Heap(Vec<u8>),
+    Pool(PoolBuf),
+}
+
+impl Default for Body {
+    fn default() -> Self {
+        Body::Heap(Vec::new())
+    }
+}
 
 impl Body {
+    /// Wrap a pool-allocated buffer. The pool must outlive this Body.
+    pub unsafe fn from_pool(ptr: *mut u8, len: usize) -> Self {
+        Body::Pool(PoolBuf { ptr, len })
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Body::Heap(v) => v,
+            Body::Pool(b) => unsafe { std::slice::from_raw_parts(b.ptr, b.len) },
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
     fn send(&self, request: &mut Request) -> Result<()> {
         unsafe {
             let content_length = self.len();
@@ -49,13 +100,17 @@ impl Body {
                 (*buf).set_last_buf(if request.is_main() { 1 } else { 0 });
                 (*buf).set_last_in_chain(1);
 
-                // TODO: make libasl allocator-aware, or take a buf to write to (form request pool),
-                // so we don't have to copy here
-                let data_ptr = request.pool().calloc(content_length) as *mut u8;
-                if data_ptr.is_null() {
-                    bail!("null body buffer");
-                }
-                copy_nonoverlapping(self.0.as_ptr(), data_ptr, content_length);
+                let data_ptr = match self {
+                    Body::Pool(b) => b.ptr,
+                    Body::Heap(v) => {
+                        let ptr = request.pool().calloc(content_length) as *mut u8;
+                        if ptr.is_null() {
+                            bail!("null body buffer");
+                        }
+                        copy_nonoverlapping(v.as_ptr(), ptr, content_length);
+                        ptr
+                    }
+                };
                 (*buf).start = data_ptr;
                 (*buf).end = (*buf).start.add(content_length);
                 (*buf).pos = (*buf).start;
@@ -93,10 +148,6 @@ impl Body {
             Ok(())
         }
     }
-
-    fn len(&self) -> usize {
-        self.0.len()
-    }
 }
 
 #[derive(Clone)]
@@ -110,7 +161,7 @@ impl std::fmt::Debug for Response {
         f.debug_struct("Response")
             .field("status", &self.status)
             .field("content_type", &self.content_type)
-            .field("body", &format!("({} bytes)", self.body.0.len()))
+            .field("body", &format!("({} bytes)", self.body.len()))
             .finish()
     }
 }
@@ -128,7 +179,7 @@ impl Response {
         Response {
             status,
             content_type: Some(content_type.to_string()),
-            body: Body(body),
+            body: Body::Heap(body),
         }
     }
 

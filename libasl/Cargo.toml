@@ -22,12 +22,21 @@
 
 [package]
 name = "asl"
-version = "0.2.1"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
-libcrux = { version = "0.0.2-alpha.3", features = ["rand"] }
-libcrux-ml-kem = { version = "0.0.2-alpha.3" }
+libcrux-traits = "0.0.6"
+libcrux-kem = "0.0.6"
+libcrux-aead = "0.0.6"
+libcrux-hkdf = "0.0.6"
+libcrux-ecdsa = { version = "0.0.6", features = ["rand"] }
+libcrux-sha2 = "0.0.6"
+libcrux-ml-kem = "0.0.7"
+rand = "0.9"
+sha1_smol = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_cbor = "0.11"
 serde_bytes = "0.11"

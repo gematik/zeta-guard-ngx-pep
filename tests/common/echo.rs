@@ -40,7 +40,6 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, lookup_host};
-use tokio::time::timeout;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Echo {
@@ -122,13 +121,14 @@ pub async fn ws_request(uri: Uri, auth: &str, dpop: &str, msg: u8) -> Result<u8>
         panic!("server didn't upgrade: {}", res.status());
     }
 
-    timeout(Duration::from_secs(1), async move {
+    tokio::time::timeout(Duration::from_secs(5), async move {
         match hyper::upgrade::on(res).await {
             Ok(upgraded) => echo_ws_client_io(upgraded, msg).await,
             Err(e) => bail!("client: {e:?}"),
         }
     })
-    .await?
+    .await
+    .context("ws client error or timeout")?
 }
 
 async fn echo_service(

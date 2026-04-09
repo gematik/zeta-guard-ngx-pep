@@ -99,7 +99,7 @@ pub fn get_roots_chain(
     issuer_cn: &str,
     cert_info: &CertResolver,
 ) -> Result<Vec<ByteBuf>, RootsError> {
-    let roots: Vec<Root> = serde_json::from_slice(&roots_blob).map_err(|_| RootsError::Format)?;
+    let roots: Vec<Root> = serde_json::from_slice(roots_blob).map_err(|_| RootsError::Format)?;
 
     let initial = root_name
         .and_then(|name| find_by_cn(&roots, &name))
@@ -149,8 +149,8 @@ pub fn build_cert_data(
     rca: Option<String>,
     cert_info: &CertResolver,
 ) -> Result<CertData, RootsError> {
-    let (_, signer_issuer_cn) = cert_info(&signer_cert).ok_or(RootsError::Decoding)?;
-    let (ca_subject_cn, ca_issuer_cn) = cert_info(&ca_cert).ok_or(RootsError::Decoding)?;
+    let (_, signer_issuer_cn) = cert_info(signer_cert).ok_or(RootsError::Decoding)?;
+    let (ca_subject_cn, ca_issuer_cn) = cert_info(ca_cert).ok_or(RootsError::Decoding)?;
 
     if signer_issuer_cn != ca_subject_cn {
         return Err(RootsError::Consistency {
@@ -171,7 +171,7 @@ pub fn build_cert_data(
 mod tests {
     use super::*;
     use std::fs;
-    use x509_parser::{parse_x509_certificate};
+    use x509_parser::parse_x509_certificate;
     use x509_parser::pem::Pem;
     use x509_parser::prelude::X509Name;
 
@@ -345,7 +345,10 @@ mod tests {
             rca1_name(),
             &get_cert_info,
         );
-        assert!(matches!(maybe_cert_data, Err(RootsError::Consistency {..})));
+        assert!(matches!(
+            maybe_cert_data,
+            Err(RootsError::Consistency { .. })
+        ));
         if let RootsError::Consistency { issue } = maybe_cert_data.unwrap_err() {
             assert!(issue.contains("CA is not the issuer of the signer certificate"));
         }

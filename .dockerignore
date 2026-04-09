@@ -31,3 +31,7 @@
 /bin
 LICENSE
 README.md
+/prefix/*
+!/prefix/conf
+/prefix/conf/*
+!/prefix/conf/tls.p256.pem

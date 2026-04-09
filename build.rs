@@ -57,9 +57,13 @@ struct ConfigFile {
     port: u16,
     // IT: embedded echo server port for upstream tests
     echo_port: u16,
+    // pep_asl_ocsp value: "off" or "http://127.1.33.7:{port}"
+    ocsp_url: String,
     temp_prefix: String,
     // adds 'user root;' for CI (coverage), no effect when master is not root (e.g. locally)
     as_root: bool,
+    // enable tls via ossl_hsm
+    tls: bool,
 }
 
 impl ConfigFile {
@@ -71,13 +75,15 @@ impl ConfigFile {
             #[cfg(not(target_os = "macos"))]
             libsuff: "so".to_string(),
             target: "debug".to_string(),
-            multi_process: true, // set to false for easier debugging
-            error_log: "/dev/stdout debug".to_string(),
+            multi_process: false, // set to false for easier debugging — test should use true
+            error_log: "/dev/stdout".to_string(),
             access_log: "/dev/stdout main".to_string(),
             port: 8000,
             echo_port: 8100, // should be port + 100
+            ocsp_url: "off".to_string(),
             temp_prefix: "".to_string(),
             as_root: false,
+            tls: false,
         }
     }
 
@@ -117,15 +123,19 @@ pub fn install_config() -> Result<()> {
     // configuration for a range of ports. This allows starting multiple tests in parallel.
     //
     // see also: tests/common/mod.rs
-    for port in 8003..=8010 {
+    for port in 8003..=8006 {
         let mut test_config = ConfigFile::new();
         test_config.name = format!("test-{port}");
-        test_config.error_log = format!("{}/logs/error.log", test_config.name);
-        test_config.access_log = format!("{}/logs/access.log", test_config.name);
+        test_config.multi_process = true;
+        // All test instances share a single log file for easier debugging
+        test_config.error_log = "test.log".to_string();
+        test_config.access_log = "test.log main".to_string();
         test_config.port = port;
         test_config.echo_port = port + 100; // e.g. 8003 → 8103
+        test_config.ocsp_url = format!("http://127.1.33.7:{}", port + 300);
         test_config.temp_prefix = format!("{}/", test_config.name);
         test_config.as_root = true; // needed in CI to write out coverage data
+        test_config.tls = true; // IT start an in-process hsm-sim and tests tls with it
         test_config.write()?;
         let test_dir = Path::new("prefix").join(format!("test-{port}"));
         create_dir_all(&test_dir)?;
@@ -266,30 +276,40 @@ fn generate_book() -> Result<()> {
     Ok(())
 }
 
+fn copy(source: &str, target: &str) -> Result<u64> {
+    let source = Path::new(source);
+    println!("cargo:rerun-if-changed={}", source.display());
+    let target = Path::new(target);
+    println!("cargo:rerun-if-changed={}", target.display());
+    fs::copy(source, target).context(format!("copy {} {}", source.display(), target.display()))
+}
+
 fn copy_aslkeys() -> Result<()> {
-    let source = Path::new("libasl/fixtures/signer_cert.pem");
-    println!("cargo:rerun-if-changed={}", source.display());
-    let target = Path::new("prefix/conf/signer_cert.pem");
-    println!("cargo:rerun-if-changed={}", target.display());
-    fs::copy(source, target)?;
+    copy(
+        "libasl/fixtures/signer_cert.pem",
+        "prefix/conf/signer_cert.pem",
+    )?;
+    copy(
+        "libasl/fixtures/signer_key.pem",
+        "prefix/conf/signer_key.pem",
+    )?;
+    copy(
+        "libasl/fixtures/issuer_cert.pem",
+        "prefix/conf/issuer_cert.pem",
+    )?;
+    // NOTE: required for the ocsp responder impl. in integration tests, not the nginx module
+    copy(
+        "libasl/fixtures/issuer_key.pem",
+        "prefix/conf/issuer_key.pem",
+    )?;
+    copy("libasl/fixtures/roots.json", "prefix/conf/roots.json")?;
 
-    let source = Path::new("libasl/fixtures/signer_key.pem");
-    println!("cargo:rerun-if-changed={}", source.display());
-    let target = Path::new("prefix/conf/signer_key.pem");
-    println!("cargo:rerun-if-changed={}", target.display());
-    fs::copy(source, target)?;
-
-    let source = Path::new("libasl/fixtures/issuer_cert.pem");
-    println!("cargo:rerun-if-changed={}", source.display());
-    let target = Path::new("prefix/conf/issuer_cert.pem");
-    println!("cargo:rerun-if-changed={}", target.display());
-    fs::copy(source, target)?;
-
-    let source = Path::new("libasl/fixtures/roots.json");
-    println!("cargo:rerun-if-changed={}", source.display());
-    let target = Path::new("prefix/conf/roots.json");
-    println!("cargo:rerun-if-changed={}", target.display());
-    fs::copy(source, target)?;
+    copy("misc/config/common.conf", "prefix/conf/common.conf")?;
+    copy("misc/config/asl.conf", "prefix/conf/asl.conf")?;
+    copy(
+        "misc/config/server_common.conf",
+        "prefix/conf/server_common.conf",
+    )?;
 
     Ok(())
 }

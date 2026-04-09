@@ -5,4 +5,5 @@
   - [AccessTokenInvalid](errors/AccessTokenInvalid.md)
   - [DPoP](errors/DPoP.md)
   - [PoPP](errors/PoPP.md)
+  - [ImpossibleTravel](errors/ImpossibleTravel.md)
   - [Internal](errors/Internal.md)

@@ -31,11 +31,13 @@ members = [
   ".",
   "purl",
   "libasl",
+  "hsm_sim",
+  "ossl_hsm",
 ]
 exclude = ["xtask"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.1"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.94.0"
@@ -66,7 +68,7 @@ its = [
 anyhow = "1.0"
 async-compat = "0.2"
 scc = "3.3"
-base64ct = "1.8"
+base64ct = {  version = "1.8", features = ["alloc"] }
 futures = "0.3"
 jsonwebtoken = { version = "10.2", features = ["rust_crypto"] }
 nginx-sys = { version = "0.5", default-features = false }
@@ -91,6 +93,10 @@ httparse = "1.10"
 http = "1.4"
 fastrand = "2.3"
 x509-parser = "0.18"
+x509-cert = "0.2"
+x509-ocsp = "0.2"
+sha1_smol = "1.0" # for OCSP CertId only
+der = "0.7"
 sec1 = { version = "0.7", features = ["pkcs8"] }
 asn1-rs = { version= "0.7", optional = true }
 uuid = { version = "1.18", optional = true }
@@ -112,6 +118,12 @@ ambassador = "0.5"
 ngx_pep = { path = ".", features = ["client", "its"] }
 tarpc = { version = "0.37", features = ["tokio1", "serde-transport", "unix", "serde1"] }
 tokio-serde = { version = "0.9", features = ["json"] }
+hsm_sim = { path = "./hsm_sim/" }
+openssl = "0.10"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+const-oid = "0.9"
 
 [build-dependencies]
 cc = { version = "1.0", optional = true }

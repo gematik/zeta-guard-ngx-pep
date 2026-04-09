@@ -2,6 +2,25 @@
 
 # Release Notes ZETA PEP
 
+## Release 0.5.1
+
+### added:
+- ossl_hsm — an openssl provider that can do TLS on a HSM
+
+## Release 0.5.0
+
+### added:
+- provide OCSP stapling for ASL
+- implement no-travel enforcement
+- support entity statement and signed JWKS for PoPP
+
+### changed:
+- updated to latest libcrux version for ASL crypto
+- slimmed down the container image some more to decrease attack surface
+
+### fixed:
+- case-independent handling of authorization schemes
+
 ## Release 0.4.0
 
 ### added:

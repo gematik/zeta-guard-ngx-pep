@@ -25,13 +25,13 @@
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{anyhow, bail, Context, Result};
-use asl::{new_cid, utc_now, Config, HandshakeState, SessionState};
+use anyhow::{Context, Result, anyhow, bail};
+use asl::{Config, HandshakeState, SessionState, new_cid, utc_now};
 use nginx_sys::{
-    ngx_conf_t, ngx_int_t, ngx_shared_memory_add, ngx_shm_zone_t, NGX_CONF_PREFIX, NGX_PREFIX,
+    NGX_CONF_PREFIX, NGX_PREFIX, ngx_conf_t, ngx_int_t, ngx_shared_memory_add, ngx_shm_zone_t,
 };
 use ngx::allocator::Allocator;
 use ngx::collections::{RbTreeMap, Vec};
@@ -43,12 +43,13 @@ use ngx::sync::RwLock;
 use crate::asl_keys::{asl_file_path, create_asl_config};
 use crate::conf::MainConfig;
 use crate::ngx_http_pep_module;
-use crate::{log_debug, Module};
+use crate::ocsp_cache::OcspCache;
+use crate::{Module, log_debug};
 
 const SESSION_CACHE_SIZE: usize = 10 << 20;
 
 pub struct ShmHandshakeState<A: Allocator + Clone> {
-    pub ss_e: Vec<u8, A>,
+    pub ss_e: [u8; 64],
     pub transcript: Vec<u8, A>,
 }
 
@@ -67,7 +68,7 @@ fn copy_to_global<T: Clone>(v: &Vec<T, SlabPool>) -> std::vec::Vec<T> {
 impl ShmHandshakeState<SlabPool> {
     fn from_global(value: &HandshakeState, pool: SlabPool) -> Self {
         ShmHandshakeState {
-            ss_e: copy_to_pool(&value.ss_e, pool.clone()),
+            ss_e: value.ss_e,
             transcript: copy_to_pool(&value.transcript, pool),
         }
     }
@@ -76,35 +77,37 @@ impl ShmHandshakeState<SlabPool> {
 impl From<&ShmHandshakeState<SlabPool>> for HandshakeState {
     fn from(value: &ShmHandshakeState<SlabPool>) -> Self {
         HandshakeState {
-            ss_e: copy_to_global(&value.ss_e),
+            ss_e: value.ss_e,
             transcript: copy_to_global(&value.transcript),
         }
     }
 }
 
-pub struct ShmSessionState<A: Allocator + Clone> {
-    pub key_id: Vec<u8, A>,
-    pub k2_c2s_app_data: Vec<u8, A>,
-    pub k2_s2c_app_data: Vec<u8, A>,
+/// Session state stored in shared memory. Key fields are inline fixed-size arrays
+/// (no slab allocations needed). Only enc_ctr needs atomic access for concurrent reads.
+pub struct ShmSessionState {
+    pub key_id: [u8; 32],
+    pub k2_c2s_app_data: [u8; 32],
+    pub k2_s2c_app_data: [u8; 32],
     pub expires: u64,
     pub enc_ctr: AtomicU64,
 }
 
-impl ShmSessionState<SlabPool> {
-    fn from_global(value: &SessionState, pool: SlabPool) -> Self {
+impl ShmSessionState {
+    fn from_global(value: &SessionState) -> Self {
         ShmSessionState {
-            key_id: copy_to_pool(&value.key_id, pool.clone()),
-            k2_c2s_app_data: copy_to_pool(&value.k2_c2s_app_data, pool.clone()),
-            k2_s2c_app_data: copy_to_pool(&value.k2_s2c_app_data, pool),
+            key_id: value.key_id,
+            k2_c2s_app_data: value.k2_c2s_app_data,
+            k2_s2c_app_data: value.k2_s2c_app_data,
             expires: value.expires,
             enc_ctr: AtomicU64::new(value.enc_ctr),
         }
     }
     fn to_global(&self, enc_ctr: u64) -> SessionState {
         SessionState {
-            key_id: copy_to_global(&self.key_id),
-            k2_c2s_app_data: copy_to_global(&self.k2_c2s_app_data),
-            k2_s2c_app_data: copy_to_global(&self.k2_s2c_app_data),
+            key_id: self.key_id,
+            k2_c2s_app_data: self.k2_c2s_app_data,
+            k2_s2c_app_data: self.k2_s2c_app_data,
             expires: self.expires,
             enc_ctr,
         }
@@ -113,7 +116,7 @@ impl ShmSessionState<SlabPool> {
 
 pub enum ShmConnectionState<A: Allocator + Clone> {
     Handshaking(ShmHandshakeState<A>),
-    Established(ShmSessionState<A>),
+    Established(ShmSessionState),
 }
 
 type Map = RbTreeMap<NgxString<SlabPool>, ShmConnectionState<SlabPool>, SlabPool>;
@@ -220,10 +223,7 @@ impl ShmSessionCache {
         self.maybe_cleanup_expired_sessions();
 
         let key = NgxString::try_from_bytes_in(cid, self.pool.clone())?;
-        let value = ShmConnectionState::Established(ShmSessionState::from_global(
-            &state,
-            self.pool.clone(),
-        ));
+        let value = ShmConnectionState::Established(ShmSessionState::from_global(&state));
 
         let mut map = self.shared.map.write();
         if map.get(&key).is_some() {
@@ -342,7 +342,8 @@ extern "C" fn shared_zone_init(shm_zone: *mut ngx_shm_zone_t, _data: *mut c_void
                 asl_file_path(&asl_conf_dir, &main_conf.asl_ca_cert),
                 asl_file_path(&asl_conf_dir, &main_conf.asl_roots_json),
                 main_conf.asl_root_ca.clone(),
-                main_conf.asl_ocsp_url.clone(),
+                main_conf.asl_ocsp.clone(),
+                main_conf.asl_ocsp_ttl,
             )
             .inspect(|config| {
                 if config.is_default() {
@@ -353,7 +354,13 @@ extern "C" fn shared_zone_init(shm_zone: *mut ngx_shm_zone_t, _data: *mut c_void
                         config.env,
                         config.signed_keys.version()
                     );
+                    if let Some(url) = &config.ocsp_url {
+                        println!("asl ocsp: {} TTL {}", url, config.ocsp_ttl.as_secs());
+                    } else {
+                        println!("asl ocsp: off");
+                    }
                 }
+                OcspCache::init(config);
             })
             .unwrap(),
         );

@@ -1,0 +1,15 @@
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+
+[provider_sect]
+ossl_hsm = ossl_hsm_sect
+default = default_sect
+
+[ossl_hsm_sect]
+module = /usr/local/lib/ossl-modules/libossl_hsm.so
+activate = 1
+
+[default_sect]
+activate = 1

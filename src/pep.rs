@@ -343,6 +343,27 @@ async fn verify_dpop(
     Ok(())
 }
 
+fn verify_client_ip(
+    main_config: &MainConfig,
+    access_token_claims: &AccessTokenPayload,
+    request_ip: Option<&str>,
+) -> ZetaResult<()> {
+    if main_config.no_travel {
+        let access_ip = &access_token_claims.ip_address;
+        let client_ip = request_ip.ok_or_else(|| {
+            ZetaError::Internal(anyhow!(
+                "client IP address unavailable; ingress must set HTTP Forwarded header"
+            ))
+        })?;
+        if client_ip != access_ip {
+            return Err(ZetaError::ImpossibleTravel(anyhow!(
+                "access token IP does not match client IP address"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<()> {
     let now = get_current_timestamp();
 
@@ -362,7 +383,7 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
         .context("missing DPoP header")
         .map_err(ZetaError::DPoP)?;
     let http_method = request.method();
-    let uri: Uri = request.eigenuri_normalized()?;
+    let uri: Uri = request.eigenurl_normalized()?;
 
     verify_dpop(
         location_config,
@@ -376,7 +397,13 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
     .await
     .map_err(ZetaError::DPoP)?;
 
-    if location_config.require_popp.unwrap_or(true) {
+    verify_client_ip(main_config, &access_token.claims, request.get_client_ip())?;
+
+    if location_config.require_popp.unwrap_or(false) {
+        if main_config.popp_issuer.is_none() {
+            return Err(ZetaError::PoPP(anyhow!("No `pep_popp_issuer` configured")));
+        }
+
         let popp = request
             .get_header_in("popp")
             .ok_or(ZetaError::PoPP(anyhow!("missing PoPP header")))?;
@@ -434,7 +461,7 @@ pub fn handler(request: &mut Request) -> Status {
                     Err(err) => {
                         log_debug!("pep: {err}");
                         let response = request
-                            .eigenuri_normalized()
+                            .eigenurl_normalized()
                             .and_then(|base| err.response(base));
 
                         match response {
@@ -847,5 +874,38 @@ mod tests {
         .await;
 
         assert!(result.is_err_and(|err| err.to_string().contains("invalid typ")));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn verifies_client_ip() {
+        let no_travel_on = MainConfig {
+            no_travel: true,
+            ..Default::default()
+        };
+
+        let at = AccessTokenPayload {
+            ip_address: "192.168.1.1".to_string(),
+            ..Default::default()
+        };
+
+        let result = verify_client_ip(&no_travel_on, &at, Some("192.168.1.1"));
+        assert!(result.is_ok());
+
+        // mismatch
+        let result = verify_client_ip(&no_travel_on, &at, Some("127.0.0.1"));
+        assert!(result.is_err_and(|err| err.to_string().contains("Impossible Travel")));
+
+        // missing client IP
+        let result = verify_client_ip(&no_travel_on, &at, None);
+        assert!(result.is_err_and(|err| err.to_string().contains("client IP address unavailable")));
+
+        // disabled
+        let no_travel_off = MainConfig {
+            no_travel: false,
+            ..Default::default()
+        };
+        let result = verify_client_ip(&no_travel_off, &at, None);
+        assert!(result.is_ok());
     }
 }

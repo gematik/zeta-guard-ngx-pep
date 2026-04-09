@@ -28,8 +28,8 @@ use std::task::{Poll, Waker};
 use anyhow::Result;
 use futures::future::try_join_all;
 use nginx_sys::{
-    NGX_HTTP_SPECIAL_RESPONSE, ngx_http_finalize_request,
-    ngx_http_read_client_request_body, ngx_http_request_t,
+    NGX_HTTP_SPECIAL_RESPONSE, ngx_http_finalize_request, ngx_http_read_client_request_body,
+    ngx_http_request_t,
 };
 use ngx::core::Status;
 use ngx::http::{HTTPStatus, Request};

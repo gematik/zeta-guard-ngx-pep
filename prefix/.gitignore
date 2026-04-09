@@ -3,6 +3,10 @@
 !/modules
 !/html
 /html/*
-!/html/jwks.json
+!/html/signed-jwks.txt
+!/html/openid-federation.txt
 !/html/empty.json
 !/html/doc
+!/conf
+/conf/*
+!/conf/tls.p256.pem

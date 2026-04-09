@@ -32,10 +32,11 @@ use reqwest::{Client, Url};
 use sha2::{Digest, Sha256};
 
 use asl::client::{
-    HandshakeKeys, SessionState, continue_handshake, finish_handshake, initiate_handshake_with_keys,
+    HandshakeKeys, SessionState, continue_handshake, finish_handshake,
+    initiate_handshake_with_keys, raw_keys_from_bytes,
 };
 use asl::client::{decrypt_response, encrypt_request};
-use asl::{Environment, ErrorResponse, raw_keys_from_bytes};
+use asl::{Environment, ErrorResponse, SESSION_OVERHEAD};
 
 use crate::client::{ClientRegistration, create_dpop_proof, post_with_dpop};
 use crate::typify::HttpZetaErrorResponse;
@@ -97,6 +98,66 @@ pub async fn asl_handshake(
     let state =
         finish_handshake(state, &m4).context(format!("finish_handshake, m4={}b", m4.len()))?;
     Ok((cid, state))
+}
+
+/// Like [`asl_handshake`], but also captures the OCSP response from M2's SignedAslKeys for
+/// integration tests.
+pub async fn asl_handshake_with_ocsp(
+    client: Client,
+    registration: &ClientRegistration,
+    url: Url,
+    access_token: &str,
+) -> Result<(String, SessionState, Option<Vec<u8>>)> {
+    let (client_raw_pk, client_raw_sk) = raw_keys_from_bytes(
+        &hex::decode(CLIENT_ECDH_SK_HEX).unwrap(),
+        &hex::decode(CLIENT_ECDH_PK_HEX).unwrap(),
+        &hex::decode(CLIENT_PQC_SK_HEX).unwrap(),
+        &hex::decode(CLIENT_PQC_PK_HEX).unwrap(),
+    )
+    .unwrap();
+    let client_keys = HandshakeKeys {
+        pk: client_raw_pk,
+        sk: client_raw_sk,
+    };
+    let (state, m1) = initiate_handshake_with_keys(Environment::Testing, client_keys.clone())?;
+
+    let response = post_with_dpop(
+        registration,
+        client.clone(),
+        access_token,
+        url.join("ASL/")?,
+    )?
+    .header("content-type", "application/cbor")
+    .body(m1)
+    .send()
+    .await?;
+
+    let cid: Vec<_> = response.headers().get_all("zeta-asl-cid").iter().collect();
+    if cid.len() != 1 {
+        bail!("cid.len() {} != 1", cid.len());
+    }
+    let cid = cid[0].to_str()?.to_string();
+    let m2 = response.bytes().await?.to_vec().clone();
+
+    let ocsp_response = std::cell::Cell::new(None);
+    let (state, m3) = continue_handshake(state, &m2, |signed_keys| {
+        ocsp_response.set(signed_keys.ocsp_response.clone());
+        true
+    })?;
+    let ocsp_response = ocsp_response.into_inner();
+
+    let m4 = post_with_dpop(registration, client, access_token, url.join(&cid)?)?
+        .header("content-type", "application/cbor")
+        .body(m3)
+        .send()
+        .await?
+        .bytes()
+        .await?
+        .to_vec();
+
+    let state =
+        finish_handshake(state, &m4).context(format!("finish_handshake, m4={}b", m4.len()))?;
+    Ok((cid, state, ocsp_response))
 }
 
 pub fn encode_http_request_with_dpop(
@@ -185,7 +246,8 @@ pub async fn asl_request_with_dpop(
     inner: &[u8],
     extra_headers: Option<HeaderMap<HeaderValue>>,
 ) -> Result<AslResponse> {
-    let inner_enc = encrypt_request(state, req_ctr, inner)?;
+    let mut inner_enc = vec![0u8; inner.len() + SESSION_OVERHEAD];
+    encrypt_request(state, req_ctr, inner, &mut inner_enc)?;
 
     let url = target.join(cid)?;
     let host = url.host().context("url needs a host")?;
@@ -221,7 +283,8 @@ pub async fn asl_request_with_dpop(
             content_type == "application/octet-stream",
             "unexpected content-type; want \"application/octet-stream\", got \"{content_type}\""
         );
-        let response_bytes = decrypt_response(state, req_ctr, &response_bitez)?;
+        let mut response_bytes = vec![0u8; response_bitez.len() - SESSION_OVERHEAD];
+        decrypt_response(state, req_ctr, &response_bitez, &mut response_bytes)?;
 
         let mut headers = [httparse::EMPTY_HEADER; 128];
         let mut response = httparse::Response::new(&mut headers);

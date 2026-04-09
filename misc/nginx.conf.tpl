@@ -21,53 +21,27 @@ error_log {error_log};
 pid {temp_prefix}logs/nginx.pid;
 
 events \{
-    worker_connections  1024;
+    worker_connections 1024;
 }
 
 http \{
-
-    map $http_upgrade $connection_upgrade \{
-      default upgrade;
-      ''      '';
-    }
-
-    # A_26920: ZETA/ASL mindestens HTTP-Version 1.1
-    map $server_protocol $reject_proto \{
-        "HTTP/1.1"    0;  # fast-path
-        "HTTP/2.0"    0;
-        ~*^HTTP/1\.1$ 0;  # case-insensitive
-        ~*^HTTP/2\.0$ 0;
-        default       1;  # reject everything else
-    }
-
-    proxy_read_timeout 300s;
-
-    include       mime.types;
-    default_type  application/octet-stream;
-
-    log_format  main '$remote_addr - $remote_user [$time_local] "$request" '
-                     '$status $body_bytes_sent $\{request_time}s "$http_referer" '
-                     '"$http_user_agent" "$http_x_forwarded_for"';
+    include common.conf;
 
     client_body_temp_path {temp_prefix}client_body_temp;
     proxy_temp_path {temp_prefix}proxy_temp;
     scgi_temp_path {temp_prefix}scgi_temp;
     uwsgi_temp_path {temp_prefix}uwsgi_temp;
 
-    access_log  {access_log};
+    access_log {access_log};
 
-    sendfile    on;
-    aio         threads;
-    aio_write   on;
-    tcp_nopush  on;
-
-    keepalive_timeout  65;
+    ### Global Config
 
     # pep_pdp_issuer http://localhost:18080/realms/zeta-guard;
     pep_pdp_issuer https://zeta-cd.westeurope.cloudapp.azure.com/auth/realms/zeta-guard;
     # pep_pdp_issuer https://zeta-dev.westeurope.cloudapp.azure.com/auth/realms/zeta-guard;
     # pep_pdp_issuer https://zeta-staging.spree.de/auth/realms/zeta-guard;
-
+    ## server hosting PoPP entity statement at /.well-known/openid-federation
+    ## optional if no locations use pep_require_popp
     pep_popp_issuer http://localhost:{port};
     # pep_http_client_idle_timeout 30; # s
     # pep_http_client_max_idle_per_host 64;
@@ -81,94 +55,92 @@ http \{
     pep_asl_ca_cert issuer_cert.pem;
     pep_asl_roots_json roots.json;
     pep_asl_root_ca FAKE.RCA1;
-    # pep_asl_ocsp_url http://example.org/ocsp
+    ## cert: use AuthorityInformationAccess (AIA) from cert (default)
+    ## off: disable OCSP checks
+    ## https://ocsp.example.org: override responder, ignore cert AIA
+    pep_asl_ocsp {ocsp_url};
+    pep_asl_ocsp_ttl 1m;
+    ## enable or disable no-travel enforcement (ip address consistency)
+    # pep_no_travel off;
 
-    # These options are location configs, but can be declared in http and server levels
-    # also to be inherited in lower levels.
-    #
-    # # enable access phase handler to check access tokens, DPoP and, optionally, PoPP?
-    pep                  on;
-    # # space separated list of required audiences
-    # pep_require_aud      "http://localhost:18080";
-    pep_require_aud      "https://zeta-cd.westeurope.cloudapp.azure.com";
-    # pep_require_aud      "https://zeta-dev.westeurope.cloudapp.azure.com";
-    # pep_require_aud      "https://zeta-staging.spree.de";
+    ### Location Config
 
-    # # space separated list of required scopes
-    # pep_require_scope    "openid profile email";
-    # # clock leeway when checking exp,nbf,iat claims in seconds, default: 60
-    # pep_leeway           60;
-    # # implied dpop validity in s: iat + pep_dpop_validity + pep_leeway
-    # pep_dpop_validity    300;
-    # # validate PoPP header and pass along decoded claims as ZETA-PoPP-Token-Content?
-    pep_require_popp    off;
-    # # implied ppop validity in s
-    # pep_ppop_validity    31536000;
+    ## These can be set per-location, but it is recommended to set them once globally, and
+    ## only override in specific locations as needed.
+    ## enable access phase handler to check access tokens, DPoP and, optionally, PoPP
+    pep on;
+    ## space separated list of required audiences
+    # pep_require_aud "http://localhost:18080";
+    pep_require_aud "https://zeta-cd.westeurope.cloudapp.azure.com";
+    # pep_require_aud "https://zeta-dev.westeurope.cloudapp.azure.com";
+    # pep_require_aud "https://zeta-staging.spree.de";
+
+    ## space separated list of required scopes
+    # pep_require_scope "openid profile email";
+    ## clock leeway when checking exp,nbf,iat claims in s, default: 60
+    # pep_leeway 60;
+    ## implied dpop validity in s: iat + pep_dpop_validity + pep_leeway
+    # pep_dpop_validity 300;
+    ## validate PoPP header and pass along decoded claims as ZETA-PoPP-Token-Content
+    # pep_require_popp off;
+    # implied ppop validity in s
+    # pep_ppop_validity 31536000;
 
     server \{
-        listen       {port};
-        server_name  localhost;
+        listen {port};
+        {{if tls}}
+        listen 2{port} ssl;
+        ## ssl_certificate doesn't support loading from openssl stores, so tls.p256.pem
+        ## must be an actual file prefix/conf/tls.p256.pem, which is committed.
+        ## See README.md
+        ssl_certificate "tls.p256.pem";
+        ssl_certificate_key "store:hsm:tls.p256";
+        {{endif}}
 
-        # A_26920: ZETA/ASL mindestens HTTP-Version 1.1
-        if ($reject_proto) \{
-            return 444;
-        }
+        include server_common.conf;
 
-        location /proxy \{
+        server_name localhost;
+
+        location /proxy/ \{
             proxy_http_version 1.1;
-            proxy_pass "http://localhost:8001";
+            proxy_pass "http://localhost:8001/";
         }
 
-        location /CertData. \{
-            asl on;
-            pep off;
+        include asl.conf;
+
+        location = /.well-known/signed-jwks \{
+          pep off;
+          default_type application/jwt;
+          alias html/signed-jwks.txt;
+        }
+        location = /.well-known/openid-federation \{
+          pep off;
+          default_type application/jwt;
+          alias html/openid-federation.txt;
         }
 
-        location /ASL \{
-            asl on;
-            client_body_buffer_size 1m;
-            client_max_body_size 1m;
+        ## mock /pep/achelos_testfachdienst/hellozeta, e.g. for local asl testing
+        location = /pep/achelos_testfachdienst/hellozeta \{
+          default_type application/json;
+          alias html/empty.json;
         }
 
-        # helpful for local dev.
-        location /jwks.json \{
-          pep              off;
-          asl              off;
-          default_type     application/json;
-          alias            html/jwks.json;
-          autoindex        off;
-        }
-
-        # mock /pep/achelos_testfachdienst/hellozeta, e.g. for local asl testing
-        location /pep/achelos_testfachdienst/hellozeta \{
-          default_type     application/json;
-          alias            html/empty.json;
-          autoindex        off;
-        }
-
-        # for integration tests
-        location /ready/ \{
-          pep              off;
-          asl              off;
+        ## for integration tests
+        location = /ready/ \{
+          pep off;
           return 200;
         }
-        location /empty.json \{
-          default_type     application/json;
-          alias            html/empty.json;
-          autoindex        off;
+        location = /empty.json \{
+          default_type application/json;
+          alias html/empty.json;
         }
-        location /with_popp.json \{
-          default_type     application/json;
-          alias            html/empty.json;
-          autoindex        off;
+        location = /with_popp.json \{
+          default_type application/json;
+          alias html/empty.json;
           pep_require_popp on;
         }
 
-        location /doc \{
-          pep off;
-        }
-
-        # see tests/common/echo.rs
+        ## see tests/common/echo.rs
         location /echo/ \{
           proxy_http_version 1.1;
           proxy_pass "http://127.1.33.7:{echo_port}/";

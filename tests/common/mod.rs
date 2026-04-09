@@ -50,8 +50,10 @@ use ngx_pep::client::{
 };
 
 use crate::common::echo::echo_server;
+use crate::common::ocsp::ocsp_responder;
 
 pub mod echo;
+pub mod ocsp;
 
 #[allow(dead_code, clippy::all)]
 pub mod typify {
@@ -70,6 +72,7 @@ impl PortLock {
         let path = dir.join(format!("port-{port}.lock"));
         let file = OpenOptions::new()
             .create(true)
+            .truncate(true)
             .read(true)
             .write(true)
             .open(&path)
@@ -103,11 +106,17 @@ pub fn reserve_port(prefix: &Path, range: RangeInclusive<u16>) -> Result<PortLoc
             TcpListener::bind(("127.0.0.1", port)),
             // embedded echo server to test upstream
             TcpListener::bind(("127.1.33.7", port + 100)),
+            // hsm_sim for this nginx
+            TcpListener::bind(("127.1.33.7", port + 200)),
+            // ocsp responder
+            TcpListener::bind(("127.1.33.7", port + 300)),
         ) {
-            (Ok(listener_nginx), Ok(listener_echo)) => {
+            (Ok(listener_nginx), Ok(listener_echo), Ok(listener_hsm_sim), Ok(listener_ocsp)) => {
                 // ports are bindable, drop sockets so nginx and echo server can bind on it
                 drop(listener_nginx);
                 drop(listener_echo);
+                drop(listener_hsm_sim);
+                drop(listener_ocsp);
                 return Ok(lock);
             }
             _ => {
@@ -126,6 +135,8 @@ struct State {
     control_path: PathBuf,
     started: bool,
     port_lock: PortLock,
+    hsm_sim: Option<JoinHandle<()>>,
+    ocsp_responder: Option<JoinHandle<()>>,
 }
 
 struct NginxManager {
@@ -140,7 +151,7 @@ fn manager() -> Manager {
     let prefix = Path::new("./prefix").to_path_buf();
 
     // see build.rs for range
-    let port_lock = reserve_port(&prefix, 8003..=8010).expect("port");
+    let port_lock = reserve_port(&prefix, 8003..=8006).expect("port");
 
     MANAGER
         .get_or_init(|| {
@@ -148,15 +159,18 @@ fn manager() -> Manager {
             let control_path = prefix.join(format!("test-{}/control", port_lock.port));
             if control_path.exists() {
                 fs::remove_dir_all(&control_path)
-                    .expect(&format!("remove {}", control_path.display()));
+                    .unwrap_or_else(|_| panic!("remove {}", control_path.display()));
             }
-            fs::create_dir_all(&control_path).expect(&format!("create {}", control_path.display()));
+            fs::create_dir_all(&control_path)
+                .unwrap_or_else(|_| panic!("create {}", control_path.display()));
             Manager(Arc::new(NginxManager {
                 state: Mutex::new(State {
                     prefix,
                     control_path,
                     started: false,
                     port_lock,
+                    hsm_sim: None,
+                    ocsp_responder: None,
                 }),
                 leases: AtomicUsize::new(0),
                 pid: AtomicI32::new(0),
@@ -170,27 +184,77 @@ struct Manager(Arc<NginxManager>);
 
 impl Manager {
     async fn ensure_started(&self) -> Result<()> {
-        let mut st = self.0.state.lock().await;
-        if st.started {
+        let mut state = self.0.state.lock().await;
+        if state.started {
             return Ok(());
         }
 
-        let port = st.port_lock.port;
+        let port = state.port_lock.port;
+        let hsm_sim_addr = format!("127.1.33.7:{}", port + 200);
+        let hsm_sim_url = format!("http://{hsm_sim_addr}");
 
-        let mut cmd = Command::new(st.prefix.join("sbin/nginx"));
+        let hsm_sim_addr_clone = hsm_sim_addr.clone();
+        let hsm_sim_task = tokio::spawn(async move {
+            let _ = hsm_sim::tests::start_server(&hsm_sim_addr_clone).await;
+        });
+
+        let old_handle = state.hsm_sim.replace(hsm_sim_task);
+        if let Some(handle) = old_handle {
+            handle.abort();
+        }
+
+        // Wait for hsm-sim to be connectable before spawning nginx
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if tokio::net::TcpStream::connect(&hsm_sim_addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("hsm_sim did not become ready")?;
+
+        // Start OCSP responder
+        let ocsp_port = port + 300;
+        let conf_dir = state.prefix.join("conf");
+        let ocsp_responder_task = tokio::spawn(async move {
+            ocsp_responder(ocsp_port, &conf_dir)
+                .await
+                .expect("ocsp_responder")
+        });
+
+        let old_ocsp = state.ocsp_responder.replace(ocsp_responder_task);
+        if let Some(handle) = old_ocsp {
+            handle.abort();
+        }
+
+        let ocsp_addr = format!("127.1.33.7:{ocsp_port}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if tokio::net::TcpStream::connect(&ocsp_addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("ocsp responder did not become ready")?;
+
+        let mut cmd = Command::new(state.prefix.join("sbin/nginx"));
         cmd.args(["-c", &format!("conf/test-{port}.conf")]);
+        cmd.env("HSM_PROXY_ADDR", &hsm_sim_url);
 
-        // Redirect stdout/stderr to files so they don't pollute test output.
-        let stdout = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(st.prefix.join(format!("test-{port}/logs/stdout.log")))
-            .context("stdout.log")?;
-        let stderr = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(st.prefix.join(format!("test-{port}/logs/stderr.log")))
-            .context("stderr.log")?;
+        // Redirect stdout/stderr to the shared test log file.
+        // All nginx instances + their ossl_hsm provider output go to one file for easier debugging.
+        let log_file = || {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(state.prefix.join("test.log"))
+        };
+        let stdout = log_file().context("test.log (stdout)")?;
+        let stderr = log_file().context("test.log (stderr)")?;
 
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(stdout);
@@ -200,7 +264,7 @@ impl Manager {
         let pid = child.id().context("pid")? as i32;
 
         self.0.pid.store(pid, Ordering::SeqCst);
-        st.started = true;
+        state.started = true;
 
         Ok(())
     }
@@ -214,6 +278,13 @@ impl Manager {
         let mut state = tokio::task::block_in_place(move || {
             Handle::current().block_on(async move { self.0.state.lock().await })
         });
+
+        if let Some(handle) = state.hsm_sim.take() {
+            handle.abort();
+        }
+        if let Some(handle) = state.ocsp_responder.take() {
+            handle.abort();
+        }
 
         unsafe {
             libc::kill(pid, libc::SIGQUIT);
@@ -269,6 +340,17 @@ impl NginxLease {
         Url::parse(&format!("http://127.0.0.1:{port}")).context("url parse")
     }
 
+    pub async fn tls_url(&self) -> Result<Url> {
+        let port = self.mgr.0.state.lock().await.port_lock.port;
+        // prepend 2 for ssl listener
+        Url::parse(&format!("https://127.0.0.1:2{port}")).context("url parse")
+    }
+
+    pub async fn hsm_sim_url(&self) -> Result<String> {
+        let port = self.mgr.0.state.lock().await.port_lock.port;
+        Ok(format!("http://127.1.33.7:{}", port + 200))
+    }
+
     pub async fn wait_ready(&self) -> Result<()> {
         // not to be confused with echo-server /ready; this is tested on-demand, in start_echo_server
         let nginx_ready = async move {
@@ -284,7 +366,7 @@ impl NginxLease {
         };
         let control_ready = async move {
             loop {
-                if let Ok(_) = self.control_client().await {
+                if self.control_client().await.is_ok() {
                     return anyhow::Ok(());
                 }
                 sleep(Duration::from_millis(10)).await;
@@ -321,7 +403,7 @@ impl NginxLease {
     /// we only need to control one to manipulate it.
     pub async fn control_client(&self) -> Result<TestControlClient> {
         let sockets = self.control_sockets().await?;
-        if sockets.len() == 0 {
+        if sockets.is_empty() {
             bail!(
                 "0 sockets found at {}",
                 self.mgr.0.state.lock().await.control_path.display()
@@ -340,10 +422,10 @@ impl NginxLease {
 
         timeout(Duration::from_secs(5), async move {
             loop {
-                if let Ok(resp) = reqwest::get(echo_ready.clone()).await {
-                    if resp.status() == StatusCode::OK {
-                        break;
-                    }
+                if let Ok(resp) = reqwest::get(echo_ready.clone()).await
+                    && resp.status() == StatusCode::OK
+                {
+                    break;
                 }
                 sleep(Duration::from_millis(10)).await;
             }
@@ -443,15 +525,11 @@ impl TestContext {
     }
 
     pub fn popp_p12_pass(&self) -> Result<String> {
-        Ok(String::from(
-            env::var("IT_POPP_P12_PASS").expect("IT_POPP_P12_PASS"),
-        ))
+        Ok(env::var("IT_POPP_P12_PASS").expect("IT_POPP_P12_PASS"))
     }
 
     pub fn popp_p12_alias(&self) -> Result<String> {
-        Ok(String::from(
-            env::var("IT_POPP_P12_ALIAS").expect("IT_POPP_P12_ALIAS"),
-        ))
+        Ok(env::var("IT_POPP_P12_ALIAS").expect("IT_POPP_P12_ALIAS"))
     }
 }
 

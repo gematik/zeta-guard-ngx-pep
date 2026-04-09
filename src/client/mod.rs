@@ -535,4 +535,3 @@ pub fn post_with_dpop(
         .header("host", hostport)
         .header("dpop", &dpop))
 }
-

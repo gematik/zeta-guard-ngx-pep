@@ -27,6 +27,16 @@ packages)
 Additionally, a basic C build setup, e.g. gcc and gnu make.
 The nginx configure script will yell at you when something is missing.
 
+## cloning on Windows
+
+You must set git to preserve line-endings when cloning in Windows, otherwise the docker
+build (which always runs in Linux) will fail:
+
+```sh
+git config core.autocrlf input
+```
+
+
 # environment
 
 ## nginx sources
@@ -122,20 +132,118 @@ registration locally. See also `misc/nginx.conf.tpl` and `build.rs` for template
 
 For technical reasons the integration tests spawn multiple nginx processes on unique
 ports and with unique temporary directories. The configurations get written to
-`prefix/conf/test-{port}.conf` by build.rs. The port range `8003..=8010` is provisioned
-like this currently, and the "max-threads" sempahore is set to 8 in
+`prefix/conf/test-{port}.conf` by build.rs. The port range `8003..=8006` is provisioned
+like this currently, and the "max-threads" sempahore is set to 4 in
 `.config/nextest.toml` accordingly.
 
-For that reason, it can be a bit inconvenient to follow test logs, but a multi-file tail
-can help:
-
-`tail -F -n 20 prefix/test-*/logs/*`
+All logs (nginx access and error logs, stdout, stderr) are merged to a single log file
+`prefix/test.log`
 
 In CI, the nginx processes must run as (fake) root to be able to write out coverage data
 (as the main build is running as root in a container). The test configs therefore set
 `user root;`. This only has an effect when the master is started as root, i.e. not when
 running the tests locally. So the following warning can be ignored:
+
 `nginx: [warn] the "user" directive makes sense only if the master process runs with super-user privileges, ignored in …/prefix/conf/test-8004.conf:13`
+
+## local docker build
+
+The image can be build locally with:
+
+```sh
+docker buildx build -t ngx_pep:local .
+```
+
+And run with, e.g.:
+
+```sh
+docker run --tty --interactive --rm \
+  --publish 8080:8080 \
+    ngx_pep:local
+```
+
+NOTE: nginx still needs to be configured (`pep_pdp_issuer`, `pep_require_aud`,
+Fachdienst URLs, ASL keys, etc. …).
+See `./misc/docker/nginx.conf` for the config file template.
+
+To test TLS via HSM Simulator (see below), comment in these lines:
+
+```nginx.conf
+http {
+    # …
+    server {
+        # …
+        listen       8443 ssl;
+        # …
+        ssl_certificate     "tls.p256.pem";
+        ssl_certificate_key "store:hsm:tls.p256";
+        # …
+    }
+}
+```
+
+The container can now be run with:
+
+```sh
+# on the host
+cargo run -p hsm_sim -- --listen 0.0.0.0:50051
+
+# in another terminal
+docker run --tty --interactive --rm \
+  --publish 8080:8080 \
+  --publish 8443:8443 \
+  --env HSM_PROXY_ADDR=http://10.0.2.2:50051 \
+    ngx_pep:local
+```
+
+`http://10.0.2.2:50051` must be reachable from within the container. For rootless
+docker, this can be achieved by passing the environment variable
+`DOCKERD_ROOTLESS_ROOTLESSKIT_DISABLE_HOST_LOOPBACK=false` to the daemon.
+
+See [the hsm-sim README.md](./hsm_sim/README.md) for usage details.
+
+To build the hsm_sim image locally:
+
+```sh
+docker buildx build -t hsm_sim:local --target hsm-sim .
+```
+
+Then, you can use that instead of local `cargo run` to start the simulator, but you must
+provide arguments:
+
+```sh
+docker run --tty --interactive --rm \
+  --publish 50051:50051 \
+  hsm_sim:local \
+  --listen 0.0.0.0:50051 \
+  --keys-dir /etc/hsm_sim/keys
+
+# in another terminal
+docker run --tty --interactive --rm \
+  --publish 8080:8080 \
+  --publish 8443:8443 \
+  --env HSM_PROXY_ADDR=http://10.0.2.2:50051 \
+    ngx_pep:local
+```
+
+## HSM Simulator certificates in nginx
+
+`ssl_certificate` in nginx doesn't support the openssl store API, so we need to provide
+actual files containing certificate PEM.
+
+The HSM Simulator is designed so that the cert contents only depend on the keyid, so
+`./prefix/conf/tls.p256.pem` can be committed and will work with `store:hsm:tls.p256`.
+
+If any of the cert fields in HSM Simulator changes, or when switching the keyid, cert
+files can be re-generated with:
+
+```sh
+cargo run -p hsm_sim
+# in another terminal
+grpcurl -plaintext -d '{"key_id": "tls.p256"}' \
+  '[::1]:50051' gematik.zetaguard.hsmproxy.v1.HsmProxyService/GetCertificate \
+  | jq -r .certificatePem > prefix/conf/tls.p256.pem
+```
 
 ## License
 

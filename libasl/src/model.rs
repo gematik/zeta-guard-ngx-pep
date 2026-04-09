@@ -26,7 +26,8 @@ use std::fmt::Debug;
 
 use super::util::{validate_ecdh_pk, validate_pqc_pk};
 use anyhow::{Context, anyhow};
-use libcrux::kem::{self, PublicKey};
+use libcrux_kem as kem;
+use libcrux_kem::PublicKey;
 use libcrux_ml_kem::mlkem768::{MlKem768PrivateKey, MlKem768PublicKey};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -409,7 +410,7 @@ impl<T, E: Debug> ToError<Result<T, anyhow::Error>> for Result<T, E> {
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
-    use libcrux::aead;
+    use libcrux_traits::aead::typed_refs::EncryptError;
     use std::fmt::Debug;
 
     use crate::{AslError, ErrorResponse, ToError};
@@ -420,16 +421,15 @@ mod tests {
 
     #[test]
     fn convert_libcrux_errors_to_error() {
-        let result: Result<(), aead::Error> = Err(aead::Error::UnsupportedAlgorithm);
+        let result: Result<(), EncryptError> = Err(EncryptError::Unknown);
 
         let result = result.to_error();
 
-        assert!(result.is_err_and(|e| e.to_string() == "UnsupportedAlgorithm"));
+        assert!(result.is_err_and(|e| e.to_string() == "Unknown"));
 
-        let result = returning_asl_error(Err(aead::Error::UnsupportedAlgorithm));
+        let result = returning_asl_error(Err(EncryptError::Unknown));
         assert!(result.is_err_and(|e| {
-            matches!(e, AslError::InternalError(..))
-                && e.to_string() == "internal error: UnsupportedAlgorithm"
+            matches!(e, AslError::InternalError(..)) && e.to_string() == "internal error: Unknown"
         }));
     }
 

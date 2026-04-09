@@ -204,6 +204,23 @@ pub unsafe extern "C" fn ngx_slab_free_locked(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn ngx_pfree(
+    _pool: *mut ngx_pool_t,
+    _p: *mut ::core::ffi::c_void,
+) -> ngx_int_t {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ngx_pmemalign(
+    _pool: *mut ngx_pool_t,
+    _size: usize,
+    _alignment: usize,
+) -> *mut ::core::ffi::c_void {
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ngx_http_compile_complex_value(
     ccv: *mut ngx_http_compile_complex_value_t,
 ) -> ngx_int_t {

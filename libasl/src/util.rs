@@ -23,18 +23,27 @@
  */
 
 use super::model::*;
-use anyhow::{Context, anyhow};
-use libcrux::{aead, digest, drbg::Drbg, hkdf, kem};
+use anyhow::anyhow;
+use libcrux_aead::Aead;
+use libcrux_kem as kem;
 use libcrux_ml_kem::mlkem768;
+use libcrux_traits::aead::typed_refs::Aead as _;
+#[cfg(test)]
+use rand::SeedableRng;
+use rand::{Rng, RngCore};
 use std::cell::RefCell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 thread_local! {
     #[cfg(test)]
-    pub static RNG: RefCell<Drbg> = RefCell::new(Drbg::new_with_entropy(
-        digest::Algorithm::Sha256, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16].as_ref()).unwrap());
+    pub static RNG: RefCell<rand::rngs::StdRng> = RefCell::new(
+        rand::rngs::StdRng::from_seed([
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+            17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+        ])
+    );
     #[cfg(not(test))]
-    pub static RNG: RefCell<Drbg> = RefCell::new(Drbg::new(digest::Algorithm::Sha256).unwrap());
+    pub static RNG: RefCell<rand::rngs::ThreadRng> = RefCell::new(rand::rng());
 }
 
 pub fn utc_now() -> u64 {
@@ -45,31 +54,22 @@ pub fn utc_now() -> u64 {
     since_epoch.as_secs()
 }
 
-pub(crate) fn hkdf_expand(secret: &[u8], out_len: usize) -> Result<Vec<u8>, AslError> {
+pub(crate) fn hkdf_expand(secret: &[u8], out: &mut [u8]) -> Result<(), AslError> {
     // Note: This emulates the reference implementation, which uses a zero salt block and empty info
     let salt = [0u8; 32]; // 32 zeroes block
     let info = [0u8; 0]; // empty
-    let res = hkdf::hkdf(hkdf::Algorithm::Sha256, &salt, &secret, &info, out_len)
+    libcrux_hkdf::hkdf(libcrux_hkdf::Algorithm::Sha256, out, &salt, secret, &info)
         .map_err(|_| anyhow!("hkdf failure"))?;
-    if res.len() != out_len {
-        return Err(anyhow!("hkdf len mismatch; want={out_len}, got={}", res.len()).into());
-    }
-    Ok(res)
+    Ok(())
 }
 
-pub(crate) fn validate_ecdh_pk(pk: &ECDHKey) -> Result<Vec<u8>, AslError> {
-    if pk.crv != "P-256" {
+pub(crate) fn validate_ecdh_pk(pk: &ECDHKey) -> Result<[u8; 64], AslError> {
+    if pk.crv != "P-256" || pk.x.len() != 32 || pk.y.len() != 32 {
         return Err(AslError::MissingParameters);
     }
-    if pk.x.len() != 32 {
-        return Err(AslError::MissingParameters);
-    }
-    if pk.y.len() != 32 {
-        return Err(AslError::MissingParameters);
-    }
-
-    let mut encoded = pk.x.clone();
-    encoded.extend(&pk.y);
+    let mut encoded = [0u8; 64];
+    encoded[..32].copy_from_slice(&pk.x);
+    encoded[32..].copy_from_slice(&pk.y);
     Ok(encoded)
 }
 
@@ -82,7 +82,7 @@ pub(crate) fn validate_pqc_pk(pk: &[u8]) -> Result<[u8; PQC_PK_SIZE], AslError> 
 }
 
 pub(crate) struct HandshakeMaterial {
-    pub ss_p: Vec<u8>, // either ss_e or ss_s, depending on where it is used
+    pub ss_p: [u8; 64], // either ss_e or ss_s, depending on where it is used
     pub ecdh_ct: Vec<u8>,
     pub pqc_ct: Vec<u8>,
 }
@@ -100,16 +100,17 @@ pub(crate) fn derive_handshake_material(
     let pqc_pk_obj = libcrux_ml_kem::MlKemPublicKey::from(pqc_pk_bytes);
 
     let (ss_p, ecdh_ct, pqc_ct) = RNG.with_borrow_mut(|rng| -> Result<_, AslError> {
-        let (ss_p_ecdh_t1, ecdh_ct_t) = kem::encapsulate(&ecdh_pk_obj, rng).to_error()?;
-        let mut ss_p_ecdh_t = ss_p_ecdh_t1.encode();
-        ss_p_ecdh_t.truncate(32); // restrict to X coordinate, like in TLS 1.3 (RFC 8446 7.4.2)
+        let (ss_p_ecdh_t1, ecdh_ct_t) = ecdh_pk_obj.encapsulate(rng).to_error()?;
+        let ss_p_ecdh_enc = ss_p_ecdh_t1.encode();
 
-        let pqc_random: [u8; 32] = rng.generate_array().to_error()?;
+        let pqc_random: [u8; 32] = rng.random();
         let (pqc_ct_t, ss_p_pqc_t) = mlkem768::encapsulate(&pqc_pk_obj, pqc_random);
 
-        let mut ss_p_t = ss_p_ecdh_t;
-        ss_p_t.extend(ss_p_pqc_t);
-        Ok((ss_p_t, ecdh_ct_t.encode(), pqc_ct_t.as_slice().to_vec()))
+        let mut ss_p = [0u8; 64];
+        // ..32: restrict to X coordinate, like in TLS 1.3 (RFC 8446 7.4.2)
+        ss_p[..32].copy_from_slice(&ss_p_ecdh_enc[..32]);
+        ss_p[32..].copy_from_slice(ss_p_pqc_t.as_slice());
+        Ok((ss_p, ecdh_ct_t.encode(), pqc_ct_t.as_slice().to_vec()))
     })?;
 
     Ok(HandshakeMaterial {
@@ -120,185 +121,259 @@ pub(crate) fn derive_handshake_material(
 }
 
 pub(crate) struct HandshakeKeys {
-    pub k1_c2s: Vec<u8>,
-    pub k1_s2c: Vec<u8>,
+    pub k1_c2s: [u8; 32],
+    pub k1_s2c: [u8; 32],
 }
 
 pub(crate) fn derive_handshake_keys(ss_p: &[u8]) -> Result<HandshakeKeys, AslError> {
-    let mat = hkdf_expand(&ss_p, 64)?;
-    let mut k1_c2s = mat;
-    let k1_s2c = k1_c2s.split_off(32);
+    let mut mat = [0u8; 64];
+    hkdf_expand(ss_p, &mut mat)?;
+    let mut k1_c2s = [0u8; 32];
+    let mut k1_s2c = [0u8; 32];
+    k1_c2s.copy_from_slice(&mat[..32]);
+    k1_s2c.copy_from_slice(&mat[32..]);
     Ok(HandshakeKeys { k1_c2s, k1_s2c })
 }
 
 pub(crate) fn derive_shared_secret(
-    ecdh_pk: &kem::PrivateKey,
-    pqc_pk: &PqcPrivateKey,
+    ecdh_sk: &kem::PrivateKey,
+    pqc_sk: &PqcPrivateKey,
     ecdh_ct: &ECDHKey,
     pqc_ct: &[u8],
-) -> Result<Vec<u8>, AslError> {
+) -> Result<[u8; 64], AslError> {
     let ecdh_ct_bytes = validate_ecdh_pk(ecdh_ct)?;
     let ecdh_ct_obj = kem::Ct::decode(kem::Algorithm::Secp256r1, &ecdh_ct_bytes)
         .map_err(|_| AslError::MissingParameters)?;
-    let ss_p_ecdh_obj =
-        kem::decapsulate(&ecdh_ct_obj, ecdh_pk).map_err(|_| AslError::DecryptionFailure)?;
-    let mut ss_p_ecdh = ss_p_ecdh_obj.encode();
-    ss_p_ecdh.truncate(32); // restrict to X coordinate, like in TLS 1.3 (RFC 8446 7.4.2)
+    let ss_p_ecdh_obj = ecdh_ct_obj
+        .decapsulate(ecdh_sk)
+        .map_err(|_| AslError::DecryptionFailure)?;
+    let ss_p_ecdh_enc = ss_p_ecdh_obj.encode();
 
     let pqc_ct_bytes: [u8; 1088] = pqc_ct.try_into().map_err(|_| AslError::MissingParameters)?;
     let pqc_ct_obj = mlkem768::MlKem768Ciphertext::from(pqc_ct_bytes);
-    let ss_p_pqc = mlkem768::decapsulate(pqc_pk, &pqc_ct_obj);
+    let ss_p_pqc = mlkem768::decapsulate(pqc_sk, &pqc_ct_obj);
 
-    let mut ss_p = ss_p_ecdh;
-    ss_p.extend(ss_p_pqc.as_slice());
+    let mut ss_p = [0u8; 64];
+
+    // ..32: restrict to X coordinate, like in TLS 1.3 (RFC 8446 7.4.2)
+    ss_p[..32].copy_from_slice(&ss_p_ecdh_enc[..32]);
+    ss_p[32..].copy_from_slice(ss_p_pqc.as_slice());
 
     Ok(ss_p)
 }
 
 pub(crate) struct SessionKeys {
-    pub k2_c2s_key_confirmation: Vec<u8>,
-    pub k2_c2s_app_data: Vec<u8>,
-    pub k2_s2c_key_confirmation: Vec<u8>,
-    pub k2_s2c_app_data: Vec<u8>,
-    pub key_id: Vec<u8>,
+    pub k2_c2s_key_confirmation: [u8; 32],
+    pub k2_c2s_app_data: [u8; 32],
+    pub k2_s2c_key_confirmation: [u8; 32],
+    pub k2_s2c_app_data: [u8; 32],
+    pub key_id: [u8; 32],
 }
 
-pub(crate) fn derive_session_keys(ss_e: &[u8], ss_s: &[u8]) -> Result<SessionKeys, AslError> {
-    let mut ss = Vec::with_capacity(ss_e.len() + ss_s.len());
-    ss.extend(ss_e);
-    ss.extend(ss_s);
+pub(crate) fn derive_session_keys(
+    ss_e: &[u8; 64],
+    ss_s: &[u8; 64],
+) -> Result<SessionKeys, AslError> {
+    let mut ss = [0u8; 128];
+    ss[..64].copy_from_slice(ss_e);
+    ss[64..].copy_from_slice(ss_s);
+    let mut mat = [0u8; 160];
+    hkdf_expand(&ss, &mut mat)?;
 
-    let mut mat = hkdf_expand(&ss, 160)?;
-
+    // Safety: all slices are exactly 32 bytes from a 160-byte buffer
+    let at = |i: usize| -> [u8; 32] { mat[i * 32..(i + 1) * 32].try_into().unwrap() };
     Ok(SessionKeys {
-        k2_c2s_key_confirmation: mat.drain(..32).collect(),
-        k2_c2s_app_data: mat.drain(..32).collect(),
-        k2_s2c_key_confirmation: mat.drain(..32).collect(),
-        k2_s2c_app_data: mat.drain(..32).collect(),
-        key_id: mat.drain(..32).collect(),
+        k2_c2s_key_confirmation: at(0),
+        k2_c2s_app_data: at(1),
+        k2_s2c_key_confirmation: at(2),
+        k2_s2c_app_data: at(3),
+        key_id: at(4),
     })
 }
 
-pub(crate) fn encrypt_handshake(key: &[u8], plain: &[u8]) -> Result<Vec<u8>, AslError> {
-    let key_obj = aead::Key::from_slice(aead::Algorithm::Aes256Gcm, key)
-        .to_error()
-        .map_err(AslError::DecodingError)?;
-    let iv: aead::Iv = RNG.with_borrow_mut(|rng| aead::Iv::generate(rng));
+/// Overhead for handshake AEAD: IV + tag
+pub(crate) const HANDSHAKE_OVERHEAD: usize = 12 + 16;
+
+/// Encrypt `plain` into `out`, which must be exactly `plain.len() + HANDSHAKE_OVERHEAD` bytes.
+/// Layout: iv (12) || ciphertext (N) || tag (16).
+pub(crate) fn encrypt_handshake(
+    key_bytes: &[u8],
+    plain: &[u8],
+    out: &mut [u8],
+) -> Result<(), AslError> {
+    assert_eq!(out.len(), HANDSHAKE_OVERHEAD + plain.len());
+
+    let algo = Aead::AesGcm256;
+    let key = algo
+        .new_key(key_bytes)
+        .map_err(|_| anyhow!("invalid key length"))?;
+
+    RNG.with_borrow_mut(|rng| rng.fill_bytes(&mut out[..12]));
+
+    let (iv_slice, rest) = out.split_at_mut(12);
+    let (ct_buf, _tag_buf) = rest.split_at_mut(plain.len());
+
+    let nonce = algo
+        .new_nonce(iv_slice)
+        .map_err(|_| anyhow!("invalid nonce"))?;
+    let mut tag_bytes = [0u8; 16];
+    let tag = algo
+        .new_tag_mut(&mut tag_bytes)
+        .map_err(|_| anyhow!("invalid tag"))?;
+
     let aad: [u8; 0] = []; // unused
+    key.encrypt(ct_buf, tag, nonce, &aad, plain)
+        .map_err(|e| anyhow!("aead encrypt: {e}"))?;
 
-    let mut res: Vec<u8> = Vec::with_capacity(12 + plain.len() + 16);
-    res.extend(&iv.0);
-
-    let (tag, ct) = aead::encrypt_detached(&key_obj, plain, iv, aad).to_error()?;
-    res.extend(&ct);
-    res.extend(tag.as_ref());
-
-    Ok(res)
+    out[12 + plain.len()..].copy_from_slice(&tag_bytes);
+    Ok(())
 }
 
-pub(crate) fn decrypt_handshake(key: &[u8], crypt: &[u8]) -> Result<Vec<u8>, AslError> {
-    let key_obj = aead::Key::from_slice(aead::Algorithm::Aes256Gcm, key).to_error()?;
-    if crypt.len() < 12 + 16 {
+/// Decrypt `crypt` into `out`, which must be exactly `crypt.len() - HANDSHAKE_OVERHEAD` bytes.
+pub(crate) fn decrypt_handshake(
+    key_bytes: &[u8],
+    crypt: &[u8],
+    out: &mut [u8],
+) -> Result<(), AslError> {
+    if crypt.len() < HANDSHAKE_OVERHEAD {
         return Err(AslError::DecryptionFailure);
-    };
-    let iv_bytes: &[u8; 12] = &crypt[..12].try_into().to_error()?;
-    let tag_bytes: &[u8] = &crypt[crypt.len() - 16..];
-    let msg: &[u8] = &crypt[12..crypt.len() - 16];
+    }
+    let plain_len = crypt.len() - HANDSHAKE_OVERHEAD;
+    assert_eq!(out.len(), plain_len);
+
+    let algo = Aead::AesGcm256;
+    let key = algo
+        .new_key(key_bytes)
+        .map_err(|_| anyhow!("invalid key length"))?;
+
+    let iv = &crypt[..12];
+    let tag_slice = &crypt[crypt.len() - 16..];
+    let ct = &crypt[12..crypt.len() - 16];
+
+    let nonce = algo
+        .new_nonce(iv)
+        .map_err(|_| AslError::DecryptionFailure)?;
+    let tag = algo
+        .new_tag(tag_slice)
+        .map_err(|_| AslError::DecryptionFailure)?;
     let aad: [u8; 0] = []; // unused
+    key.decrypt(out, nonce, &aad, ct, tag)
+        .map_err(|_| AslError::DecryptionFailure)?;
 
-    let iv = aead::Iv(*iv_bytes);
-    let tag = aead::Tag::from_slice(&tag_bytes).to_error()?;
-    let plain = aead::decrypt_detached(&key_obj, &msg, iv, &aad, &tag);
-    let res = plain.map_err(|_| AslError::DecryptionFailure)?;
-
-    Ok(res)
+    Ok(())
 }
 
+/// Session header size: 1 (version) + 1 (env) + 1 (mode) + 8 (req_ctr) + 32 (key_id) = 43
+const SESSION_HEADER_SIZE: usize = 43;
+/// Overhead per encrypted session message: header + IV + tag
+pub const SESSION_OVERHEAD: usize = SESSION_HEADER_SIZE + 12 + 16;
+
+/// Encrypt `plain` into `out`, which must be exactly `plain.len() + SESSION_OVERHEAD` bytes.
+/// Layout: header (43) || iv (12) || ciphertext (N) || tag (16).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encrypt_session(
-    key: &aead::Key,
-    key_id: &[u8],
+    key_bytes: &[u8; 32],
+    key_id: &[u8; 32],
     env: Environment,
     mode: MessageMode,
     req_ctr: u64,
     enc_ctr: u64,
     plain: &[u8],
-) -> Result<Vec<u8>, AslError> {
-    let req_ctr_bytes = req_ctr.to_be_bytes();
-    let enc_ctr_bytes = enc_ctr.to_be_bytes();
+    out: &mut [u8],
+) -> Result<(), AslError> {
+    assert_eq!(out.len(), SESSION_OVERHEAD + plain.len());
 
-    let mut header = Vec::with_capacity(43);
-    header.push(ASL_VERSION);
-    header.push(env.as_byte());
-    header.push(mode.as_byte());
-    header.extend(req_ctr_bytes);
-    header.extend(key_id);
+    let algo = Aead::AesGcm256;
+    let key = algo
+        .new_key(key_bytes)
+        .map_err(|_| anyhow!("invalid key length"))?;
 
-    let iv_random = RNG.with_borrow_mut(|rng| rng.generate_vec(4)).to_error()?;
-    let mut iv_bytes: Vec<u8> = Vec::with_capacity(12);
-    iv_bytes.extend(iv_random);
-    iv_bytes.extend(enc_ctr_bytes);
-    let iv: aead::Iv = aead::Iv::new(&iv_bytes).to_error()?;
+    // Write header in-place
+    out[0] = ASL_VERSION;
+    out[1] = env.as_byte();
+    out[2] = mode.as_byte();
+    out[3..11].copy_from_slice(&req_ctr.to_be_bytes());
+    out[11..43].copy_from_slice(key_id);
 
-    let mut res: Vec<u8> = Vec::with_capacity(12 + plain.len() + 16);
-    res.extend(&header);
-    res.extend(&iv.0);
-    let (tag, ct) = aead::encrypt_detached(&key, plain, iv, &header).to_error()?;
+    // Build IV: 4 random bytes || enc_ctr
+    RNG.with_borrow_mut(|rng| {
+        rng.fill_bytes(&mut out[SESSION_HEADER_SIZE..SESSION_HEADER_SIZE + 4])
+    });
+    out[SESSION_HEADER_SIZE + 4..SESSION_HEADER_SIZE + 12].copy_from_slice(&enc_ctr.to_be_bytes());
 
-    res.extend(&ct);
-    res.extend(tag.as_ref());
+    // Encrypt: ciphertext at [55..55+N], tag at [55+N..71+N]
+    let ct_start = SESSION_HEADER_SIZE + 12;
+    let (pre, rest) = out.split_at_mut(ct_start);
+    let (ct_buf, tag_buf) = rest.split_at_mut(plain.len());
 
-    Ok(res)
+    let nonce = algo
+        .new_nonce(&pre[SESSION_HEADER_SIZE..])
+        .map_err(|_| anyhow!("invalid nonce"))?;
+    let mut tag_bytes = [0u8; 16];
+    let tag = algo
+        .new_tag_mut(&mut tag_bytes)
+        .map_err(|_| anyhow!("invalid tag"))?;
+
+    key.encrypt(ct_buf, tag, nonce, &pre[..SESSION_HEADER_SIZE], plain)
+        .map_err(|e| anyhow!("aead encrypt: {e}"))?;
+
+    tag_buf.copy_from_slice(&tag_bytes);
+    Ok(())
 }
 
+/// Decrypt `cipher` into `out`, which must be exactly `cipher.len() - SESSION_OVERHEAD` bytes.
+/// Returns the request counter from the header.
 pub(crate) fn decrypt_session(
-    key: &aead::Key,
-    expect_key_id: &[u8],
+    key_bytes: &[u8; 32],
+    expect_key_id: &[u8; 32],
     expect_env: Environment,
     expect_mode: MessageMode,
     cipher: &[u8],
-) -> Result<(u64, Vec<u8>), AslError> {
-    if cipher.len() < 72 {
+    out: &mut [u8],
+) -> Result<u64, AslError> {
+    if cipher.len() < SESSION_OVERHEAD + 1 {
         return Err(AslError::BadFormat);
     }
-    let header = &cipher[..43];
-    let crypt = &cipher[43..];
+    let plain_len = cipher.len() - SESSION_OVERHEAD;
+    assert_eq!(out.len(), plain_len);
 
-    let version = header[0];
-    if version != ASL_VERSION {
+    let algo = Aead::AesGcm256;
+    let key = algo
+        .new_key(key_bytes)
+        .map_err(|_| anyhow!("invalid key length"))?;
+
+    let header = &cipher[..SESSION_HEADER_SIZE];
+    let crypt = &cipher[SESSION_HEADER_SIZE..];
+
+    if header[0] != ASL_VERSION {
         return Err(AslError::BadFormat);
     }
-
-    let is_pu = header[1];
-    if is_pu != expect_env.as_byte() {
+    if header[1] != expect_env.as_byte() {
         return Err(AslError::WrongEnvironment);
     }
-
-    let is_req = header[2];
-    if is_req != expect_mode.as_byte() {
+    if header[2] != expect_mode.as_byte() {
         return Err(AslError::NotRequest);
     }
 
-    let req_ctr_bytes: [u8; 8] = header[3..11].try_into().map_err(|_| AslError::BadFormat)?;
-    let req_ctr = u64::from_be_bytes(req_ctr_bytes);
+    let req_ctr = u64::from_be_bytes(header[3..11].try_into().map_err(|_| AslError::BadFormat)?);
 
-    let key_id = &header[11..];
-    if key_id != expect_key_id {
+    if &header[11..] != expect_key_id {
         return Err(AslError::UnknownKeyID);
     }
 
-    if crypt.len() < 12 + 16 {
-        return Err(AslError::DecryptionFailure);
-    };
-    let iv_bytes: &[u8; 12] = &crypt[..12]
-        .try_into()
-        .context("unable to get iv_bytes slice")?;
-    let tag_bytes: &[u8] = &crypt[crypt.len() - 16..];
-    let msg: &[u8] = &crypt[12..crypt.len() - 16];
+    let iv = &crypt[..12];
+    let tag_slice = &crypt[crypt.len() - 16..];
+    let ct = &crypt[12..crypt.len() - 16];
 
-    let iv = aead::Iv(*iv_bytes);
-    let tag = aead::Tag::from_slice(&tag_bytes).map_err(|_| anyhow!("unable to get aead tag"))?;
-    let plain = aead::decrypt_detached(&key, &msg, iv, &header, &tag);
-    let res = plain.map_err(|_| AslError::DecryptionFailure)?;
+    let nonce = algo
+        .new_nonce(iv)
+        .map_err(|_| AslError::DecryptionFailure)?;
+    let tag = algo
+        .new_tag(tag_slice)
+        .map_err(|_| AslError::DecryptionFailure)?;
 
-    Ok((req_ctr, res))
+    key.decrypt(out, nonce, header, ct, tag)
+        .map_err(|_| AslError::DecryptionFailure)?;
+
+    Ok(req_ctr)
 }

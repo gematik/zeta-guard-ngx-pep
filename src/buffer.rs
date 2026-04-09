@@ -25,10 +25,9 @@
 use std::borrow::Cow;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
-use nginx_sys::ngx_buf_t;
 use anyhow::Result;
+use nginx_sys::ngx_buf_t;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
 
 #[derive(Debug)]
 pub struct Buffer(pub ngx_buf_t);

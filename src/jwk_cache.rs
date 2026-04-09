@@ -34,23 +34,33 @@ pub trait JwkCacheOps {
     async fn get_jwk_popp(&self, kid: String) -> anyhow::Result<Jwk>;
 }
 
-#[cfg(not(test))]
+#[cfg_attr(test, allow(unused))]
 mod prod {
-    use anyhow::Context;
-    use jsonwebtoken::jwk::JwkSet;
+    use std::collections::HashMap;
 
-    use crate::spawn_compat;
+    use anyhow::{Context, anyhow, bail};
+    use base64ct::Base64;
+    use jsonwebtoken::{
+        Algorithm, DecodingKey, TokenData, Validation, get_current_timestamp, jwk::JwkSet,
+    };
+    use tokio::{sync::RwLock, time::Instant};
+
+    use crate::{format_iso8601, spawn_compat};
 
     use {
         super::JwkCacheOps,
         crate::{CLIENT, conf::MainConfig, log_debug},
         jsonwebtoken::jwk::Jwk,
         ngx::async_::sleep,
-        scc::HashMap,
         serde::Deserialize,
         std::sync::OnceLock,
         std::time::Duration,
     };
+
+    use base64ct::Encoding;
+    fn is_base64url_char(byte: u8) -> bool {
+        matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_')
+    }
 
     #[derive(Deserialize)]
     pub struct OidcConfig {
@@ -58,13 +68,53 @@ mod prod {
         pub issuer: String,
     }
 
+    #[derive(Debug, Deserialize)]
+    struct EntityStatement {
+        metadata: Metadata,
+        jwks: JwkSet,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Metadata {
+        oauth_resource: OauthResource,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct OauthResource {
+        signed_jwks_uri: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SignedJwkSet {
+        #[serde(flatten)]
+        jwks: JwkSet,
+    }
+
     pub static JWK_CACHE: OnceLock<JwkCache> = OnceLock::new();
+
+    #[derive(Debug, Default)]
+    struct JwkStore {
+        keys: HashMap<String, Jwk>, // put into map for faster access
+        #[allow(unused)]
+        seen: u64, // when was the JwkSet last seen (epoch s)
+    }
+
+    trait JwksOps {
+        async fn get_key(&self, kid: &str) -> Option<Jwk>;
+    }
+
+    impl JwksOps for RwLock<Option<JwkStore>> {
+        async fn get_key(&self, kid: &str) -> Option<Jwk> {
+            let jwks = self.read().await;
+            jwks.as_ref().and_then(|jwks| jwks.keys.get(kid).cloned())
+        }
+    }
 
     pub struct JwkCache {
         pdp_issuer: String,
-        pdp_jwks: HashMap<String, Jwk>,
+        pdp_jwks: RwLock<Option<JwkStore>>,
         popp_issuer: Option<String>,
-        popp_jwks: HashMap<String, Jwk>,
+        popp_jwks: RwLock<Option<JwkStore>>,
         refresh_interval: Duration,
     }
 
@@ -72,9 +122,9 @@ mod prod {
         pub fn init(conf: &MainConfig) {
             let cache = JWK_CACHE.get_or_init(|| JwkCache {
                 pdp_issuer: conf.pdp_issuer.as_ref().expect("issuer").clone(),
-                pdp_jwks: HashMap::new(),
+                pdp_jwks: Default::default(),
                 popp_issuer: conf.popp_issuer.clone(),
-                popp_jwks: HashMap::new(),
+                popp_jwks: Default::default(),
                 refresh_interval: conf.jwks_refresh_interval,
             });
             spawn_compat(cache.cache_worker()).detach();
@@ -82,26 +132,30 @@ mod prod {
 
         async fn cache_worker(&'static self) {
             loop {
-                log_debug!("pep: jwk cache refresh…");
+                let start = Instant::now();
                 match self.fetch_pdp().await {
                     Ok(_) => {}
                     Err(e) => {
-                        log_debug!("during jwk cache refresh (pdp): {e}");
+                        log_debug!("jwk_cache[pdp]: during refresh: {e}");
                     }
                 };
                 match self.fetch_popp().await {
                     Ok(_) => {}
                     Err(e) => {
-                        log_debug!("during jwk cache refresh (popp): {e}");
+                        log_debug!("jwk_cache[popp]: during refresh: {e}");
                     }
                 };
-                sleep(self.refresh_interval).await;
+                let elapsed = Instant::now().duration_since(start);
+                if elapsed < self.refresh_interval {
+                    sleep(self.refresh_interval - elapsed).await;
+                }
             }
         }
     }
 
     impl JwkCacheOps for JwkCache {
         async fn fetch_pdp(&self) -> anyhow::Result<()> {
+            tokio::time::sleep(Duration::from_millis(700)).await;
             let well_known = format!(
                 "{}/.well-known/openid-configuration",
                 self.pdp_issuer.trim_end_matches('/')
@@ -111,59 +165,155 @@ mod prod {
 
             let cfg: OidcConfig = client.get(well_known).send().await?.json().await?;
             if cfg.issuer != self.pdp_issuer {
-                anyhow::bail!("issuer mismatch (pdp)");
+                bail!("pdp: issuer mismatch");
             }
 
-            let jwks: JwkSet = client.get(cfg.jwks_uri).send().await?.json().await?;
-            for jwk in jwks.keys {
+            let jwk_set: JwkSet = client.get(cfg.jwks_uri).send().await?.json().await?;
+            let now = get_current_timestamp();
+            let mut jwks = JwkStore {
+                seen: now,
+                ..Default::default()
+            };
+            for jwk in jwk_set.keys {
                 let kid = jwk.common.key_id.as_ref().expect("kid").clone();
-                log_debug!("pep: cache add kid {kid} (pdp)");
-                self.pdp_jwks.upsert_async(kid, jwk).await;
+                let existing = jwks.keys.insert(kid.clone(), jwk);
+                if existing.is_some() {
+                    bail!("pdp: duplicate kid: {kid}");
+                }
             }
+            let kids: Vec<_> = jwks.keys.keys().collect();
+            let now_ts = format_iso8601(Duration::from_secs(now));
+            log_debug!("jwk_cache[pdp]: refresh @ {now_ts}, kids={kids:?}");
+            self.pdp_jwks.write().await.replace(jwks);
 
             Ok(())
         }
 
         async fn get_jwk_pdp(&self, kid: String) -> anyhow::Result<Jwk> {
-            let mut jwk = self.pdp_jwks.get_async(&kid).await.map(|x| x.clone());
+            let mut jwk = self.pdp_jwks.get_key(&kid).await;
             if jwk.is_none() {
-                log_debug!("pep: {kid} not found (pdp), refresh and retry…");
+                log_debug!(
+                    "jwk_cache[pdp]: {kid} not found (have {:?}), refresh and retry…",
+                    self.pdp_jwks.read().await
+                );
                 self.fetch_pdp().await?;
-                jwk = self.pdp_jwks.get_async(&kid).await.map(|x| x.clone());
+                jwk = self.pdp_jwks.get_key(&kid).await;
             }
-            jwk.ok_or_else(|| anyhow::anyhow!("pep: {kid} not found (pdp)"))
+            jwk.ok_or_else(|| anyhow!("pdp: {kid} not found"))
         }
 
         async fn fetch_popp(&self) -> anyhow::Result<()> {
-            let issuer = self
-                .popp_issuer
-                .clone()
-                .context("no pep_popp_issuer configured")?;
+            // config for now; once federation master provides services list, use it to discover PoPP
+            let issuer = self.popp_issuer.clone();
+            match issuer {
+                Some(issuer) => {
+                    let now = get_current_timestamp();
+                    let client = CLIENT.get().expect("client");
+                    let issuer = issuer.trim_end_matches('/');
 
-            // TODO: fetch openid-configuration to determine jwks_uri (as soon as PoPP test server available)
-            let well_known = format!("{}/jwks.json", issuer.trim_end_matches('/'));
+                    let mut validation = Validation::new(Algorithm::ES256);
+                    validation.validate_aud = false; // disabled until we know how this behaves in production
+                    validation.validate_nbf = true; // validate if present
+                    validation.set_required_spec_claims(&["exp"]);
 
-            let client = CLIENT.get().expect("client");
+                    // fetch PoPP entity statement, for now we validate self-signing and trust HTTPS
+                    // otherwise; should fetch this via federation master and verify against its
+                    // provisioned key
+                    let entity_url = format!("{}/.well-known/openid-federation", issuer);
+                    let entity_bytes = client.get(entity_url).send().await?.bytes().await?;
+                    if !is_base64url_char(entity_bytes[0]) {
+                        bail!(
+                            "Bad PoPP entity statement: {}",
+                            Base64::encode_string(&entity_bytes)
+                        );
+                    }
+                    let entity_statement_insecure: TokenData<EntityStatement> =
+                        jsonwebtoken::dangerous::insecure_decode(&entity_bytes)
+                            .context("fetch PoPP entity statement")?;
+                    let entity_kid = entity_statement_insecure
+                        .header
+                        .kid
+                        .ok_or_else(|| anyhow!("missing kid header in entity statement"))?;
+                    let entity_key = entity_statement_insecure
+                        .claims
+                        .jwks
+                        .find(&entity_kid)
+                        .and_then(|key| DecodingKey::from_jwk(key).ok())
+                        .ok_or_else(|| anyhow!("missing or invalid key '{}'", entity_kid))?;
+                    let entity_statement: EntityStatement =
+                        jsonwebtoken::decode(entity_bytes, &entity_key, &validation)
+                            .context("fetch PoPP signed key set")?
+                            .claims;
 
-            let jwks: JwkSet = client.get(well_known).send().await?.json().await?;
+                    // fetch PoPP signed JWKS; consider relative URLs based on issuer URL
+                    let mut jwks_url = entity_statement.metadata.oauth_resource.signed_jwks_uri;
+                    if !jwks_url.to_ascii_lowercase().starts_with("http") {
+                        if jwks_url.starts_with('/') {
+                            jwks_url = format!("{issuer}{jwks_url}");
+                        } else {
+                            jwks_url = format!("{issuer}/{jwks_url}");
+                        }
+                    }
+                    let jwks_bytes = client.get(jwks_url).send().await?.bytes().await?;
+                    if !is_base64url_char(jwks_bytes[0]) {
+                        bail!(
+                            "Bad PoPP signed JWKS: {}",
+                            Base64::encode_string(&jwks_bytes)
+                        );
+                    }
+                    let jwks_header = jsonwebtoken::decode_header(&jwks_bytes)?;
+                    let jwks_kid = jwks_header
+                        .kid
+                        .ok_or_else(|| anyhow!("missing kid header in signed JWKS"))?;
+                    let jwks_key = entity_statement
+                        .jwks
+                        .find(&jwks_kid)
+                        .and_then(|key| DecodingKey::from_jwk(key).ok())
+                        .ok_or_else(|| anyhow!("missing or invalid key '{}'", jwks_kid))?;
+                    let signed_jwks: SignedJwkSet =
+                        jsonwebtoken::decode(jwks_bytes, &jwks_key, &validation)
+                            .context("fetch PoPP signed key set")?
+                            .claims;
 
-            for jwk in jwks.keys {
-                let kid = jwk.common.key_id.as_ref().expect("kid").clone();
-                log_debug!("pep: cache add kid {kid} (popp)");
-                self.popp_jwks.upsert_async(kid, jwk).await;
-            }
+                    let mut jwks = JwkStore {
+                        seen: now,
+                        ..Default::default()
+                    };
+                    for jwk in signed_jwks.jwks.keys {
+                        let kid = jwk.common.key_id.as_ref().expect("kid").clone();
+                        let existing = jwks.keys.insert(kid.clone(), jwk);
+                        if existing.is_some() {
+                            bail!("popp: duplicate kid: {kid}");
+                        }
+                    }
+                    let kids: Vec<_> = jwks.keys.keys().collect();
 
+                    let now_ts = format_iso8601(Duration::from_secs(now));
+                    log_debug!("jwk_cache[popp]: refresh @ {now_ts}, kids={kids:?}");
+                    self.popp_jwks.write().await.replace(jwks);
+                }
+                None => {
+                    log_debug!("jwk_cache[popp]: no pep_popp_issuer configured, skipping refresh");
+                }
+            };
             Ok(())
         }
 
         async fn get_jwk_popp(&self, kid: String) -> anyhow::Result<Jwk> {
-            let mut jwk = self.popp_jwks.get_async(&kid).await.map(|x| x.clone());
-            if jwk.is_none() {
-                log_debug!("pep: {kid} not found (popp), refresh and retry…");
-                self.fetch_popp().await?;
-                jwk = self.popp_jwks.get_async(&kid).await.map(|x| x.clone());
+            if self.popp_issuer.is_none() {
+                bail!("popp: no pep_popp_issuer configured");
             }
-            jwk.ok_or_else(|| anyhow::anyhow!("pep: {kid} not found (popp)"))
+
+            let mut jwk = self.popp_jwks.get_key(&kid).await;
+            if jwk.is_none() {
+                log_debug!(
+                    "jwk_cache[popp]: {kid} not found (have {:?}), refresh and retry…",
+                    self.popp_jwks.read().await
+                );
+                self.fetch_popp().await?;
+                jwk = self.popp_jwks.get_key(&kid).await;
+            }
+            jwk.ok_or_else(|| anyhow!("popp: {kid} not found"))
         }
     }
 
@@ -173,6 +323,9 @@ mod prod {
 }
 #[cfg(not(test))]
 pub use prod::*;
+
+#[cfg(test)]
+pub use mock::*;
 
 #[cfg(test)]
 mod mock {
@@ -207,7 +360,7 @@ mod mock {
 
     pub async fn with_jwk_cache_mock<T>(f: impl FnOnce(&mut MockJwkCacheOps) -> T) -> T {
         let mut g = JWK_CACHE_MOCK.write().await;
-        f(&mut *g)
+        f(&mut g)
     }
 
     pub async fn reset_jwk_cache_mock() {
@@ -218,5 +371,3 @@ mod mock {
         &*JWK_CACHE_MOCK
     }
 }
-#[cfg(test)]
-pub use mock::*;

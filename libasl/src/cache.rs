@@ -27,7 +27,7 @@ use super::util::utc_now;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-pub const CID_PREFIX: &'static str = "/ASL/";
+pub const CID_PREFIX: &str = "/ASL/";
 
 pub trait SessionCache {
     fn init_handshake(&self, state: HandshakeState) -> String; // CID
@@ -48,6 +48,12 @@ pub enum ConnectionState {
 #[derive(Debug)]
 pub struct MemorySessionCache {
     state: Mutex<HashMap<String, ConnectionState>>,
+}
+
+impl Default for MemorySessionCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemorySessionCache {
@@ -93,7 +99,7 @@ impl SessionCache for MemorySessionCache {
         if let ConnectionState::Established(state) = state {
             if state.expires > utc_now() {
                 state.enc_ctr += 1;
-                return Some(state.clone());
+                return Some(*state);
             } else {
                 sessions.remove(cid);
             }
@@ -112,7 +118,13 @@ mod tests {
         let cache = MemorySessionCache::new();
 
         let state1 = HandshakeState {
-            ss_e: vec![1, 2, 3],
+            ss_e: {
+                let mut arr = [0u8; 64];
+                arr[0] = 1;
+                arr[1] = 2;
+                arr[2] = 3;
+                arr
+            },
             transcript: vec![4, 5, 6],
         };
 
@@ -123,7 +135,7 @@ mod tests {
         assert!(maybe_state.is_some());
 
         let state2 = maybe_state.unwrap();
-        assert_eq!(state2.ss_e, vec!(1, 2, 3));
+        assert_eq!(state2.ss_e[..3], [1, 2, 3]);
         assert_eq!(state2.transcript, vec!(4, 5, 6));
 
         let again = cache.finish_handshake(&cid);
@@ -135,9 +147,27 @@ mod tests {
         let cache = MemorySessionCache::new();
 
         let state1 = SessionState {
-            key_id: vec![1, 2, 3],
-            k2_c2s_app_data: vec![4, 5, 6],
-            k2_s2c_app_data: vec![7, 8, 9],
+            key_id: {
+                let mut arr = [0u8; 32];
+                arr[0] = 1;
+                arr[1] = 2;
+                arr[2] = 3;
+                arr
+            },
+            k2_c2s_app_data: {
+                let mut arr = [0u8; 32];
+                arr[0] = 4;
+                arr[1] = 5;
+                arr[2] = 6;
+                arr
+            },
+            k2_s2c_app_data: {
+                let mut arr = [0u8; 32];
+                arr[0] = 7;
+                arr[1] = 8;
+                arr[2] = 9;
+                arr
+            },
             expires: utc_now() + 10,
             enc_ctr: 0,
         };
@@ -150,9 +180,9 @@ mod tests {
         assert!(maybe_state.is_some());
 
         let state2 = maybe_state.unwrap();
-        assert_eq!(state2.key_id, vec!(1, 2, 3));
-        assert_eq!(state2.k2_c2s_app_data, vec!(4, 5, 6));
-        assert_eq!(state2.k2_s2c_app_data, vec!(7, 8, 9));
+        assert_eq!(state2.key_id[..3], [1, 2, 3]);
+        assert_eq!(state2.k2_c2s_app_data[..3], [4, 5, 6]);
+        assert_eq!(state2.k2_s2c_app_data[..3], [7, 8, 9]);
         assert_eq!(state2.enc_ctr, 1); // increased
 
         let again = cache.continue_session(&cid);
@@ -165,9 +195,9 @@ mod tests {
         let cache = MemorySessionCache::new();
 
         let state1 = SessionState {
-            key_id: vec![],
-            k2_c2s_app_data: vec![],
-            k2_s2c_app_data: vec![],
+            key_id: [0u8; 32],
+            k2_c2s_app_data: [0u8; 32],
+            k2_s2c_app_data: [0u8; 32],
             expires: 0, // epoch should be < now
             enc_ctr: 0,
         };

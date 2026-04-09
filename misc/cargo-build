@@ -18,6 +18,26 @@ export RUST_BACKTRACE=1
 printf "!! configure nginx\n\n"
 cargo xtask configure
 
+printf "!! generate openssl.cnf for ossl_hsm\n\n"
+export OPENSSL_CONF="$PWD/ossl_hsm/openssl.cnf"
+cat >"$OPENSSL_CONF" <<-EOF
+	openssl_conf = openssl_init
+
+	[openssl_init]
+	providers = provider_sect
+
+	[provider_sect]
+	ossl_hsm = ossl_hsm_sect
+	default = default_sect
+
+	[ossl_hsm_sect]
+	module = $PWD/target/debug/libossl_hsm.so
+	activate = 1
+
+	[default_sect]
+	activate = 1
+EOF
+
 printf "!! tests\n\n"
 tests() {
 	set +e
@@ -29,12 +49,13 @@ tests() {
 		cargo nextest run --workspace ${NEXTEST_FILTERSET:+--filterset "$NEXTEST_FILTERSET"}
 		local result=$?
 
-		if [[ -n "$(printf "%s" prefix/test-*/logs/*)" ]]; then
-			grep . prefix/test-*/logs/* || :
+		if [[ -f prefix/test.log ]]; then
+			cat prefix/test.log || :
 		fi
 
-		cargo llvm-cov report
-		cargo llvm-cov report --lcov --output-path coverage.lcov || :
+		# n.b.: --no-run is deprecated, but report doesn't support --workspace…
+		cargo llvm-cov --no-run --workspace
+		cargo llvm-cov --no-run --workspace --lcov --output-path coverage.lcov || :
 		cargo llvm-cov clean --workspace || :
 		exit $result
 	)
@@ -48,14 +69,20 @@ tests
 test_result=$?
 set +e
 
-printf "!! cargo build\n\n"
+printf "!! build nginx module\n\n"
 cargo build "${common_args[@]}" --release --lib
 
+printf "!! build hsm_sim\n\n"
+cargo build "${common_args[@]}" --release -p hsm_sim
+
+printf "!! build ossl_hsm\n\n"
+cargo build "${common_args[@]}" --release -p ossl_hsm
+
 printf "!! clippy\n\n"
-cargo clippy "${common_args[@]}" --release --lib
+cargo clippy "${common_args[@]}" --release --workspace
 
 printf "!! clippy json\n\n"
-cargo clippy "${common_args[@]}" --release --lib --message-format json >clippy.json
+cargo clippy "${common_args[@]}" --release --workspace --message-format json >clippy.json
 
 printf "!! write .pkg-version\n\n"
 cargo metadata --format-version 1 | jq -r '.packages | map(select(.name == "ngx_pep")) | .[0].version' \

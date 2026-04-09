@@ -25,6 +25,7 @@
 use std::cell::RefCell;
 use std::ptr::addr_of;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use async_compat::Compat;
 use nginx_sys::{
@@ -46,8 +47,6 @@ use reqwest::Client;
 use crate::conf::NGX_HTTP_PEP_COMMANDS;
 use crate::error::ZetaResult;
 use crate::request_body::RequestBody;
-#[cfg(not(test))]
-use {crate::jwk_cache::JwkCache, nginx_sys::ngx_cycle_t};
 
 mod asl;
 mod asl_keys;
@@ -56,6 +55,7 @@ mod conf;
 mod error;
 mod headers;
 mod jwk_cache;
+mod ocsp_cache;
 mod pep;
 mod request_body;
 mod request_ops;
@@ -247,15 +247,10 @@ http_request_handler!(asl_handler, asl::handler);
 
 pub static CLIENT: OnceLock<Client> = OnceLock::new();
 
-#[cfg(not(test))]
-use std::time::{SystemTime, UNIX_EPOCH};
-
-#[cfg(not(test))]
 #[inline]
-fn format_iso8601(t: SystemTime) -> String {
-    let dur = t.duration_since(UNIX_EPOCH).unwrap();
-    let t: libc::time_t = dur.as_secs().try_into().unwrap();
-    let millis = dur.subsec_millis();
+fn format_iso8601(since_epoch: Duration) -> String {
+    let t: libc::time_t = since_epoch.as_secs().try_into().unwrap();
+    let millis = since_epoch.subsec_millis();
     let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
     let tm = unsafe {
         libc::gmtime_r(&t, tm.as_mut_ptr());
@@ -274,66 +269,86 @@ fn format_iso8601(t: SystemTime) -> String {
     )
 }
 
-#[cfg(not(test))]
-extern "C" fn ngx_http_pep_init_worker(cycle: *mut ngx_cycle_t) -> ngx_int_t {
-    use reqwest::ClientBuilder;
-    use reqwest::redirect::Policy;
+#[cfg_attr(test, allow(unused))]
+mod prod {
 
-    let ts = format_iso8601(SystemTime::now());
-    log_debug!("init worker @ {ts}",);
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    let cycle = unsafe { &mut *cycle };
+    use nginx_sys::ngx_cycle_t;
+    use ngx::core::Status;
+    use ngx::ffi::ngx_int_t;
+    use ngx::http::HttpModuleMainConf;
 
-    let process = unsafe { nginx_sys::ngx_process } as u32;
-    if !matches!(
-        process,
-        nginx_sys::NGX_PROCESS_SINGLE | nginx_sys::NGX_PROCESS_WORKER
-    ) {
-        return Status::NGX_OK.into();
+    use crate::{CLIENT, Module, format_iso8601};
+
+    pub extern "C" fn ngx_http_pep_init_worker(cycle: *mut ngx_cycle_t) -> ngx_int_t {
+        use reqwest::ClientBuilder;
+        use reqwest::redirect::Policy;
+
+        let ts = format_iso8601(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
+        log_debug!("init worker @ {ts}",);
+
+        let cycle = unsafe { &mut *cycle };
+
+        let process = unsafe { nginx_sys::ngx_process } as u32;
+        if !matches!(
+            process,
+            nginx_sys::NGX_PROCESS_SINGLE | nginx_sys::NGX_PROCESS_WORKER
+        ) {
+            return Status::NGX_OK.into();
+        }
+
+        let conf = Module::main_conf(cycle).expect("main conf");
+
+        log_debug!("conf={conf:#?}");
+        log_debug!("initializing http client…");
+        CLIENT.get_or_init(|| {
+            ClientBuilder::new()
+                .redirect(Policy::none())
+                .http2_adaptive_window(true)
+                .pool_idle_timeout(conf.http_client_idle_timeout)
+                .pool_max_idle_per_host(conf.http_client_max_idle_per_host)
+                .tcp_keepalive(conf.http_client_tcp_keepalive)
+                .connect_timeout(conf.http_client_connect_timeout)
+                .timeout(conf.http_client_timeout)
+                .use_rustls_tls()
+                .danger_accept_invalid_certs(conf.http_client_accept_invalid_certs)
+                .build()
+                .expect("reqwest client")
+        });
+
+        #[cfg(not(test))]
+        {
+            use crate::jwk_cache::JwkCache;
+            log_debug!("initializing jwk cache…");
+            JwkCache::init(conf);
+        }
+
+        #[cfg(feature = "its")]
+        {
+            // work up from the pid file path to get to control path dir: ./prefix/test-{port}/control
+
+            use crate::its;
+            let ccf: &nginx_sys::ngx_core_conf_t = unsafe {
+                &*cycle
+                    .conf_ctx
+                    .add(nginx_sys::ngx_core_module.index)
+                    .read()
+                    .cast()
+            };
+            let pid = unsafe { ngx::core::NgxStr::from_ngx_str(ccf.pid).to_str().unwrap() };
+            let control_path = std::path::Path::new(pid)
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("control");
+
+            its::start(&control_path);
+        }
+
+        Status::NGX_OK.into()
     }
-
-    let conf = Module::main_conf(cycle).expect("main conf");
-
-    log_debug!("conf={conf:#?}");
-    log_debug!("initializing http client…");
-    CLIENT.get_or_init(|| {
-        ClientBuilder::new()
-            .redirect(Policy::none())
-            .http2_adaptive_window(true)
-            .pool_idle_timeout(conf.http_client_idle_timeout)
-            .pool_max_idle_per_host(conf.http_client_max_idle_per_host)
-            .tcp_keepalive(conf.http_client_tcp_keepalive)
-            .connect_timeout(conf.http_client_connect_timeout)
-            .timeout(conf.http_client_timeout)
-            .use_rustls_tls()
-            .danger_accept_invalid_certs(conf.http_client_accept_invalid_certs)
-            .build()
-            .expect("reqwest client")
-    });
-
-    log_debug!("initializing jwk cache…");
-    JwkCache::init(conf);
-
-    #[cfg(feature = "its")]
-    {
-        // work up from the pid file path to get to control path dir: ./prefix/test-{port}/control
-        let ccf: &nginx_sys::ngx_core_conf_t = unsafe {
-            &*cycle
-                .conf_ctx
-                .add(nginx_sys::ngx_core_module.index)
-                .read()
-                .cast()
-        };
-        let pid = unsafe { ngx::core::NgxStr::from_ngx_str(ccf.pid).to_str().unwrap() };
-        let control_path = std::path::Path::new(pid)
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("control");
-
-        its::start(&control_path);
-    }
-
-    Status::NGX_OK.into()
 }
+#[cfg(not(test))]
+use prod::*;

@@ -24,13 +24,13 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use http::{HeaderMap, HeaderValue, Method, Uri};
 use jsonwebtoken::get_current_timestamp;
 use ngx_pep::client::asl::{
-    AslResponse, asl_handshake, asl_request, asl_request_with_dpop, encode_http_request,
-    encode_http_request_with_dpop,
+    AslResponse, asl_handshake, asl_handshake_with_ocsp, asl_request, asl_request_with_dpop,
+    encode_http_request, encode_http_request_with_dpop,
 };
 use rstest::rstest;
 use serde_json::{Value, json};
@@ -408,7 +408,7 @@ async fn asl(#[future(awt)] context: &TestContext, #[future(awt)] nginx: NginxLe
     let response = asl_request(
         &context.registration,
         context.client.clone(),
-        &"invalid",
+        "invalid",
         target.clone(),
         &cid,
         &mut state,
@@ -525,7 +525,7 @@ async fn asl_forward_header(
     let inner = encoded_inner(url.parse()?, &access_token, inner_dpop)?;
 
     let mut outer_headers = HeaderMap::new();
-    // ignored for the purposes of eigenuri, but is commonly set by proxies
+    // ignored for the purposes of eigenurl, but is commonly set by proxies
     outer_headers.insert("x-forwarded-for", HeaderValue::from_str("client")?);
     outer_headers.insert("x-forwarded-proto", HeaderValue::from_str("https")?);
     outer_headers.insert(
@@ -566,7 +566,7 @@ async fn asl_forward_header(
     };
 
     // outer with both forwarded and x-forwarded-* — forwarded takes precedence (see
-    // `RequestOps::eigenuri_parts`)
+    // `RequestOps::eigenurl_parts`)
     let url = "https://forwarded.invalid:4444/empty.json";
     let inner_dpop = create_dpop_proof(&context.registration, "GET", url, Some(&ath), None)?;
     let inner = encoded_inner(url.parse()?, &access_token, inner_dpop)?;
@@ -837,6 +837,98 @@ async fn error_responses(
 
     echo_sever.abort();
     let _ = echo_sever.await;
+
+    Ok(())
+}
+
+/// Verify that nginx serves a TLS certificate obtained via the HSM proxy provider.
+/// Connects to nginx over TLS, extracts the peer certificate, then fetches the same
+/// key_id's certificate directly from hsm_sim and compares SPKI.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn hsm_proxy_tls(#[future(awt)] nginx: NginxLease) -> Result<()> {
+    nginx.wait_ready().await?;
+
+    // Build a client with tls_info enabled so we can extract the peer certificate
+    let client = reqwest::ClientBuilder::new()
+        .use_rustls_tls()
+        .danger_accept_invalid_certs(true)
+        .tls_info(true)
+        .build()?;
+
+    let tls_url = nginx.tls_url().await?.join("ready/")?;
+    let resp = client.get(tls_url).send().await?;
+    assert!(resp.status() == 200);
+
+    let tls_info = resp
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .expect("tls_info missing — was .tls_info(true) set on the client?");
+
+    let peer_cert_der = tls_info
+        .peer_certificate()
+        .expect("no peer certificate from TLS connection");
+    let peer_cert = openssl::x509::X509::from_der(peer_cert_der)?;
+
+    // Compare the SPKI (public key) from the TLS cert against what hsm_sim derives.
+    // We can't compare full certs because ECDSA signatures are non-deterministic.
+    let hsm_url = nginx.hsm_sim_url().await?;
+    let mut hsm_client =
+        hsm_sim::proto::hsm_proxy_service_client::HsmProxyServiceClient::connect(hsm_url).await?;
+
+    let pub_resp = hsm_client
+        .get_public_key(hsm_sim::proto::GetPublicKeyRequest {
+            key_id: "tls.p256".to_string(),
+        })
+        .await?
+        .into_inner();
+
+    let peer_pubkey_der = peer_cert.public_key()?.public_key_to_der()?;
+    assert!(
+        peer_pubkey_der == pub_resp.public_key_der,
+        "TLS peer cert SPKI does not match hsm_sim key for tls.p256"
+    );
+
+    Ok(())
+}
+
+/// Verify that the ASL handshake includes a valid OCSP response when the OCSP responder is running.
+/// Starts the OCSP responder, performs an ASL handshake, and checks that M2's
+/// SignedAslKeys contains a non-empty ocsp_response that decodes as a valid OCSP response.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn asl_ocsp_stapling(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    nginx.wait_ready().await?;
+
+    let target = nginx.url().await?;
+    let access_token = context.access_token().await?;
+
+    // Handshake with OCSP capture — the verify callback extracts the OCSP response from M2
+    let (_cid, _state, ocsp_response) = asl_handshake_with_ocsp(
+        context.client.clone(),
+        &context.registration,
+        target,
+        &access_token,
+    )
+    .await?;
+
+    assert!(
+        ocsp_response.is_some(),
+        "M2 SignedAslKeys did not contain an OCSP response — is the OCSP responder running?"
+    );
+
+    // Verify the OCSP response is well-formed
+    let ocsp_bytes = ocsp_response.unwrap();
+    let ocsp: x509_ocsp::OcspResponse =
+        der::Decode::from_der(&ocsp_bytes).context("decode OCSP response from M2")?;
+    assert!(
+        ocsp.response_status == x509_ocsp::OcspResponseStatus::Successful,
+        "OCSP response status: {:?}",
+        ocsp.response_status
+    );
 
     Ok(())
 }

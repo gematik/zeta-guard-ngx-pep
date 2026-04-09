@@ -24,13 +24,16 @@
 
 use asl::client::HandshakeKeys;
 use asl::{
-    CertData, Config, Environment, MemorySessionCache, SessionCache, client, decrypt_request,
-    encrypt_response, finish_handshake, generate_asl_keys, initiate_handshake, raw_keys_from_bytes,
+    CertData, Config, Environment, MemorySessionCache, SESSION_OVERHEAD, SessionCache,
+    client::{self, raw_keys_from_bytes},
+    decrypt_request, encrypt_response, finish_handshake, generate_asl_keys, initiate_handshake,
 };
+use std::time::Duration;
 
 #[test]
 fn it_performs_roundtrip() {
-    const SERVER_SIG_SK_HEX: &str = "BD37298383EB3D620DA1ED367A9A0898E02443FADFF0AF783E1FBBFDF8250D95";
+    const SERVER_SIG_SK_HEX: &str =
+        "BD37298383EB3D620DA1ED367A9A0898E02443FADFF0AF783E1FBBFDF8250D95";
     const SERVER_SIG_CERT_HEX: &str = "3082017330820119a003020102021450fe87e05a3c00463e0a18387c3dbda92f4828fd300a06082a8648ce3d040302300f310d300b06035504030c0474657374301e170d3235313033303039333430395a170d3335313032383039333430395a300f310d300b06035504030c04746573743059301306072a8648ce3d020106082a8648ce3d030107034200048bf54a359336ad068fc57282552526875f0884a8d5b3bc09716edcaa7e0b4443084eea5f2445fea6cfe558edf4a9efea2732efa2d5888b66be9b5b08101448c2a3533051301d0603551d0e0416041461dd7c90fc9bdf91f8b4c3eaa0ceda715bd523f5301f0603551d2304183016801461dd7c90fc9bdf91f8b4c3eaa0ceda715bd523f5300f0603551d130101ff040530030101ff300a06082a8648ce3d0403020348003045022100d0621bf50aee3ff00713393825f2993adc88a091d1f227e8a2319bc7a33b0e4302201a0276dcceabbf9e7dae50669d9186663f3f00a954e1d9eb87b844bd8733cfe4";
 
     const CLIENT_ECDH_SK_HEX: &str =
@@ -55,8 +58,16 @@ fn it_performs_roundtrip() {
         rca_chain: vec![],
     };
     let ocsp_url = Some("https://ocsp2.example.org/".to_string());
-    let server_config =
-        Config::new_with_keys(Environment::Testing, signed_keys, private_keys, cert_data, ocsp_url).unwrap();
+    let server_config = Config::new_with_keys(
+        Environment::Testing,
+        signed_keys,
+        private_keys,
+        cert_data,
+        ocsp_url,
+        vec![],
+        Duration::from_mins(5),
+    )
+    .unwrap();
     let server_cache = MemorySessionCache::new();
 
     // Step 1: Client initiates Handshake with M1 to generic /ASL endpoint
@@ -79,8 +90,7 @@ fn it_performs_roundtrip() {
     println!("M1: {}", hex::encode(&m1));
 
     // Step 2: Server processes initial Handshake M1 from /ASL, produces M2 and ZETA-ASL-CID header
-    let ocsp_response = &[]; // TODO ignored for now
-    let maybe_m2 = initiate_handshake(&server_config, &m1, ocsp_response);
+    let maybe_m2 = initiate_handshake(&server_config, &m1, None);
     assert!(maybe_m2.is_ok());
     let (server_handshake1, m2) = maybe_m2.unwrap();
     let cid = server_cache.init_handshake(server_handshake1);
@@ -120,19 +130,28 @@ fn it_performs_roundtrip() {
     // Step 6: Client sends a request to the server at endpoint from ZETA-ASL-CID header
     let client_plain_request = "Hello World".as_bytes();
     let client_req_ctr = 1;
-    let maybe_client_request =
-        client::encrypt_request(&mut client_session, client_req_ctr, client_plain_request);
-    assert!(maybe_client_request.is_ok());
-    let client_request = maybe_client_request.unwrap();
+    let mut client_request = vec![0u8; client_plain_request.len() + SESSION_OVERHEAD];
+    client::encrypt_request(
+        &mut client_session,
+        client_req_ctr,
+        client_plain_request,
+        &mut client_request,
+    )
+    .unwrap();
     println!("request: {}", hex::encode(&client_request));
 
     // Step 7: Server processes request
     let maybe_server_session = server_cache.continue_session(&cid);
     assert!(maybe_server_session.is_some());
     let server_session = maybe_server_session.unwrap();
-    let maybe_inner_request = decrypt_request(&server_config, &server_session, &client_request);
-    assert!(maybe_inner_request.is_ok());
-    let (server_req_ctr, inner_request) = maybe_inner_request.unwrap();
+    let mut inner_request = vec![0u8; client_request.len() - SESSION_OVERHEAD];
+    let server_req_ctr = decrypt_request(
+        &server_config,
+        &server_session,
+        &client_request,
+        &mut inner_request,
+    )
+    .unwrap();
     assert_eq!(server_req_ctr, client_req_ctr);
     assert_eq!(inner_request, client_plain_request);
 
@@ -140,20 +159,25 @@ fn it_performs_roundtrip() {
 
     // Step 8: Server sends a response
     let server_plain_response = "Right back at ya!".as_bytes();
-    let maybe_server_response = encrypt_response(
+    let mut server_response = vec![0u8; server_plain_response.len() + SESSION_OVERHEAD];
+    encrypt_response(
         &server_config,
         &server_session,
         server_req_ctr,
         server_plain_response,
-    );
-    assert!(maybe_server_response.is_ok());
-    let server_response = maybe_server_response.unwrap();
+        &mut server_response,
+    )
+    .unwrap();
     println!("response: {}", hex::encode(&server_response));
 
     // Step 9: Client processes response
-    let maybe_plain_response =
-        client::decrypt_response(&client_session, client_req_ctr, &server_response);
-    assert!(maybe_plain_response.is_ok());
-    let plain_response = maybe_plain_response.unwrap();
+    let mut plain_response = vec![0u8; server_response.len() - SESSION_OVERHEAD];
+    client::decrypt_response(
+        &client_session,
+        client_req_ctr,
+        &server_response,
+        &mut plain_response,
+    )
+    .unwrap();
     assert_eq!(plain_response, server_plain_response);
 }

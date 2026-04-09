@@ -46,6 +46,8 @@ pub enum ZetaError {
     DPoP(#[source] anyhow::Error),
     #[error("PoPP error: {0}")]
     PoPP(#[source] anyhow::Error),
+    #[error("Impossible Travel: {0}")]
+    ImpossibleTravel(#[source] anyhow::Error),
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -57,6 +59,7 @@ impl ZetaError {
             Self::AccessTokenInvalid(_) => 401,
             Self::DPoP(_) => 401,
             Self::PoPP(_) => 403,
+            Self::ImpossibleTravel(_) => 401,
             Self::Internal(_) => 500,
         }
     }
@@ -112,7 +115,7 @@ mod tests {
         assert!(response.status == HTTPStatus::INTERNAL_SERVER_ERROR);
         assert!(response.content_type == Some("application/json".to_string()));
 
-        let body: HttpZetaErrorResponse = serde_json::from_slice(&response.body.0)?;
+        let body: HttpZetaErrorResponse = serde_json::from_slice(response.body.as_slice())?;
         let expected_body = HttpZetaErrorResponse {
             error: "Internal".to_string(),
             error_description: Some("internal error: request completed successfully".to_string()),

@@ -24,47 +24,25 @@
 
 use super::model::*;
 use super::util::*;
-use libcrux::{digest, ecdh, kem, signature};
+use libcrux_kem as kem;
 use libcrux_ml_kem::mlkem768;
+use rand::Rng;
 
 const SECONDS_PER_DAY: u64 = 60 * 60 * 24;
 
 pub fn generate_raw_keys() -> Result<(PublicKeys, PrivateKeys), AslError> {
-    let (ecdh_sk_bytes, ecdh_pk_bytes) = RNG
-        .with_borrow_mut(|rng| ecdh::key_gen(ecdh::Algorithm::P256, rng))
-        .to_error()?;
-    let rv: [u8; 64] = RNG.with_borrow_mut(|rng| rng.generate_array()).to_error()?;
-    let pqc = mlkem768::generate_key_pair(rv);
-    raw_keys_from_bytes(
-        &ecdh_sk_bytes,
-        &ecdh_pk_bytes,
-        pqc.sk().as_slice(),
-        pqc.pk().as_slice(),
-    )
-}
+    RNG.with_borrow_mut(|rng| {
+        let (ecdh_sk, ecdh_pk) = kem::key_gen(kem::Algorithm::Secp256r1, rng).to_error()?;
+        let rv: [u8; 64] = rng.random();
+        let pqc = mlkem768::generate_key_pair(rv);
 
-pub fn raw_keys_from_bytes(
-    ecdh_sk_bytes: &[u8],
-    ecdh_pk_bytes: &[u8],
-    pqc_sk_bytes: &[u8],
-    pqc_pk_bytes: &[u8],
-) -> Result<(PublicKeys, PrivateKeys), AslError> {
-    let ecdh_sk = kem::PrivateKey::decode(kem::Algorithm::Secp256r1, ecdh_sk_bytes)
-        .map_err(|_| AslError::BadFormat)?;
-    let ecdh_pk = kem::PublicKey::decode(kem::Algorithm::Secp256r1, ecdh_pk_bytes)
-        .map_err(|_| AslError::BadFormat)?;
-
-    let pqc_sk_bytes: &[u8; PQC_SK_SIZE] =
-        pqc_sk_bytes.try_into().map_err(|_| AslError::BadFormat)?;
-    let pqc_pk_bytes: &[u8; PQC_PK_SIZE] =
-        pqc_pk_bytes.try_into().map_err(|_| AslError::BadFormat)?;
-    let pqc_sk = libcrux_ml_kem::MlKemPrivateKey::from(pqc_sk_bytes);
-    let pqc_pk = libcrux_ml_kem::MlKemPublicKey::from(pqc_pk_bytes);
-
-    Ok((
-        PublicKeys { ecdh_pk, pqc_pk },
-        PrivateKeys { ecdh_sk, pqc_sk },
-    ))
+        let pqc_pk = pqc.public_key().clone();
+        let pqc_sk = pqc.private_key().clone();
+        Ok((
+            PublicKeys { ecdh_pk, pqc_pk },
+            PrivateKeys { ecdh_sk, pqc_sk },
+        ))
+    })
 }
 
 pub fn generate_asl_keys(
@@ -100,29 +78,29 @@ impl AslKeys {
     }
 
     pub fn sign(
-        self: &Self,
+        &self,
         signer_der: &[u8],
         signer_sk: &[u8],
         version: u64,
     ) -> Result<SignedAslKeys, AslError> {
         self.sign_with(signer_der, version, |data| {
-            anyhow::Ok(
-                RNG.with_borrow_mut(|rng| {
-                    signature::sign(
-                        signature::Algorithm::EcDsaP256(signature::DigestAlgorithm::Sha256),
-                        data,
-                        signer_sk,
-                        rng,
-                    )
+            let sk_arr: [u8; 32] = signer_sk
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid private key length"))?;
+            let sk = libcrux_ecdsa::p256::PrivateKey::try_from(&sk_arr)
+                .map_err(|e| anyhow::anyhow!("invalid private key: {e:?}"))?;
+            let sig = RNG
+                .with_borrow_mut(|rng| {
+                    libcrux_ecdsa::p256::rand::sign(libcrux_sha2::Algorithm::Sha256, data, &sk, rng)
                 })
-                .to_error()?
-                .into_vec(),
-            )
+                .map_err(|e| anyhow::anyhow!("sign error: {e:?}"))?;
+            let (r, s) = sig.as_bytes();
+            Ok([r.as_slice(), s.as_slice()].concat())
         })
     }
 
     pub fn sign_with<F>(
-        self: &Self,
+        &self,
         signer_der: &[u8],
         version: u64,
         sign: F,
@@ -132,7 +110,7 @@ impl AslKeys {
     {
         let signed_pub_keys = serde_cbor::to_vec(&self).to_error()?;
         let signature_es256 = sign(&signed_pub_keys).to_error()?;
-        let cert_hash = digest::hash(digest::Algorithm::Sha256, signer_der);
+        let cert_hash = libcrux_sha2::sha256(signer_der).to_vec();
 
         let signed = SignedAslKeys {
             signed_pub_keys,
@@ -153,15 +131,11 @@ pub enum AslVerifyError {
 }
 
 impl SignedAslKeys {
-    pub fn verify_with<E, F>(
-        self: &Self,
-        signer_der: &[u8],
-        verify: F,
-    ) -> Result<AslKeys, AslVerifyError>
+    pub fn verify_with<E, F>(&self, signer_der: &[u8], verify: F) -> Result<AslKeys, AslVerifyError>
     where
         F: Fn(&[u8], &[u8], &[u8]) -> Result<(), E>, // verifyfunc(data, sig, cert) -> ()
     {
-        let cert_hash = digest::hash(digest::Algorithm::Sha256, signer_der);
+        let cert_hash = libcrux_sha2::sha256(signer_der).to_vec();
         if cert_hash != self.cert_hash {
             return Err(AslVerifyError::WrongCertificate);
         }
@@ -176,7 +150,7 @@ impl SignedAslKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libcrux::signature::{Algorithm, DigestAlgorithm, EcDsaP256Signature, Signature, verify};
+    use libcrux_ecdsa::p256;
     use x509_parser::parse_x509_certificate;
 
     #[test]
@@ -223,12 +197,15 @@ mod tests {
                 assert_eq!(pk, hex::decode(SERVER_SIG_PK_HEX).unwrap());
 
                 let sig_array: [u8; 64] = sig.try_into().unwrap();
-                let signature = Signature::EcDsaP256(EcDsaP256Signature::from_bytes(
-                    sig_array,
-                    Algorithm::EcDsaP256(DigestAlgorithm::Sha256),
-                ));
+                let signature = p256::Signature::from_bytes(sig_array);
+                let public_key = p256::PublicKey::try_from(pk).unwrap();
 
-                verify(data, &signature, &pk)
+                p256::verify(
+                    libcrux_sha2::Algorithm::Sha256,
+                    data,
+                    &signature,
+                    &public_key,
+                )
             },
         );
         assert!(maybe_asl_keys.is_ok());

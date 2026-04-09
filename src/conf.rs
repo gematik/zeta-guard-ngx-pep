@@ -22,21 +22,22 @@
  * #L%
  */
 
+use anyhow::anyhow;
+use http::Uri;
 use nginx_sys::{
     NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF,
     NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_SRV_CONF, NGX_LOG_EMERG, ngx_shm_zone_t, ngx_uint_t,
+};
+use ngx::{
+    ffi::{ngx_command_t, ngx_conf_t, ngx_str_t},
+    http::{HttpModuleLocationConf, HttpModuleMainConf, Merge, MergeConfigError},
+    ngx_string,
 };
 use std::collections::HashSet;
 use std::ptr;
 use std::{
     ffi::{c_char, c_void},
     time::Duration,
-};
-use anyhow::anyhow;
-use ngx::{
-    ffi::{ngx_command_t, ngx_conf_t, ngx_str_t},
-    http::{HttpModuleLocationConf, HttpModuleMainConf, Merge, MergeConfigError},
-    ngx_string,
 };
 
 use ngx::ngx_conf_log_error;
@@ -102,6 +103,14 @@ macro_rules! loc_command {
     };
 }
 
+#[derive(Debug, Clone, Default)]
+pub enum OcspMode {
+    Disable,
+    #[default]
+    Cert,
+    Override(Uri),
+}
+
 // MAIN
 #[derive(Debug, Clone)]
 #[cfg_attr(test, allow(unused))]
@@ -115,13 +124,15 @@ pub struct MainConfig {
     pub http_client_connect_timeout: Duration,
     pub http_client_timeout: Duration,
     pub http_client_accept_invalid_certs: bool,
+    pub no_travel: bool,
     pub asl_testing: bool,
     pub asl_signer_cert: Option<String>,
     pub asl_signer_key: Option<String>,
     pub asl_ca_cert: Option<String>,
     pub asl_roots_json: Option<String>,
     pub asl_root_ca: Option<String>,
-    pub asl_ocsp_url: Option<String>,
+    pub asl_ocsp: OcspMode,
+    pub asl_ocsp_ttl: Duration,
     pub shm_zone: *mut ngx_shm_zone_t,
 }
 
@@ -137,13 +148,15 @@ impl Default for MainConfig {
             http_client_connect_timeout: Duration::from_secs(2),
             http_client_timeout: Duration::from_secs(10),
             http_client_accept_invalid_certs: false,
+            no_travel: false,
             asl_testing: false,
             asl_signer_cert: None,
             asl_signer_key: None,
             asl_ca_cert: None,
             asl_roots_json: None,
             asl_root_ca: None,
-            asl_ocsp_url: None,
+            asl_ocsp: Default::default(),
+            asl_ocsp_ttl: Duration::from_hours(24), // A_24624-01 #1
             shm_zone: ptr::null_mut(),
         }
     }
@@ -152,9 +165,6 @@ impl Default for MainConfig {
 impl MainConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.pdp_issuer.is_none() {
-            anyhow::bail!("no issuer configured");
-        }
-        if self.popp_issuer.is_none() {
             anyhow::bail!("no issuer configured");
         }
         Ok(())
@@ -264,11 +274,41 @@ conf_handler!(pep_popp_issuer, MainConfig, |conf: &mut MainConfig,
 
 #[inline(always)]
 fn non_empty(name: &str, val: &str) -> anyhow::Result<String> {
-    if val.trim().is_empty() {
-        Err(anyhow!("{} empty", name))
+    let res = val.trim();
+    if res.is_empty() {
+        Err(anyhow!("{name} empty"))
     } else {
-        Ok(val.to_string())
+        Ok(res.to_string())
     }
+}
+
+// parse a duration spec of the form 1d, 2h, 30m or 45s; assumes given unit if no suffix
+fn parse_duration(name: &str, def: char, val: &str) -> anyhow::Result<Duration> {
+    let spec = val.trim();
+    if spec.is_empty() {
+        return Err(anyhow!("{name} empty"));
+    }
+
+    let last_char = spec.chars().last().unwrap();
+    let (amount_str, unit) = if last_char.is_ascii_alphabetic() {
+        (&spec[..spec.len() - 1], last_char)
+    } else {
+        (spec, def)
+    };
+
+    let amount: u64 = amount_str
+        .parse()
+        .map_err(|_| anyhow!("invalid number in {name}: {val}"))?;
+
+    let duration = match unit {
+        'd' => Duration::from_hours(amount * 24),
+        'h' => Duration::from_hours(amount),
+        'm' => Duration::from_mins(amount),
+        's' => Duration::from_secs(amount),
+        _ => return Err(anyhow!("invalid unit in {name}: {val}")),
+    };
+
+    Ok(duration)
 }
 
 conf_handler!(pep_asl_signer_cert, MainConfig, |conf: &mut MainConfig,
@@ -281,7 +321,7 @@ conf_handler!(pep_asl_signer_cert, MainConfig, |conf: &mut MainConfig,
 });
 
 conf_handler!(pep_asl_signer_key, MainConfig, |conf: &mut MainConfig,
-                                                val: &str|
+                                               val: &str|
  -> anyhow::Result<
     *mut c_char,
 > {
@@ -290,7 +330,7 @@ conf_handler!(pep_asl_signer_key, MainConfig, |conf: &mut MainConfig,
 });
 
 conf_handler!(pep_asl_ca_cert, MainConfig, |conf: &mut MainConfig,
-                                                val: &str|
+                                            val: &str|
  -> anyhow::Result<
     *mut c_char,
 > {
@@ -299,7 +339,7 @@ conf_handler!(pep_asl_ca_cert, MainConfig, |conf: &mut MainConfig,
 });
 
 conf_handler!(pep_asl_roots_json, MainConfig, |conf: &mut MainConfig,
-                                                val: &str|
+                                               val: &str|
  -> anyhow::Result<
     *mut c_char,
 > {
@@ -308,7 +348,7 @@ conf_handler!(pep_asl_roots_json, MainConfig, |conf: &mut MainConfig,
 });
 
 conf_handler!(pep_asl_root_ca, MainConfig, |conf: &mut MainConfig,
-                                                val: &str|
+                                            val: &str|
  -> anyhow::Result<
     *mut c_char,
 > {
@@ -316,15 +356,30 @@ conf_handler!(pep_asl_root_ca, MainConfig, |conf: &mut MainConfig,
     Ok(ngx::core::NGX_CONF_OK)
 });
 
-conf_handler!(pep_asl_ocsp_url, MainConfig, |conf: &mut MainConfig,
-                                                val: &str|
+conf_handler!(pep_asl_ocsp, MainConfig, |conf: &mut MainConfig,
+                                         val: &str|
  -> anyhow::Result<
     *mut c_char,
 > {
-    conf.asl_ocsp_url = Some(non_empty("pep_asl_ocsp_url", val)?);
+    let asl_ocsp = non_empty("pep_asl_ocsp", val)?;
+    let asl_ocsp = match asl_ocsp.to_ascii_lowercase().as_str() {
+        "off" => OcspMode::Disable,
+        "cert" => OcspMode::Cert,
+        _ => OcspMode::Override(asl_ocsp.parse().expect("unparseable pep_asl_ocsp")),
+    };
+    conf.asl_ocsp = asl_ocsp;
+
     Ok(ngx::core::NGX_CONF_OK)
 });
 
+conf_handler!(pep_asl_ocsp_ttl, MainConfig, |conf: &mut MainConfig,
+                                             val: &str|
+ -> anyhow::Result<
+    *mut c_char,
+> {
+    conf.asl_ocsp_ttl = parse_duration("pep_asl_ocsp_ttl", 'm', val)?;
+    Ok(ngx::core::NGX_CONF_OK)
+});
 
 conf_handler!(pep_asl_testing, MainConfig, |conf: &mut MainConfig,
                                             val: &str|
@@ -339,6 +394,21 @@ conf_handler!(pep_asl_testing, MainConfig, |conf: &mut MainConfig,
         anyhow::bail!("Unable to parse asl_testing: {val}")
     }
 
+    Ok(ngx::core::NGX_CONF_OK)
+});
+
+conf_handler!(pep_no_travel, MainConfig, |conf: &mut MainConfig,
+                                          val: &str|
+ -> anyhow::Result<
+    *mut c_char,
+> {
+    if val.eq_ignore_ascii_case("on") {
+        conf.no_travel = true;
+    } else if val.eq_ignore_ascii_case("off") {
+        conf.no_travel = false;
+    } else {
+        anyhow::bail!("Unable to parse no_travel: {val}")
+    }
     Ok(ngx::core::NGX_CONF_OK)
 });
 
@@ -508,7 +578,7 @@ conf_handler!(
     }
 );
 
-pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 24] = [
+pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 26] = [
     main_command!("pep_pdp_issuer", pep_pdp_issuer),
     main_command!("pep_popp_issuer", pep_popp_issuer),
     main_command!("pep_http_client_idle_timeout", pep_http_client_idle_timeout),
@@ -529,13 +599,15 @@ pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 24] = [
         "pep_http_client_accept_invalid_certs",
         pep_http_client_accept_invalid_certs
     ),
+    main_command!("pep_no_travel", pep_no_travel),
     main_command!("pep_asl_testing", pep_asl_testing),
     main_command!("pep_asl_signer_cert", pep_asl_signer_cert),
     main_command!("pep_asl_signer_key", pep_asl_signer_key),
     main_command!("pep_asl_ca_cert", pep_asl_ca_cert),
     main_command!("pep_asl_roots_json", pep_asl_roots_json),
     main_command!("pep_asl_root_ca", pep_asl_root_ca),
-    main_command!("pep_asl_ocsp_url", pep_asl_ocsp_url),
+    main_command!("pep_asl_ocsp", pep_asl_ocsp),
+    main_command!("pep_asl_ocsp_ttl", pep_asl_ocsp_ttl),
     loc_command!("pep", pep),
     loc_command!("pep_require_aud", pep_require_aud),
     loc_command!("pep_require_scope", pep_require_scope),

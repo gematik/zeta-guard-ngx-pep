@@ -25,11 +25,19 @@
 use anyhow::{Context, Result, bail};
 use asl::roots::build_cert_data;
 use asl::{Config, Environment, ToError, generate_asl_keys};
+use der::Encode;
+use der::asn1::OctetString;
+use der::oid::db::rfc5912::ID_SHA_1;
 use sec1::EcPrivateKey;
 use sec1::der::Decode;
 use sec1::pkcs8::PrivateKeyInfo;
+use sha1_smol::Sha1;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use x509_cert::serial_number::SerialNumber;
+use x509_cert::spki::AlgorithmIdentifierOwned;
+use x509_ocsp::{CertId, OcspRequest, Request, TbsRequest, Version};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::oid_registry::Oid;
@@ -37,6 +45,8 @@ use x509_parser::oid_registry::asn1_rs::oid;
 use x509_parser::parse_x509_certificate;
 use x509_parser::prelude::{Pem, parse_x509_pem};
 use x509_parser::x509::X509Name;
+
+use crate::conf::OcspMode;
 
 fn load_file(name: &Path) -> Result<Vec<u8>> {
     fs::read(name).context(format!("failed to load asl keys {:?}", &name))
@@ -112,18 +122,55 @@ fn parse_ocsp_url(cert: &X509Certificate) -> Option<String> {
     None
 }
 
+fn sha1_hash(data: &[u8]) -> Vec<u8> {
+    let mut md = Sha1::new(); // libcrux does not implement SHA1 yet
+    md.update(data);
+    md.digest().bytes().to_vec()
+}
+
+fn build_ocsp_request(issuer_name: &X509Name, issuer_key: &[u8], signer_serial: &[u8]) -> Vec<u8> {
+    let issuer_name_hash =
+        OctetString::new(sha1_hash(issuer_name.as_raw())).expect("ocsp issuer name hash");
+    let issuer_key_hash = OctetString::new(sha1_hash(issuer_key)).expect("ocsp issuer key hash");
+    let serial_number = SerialNumber::new(signer_serial).expect("ocsp signer serial number");
+
+    let request = OcspRequest {
+        tbs_request: TbsRequest {
+            version: Version::V1,
+            requestor_name: None,
+            request_list: vec![Request {
+                req_cert: CertId {
+                    hash_algorithm: AlgorithmIdentifierOwned {
+                        oid: ID_SHA_1,
+                        parameters: None,
+                    },
+                    issuer_name_hash,
+                    issuer_key_hash,
+                    serial_number,
+                },
+                single_request_extensions: None,
+            }],
+            request_extensions: None,
+        },
+        optional_signature: None,
+    };
+
+    request.to_der().expect("ocsp request encoding")
+}
+
 const SECONDS_PER_WEEK: f64 = 604800f64;
 fn expires_soon(cert: &X509Certificate) -> bool {
     cert.tbs_certificate
         .validity
         .time_to_expiration()
-        .map_or(false, |expires| expires.as_seconds_f64() < SECONDS_PER_WEEK)
+        .is_some_and(|expires| expires.as_seconds_f64() < SECONDS_PER_WEEK)
 }
 
 pub fn asl_file_path(conf_dir: &Path, maybe_file: &Option<String>) -> Option<PathBuf> {
     maybe_file.as_ref().map(|file| conf_dir.join(file))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_asl_config(
     is_testing: bool,
     signer_cert_file: Option<PathBuf>,
@@ -131,7 +178,8 @@ pub fn create_asl_config(
     ca_cert_file: Option<PathBuf>,
     roots_file: Option<PathBuf>,
     rca: Option<String>,
-    ocsp_url: Option<String>,
+    ocsp_mode: OcspMode,
+    ocsp_ttl: Duration,
 ) -> Result<Config> {
     if signer_cert_file.is_none()
         && signer_key_file.is_none()
@@ -153,7 +201,7 @@ pub fn create_asl_config(
     let signer_der = load_pem_entry(&signer_cert_file.unwrap())?;
     let signer = parse_certificate(&signer_der)?;
     let ca_der = load_pem_entry(&ca_cert_file.unwrap())?;
-    let _ca = parse_certificate(&ca_der)?;
+    let ca = parse_certificate(&ca_der)?;
 
     if expires_soon(&signer) {
         println!(
@@ -180,10 +228,27 @@ pub fn create_asl_config(
         Environment::Production
     };
 
-    let ocsp = ocsp_url.or(parse_ocsp_url(&signer));
+    let ocsp_url = match ocsp_mode {
+        OcspMode::Disable => None,
+        OcspMode::Cert => parse_ocsp_url(&signer),
+        OcspMode::Override(uri) => Some(uri.to_string()),
+    };
+    let ocsp_request = build_ocsp_request(
+        &ca.subject,
+        ca.subject_pki.subject_public_key.data.as_ref(),
+        signer.raw_serial(),
+    );
 
-    let config = Config::new_with_keys(asl_env, signed_keys, private_keys, cert_data, ocsp)
-        .context("failed to build ASL configuration")?;
+    let config = Config::new_with_keys(
+        asl_env,
+        signed_keys,
+        private_keys,
+        cert_data,
+        ocsp_url,
+        ocsp_request,
+        ocsp_ttl,
+    )
+    .context("failed to build ASL configuration")?;
 
     Ok(config)
 }

@@ -22,12 +22,11 @@
  * #L%
  */
 
+use crate::Module;
+use crate::conf::{LocationConfig, MainConfig};
 use anyhow::{Result, anyhow, bail};
 use http::Uri;
 use ngx::http::{HttpModuleLocationConf, HttpModuleMainConf, Request};
-
-use crate::Module;
-use crate::conf::{LocationConfig, MainConfig};
 
 #[cfg(test)]
 use {ambassador::delegatable_trait, mockall::automock};
@@ -37,8 +36,9 @@ use {ambassador::delegatable_trait, mockall::automock};
 #[allow(clippy::needless_lifetimes)] // automock
 pub trait RequestOps {
     fn method(&self) -> String;
-    fn eigenuri_parts<'a>(&'a self) -> anyhow::Result<(&'a str, &'a str, Option<u16>)>;
-    fn eigenuri_normalized(&self) -> anyhow::Result<http::Uri>;
+    fn eigenurl_parts<'a>(&'a self) -> anyhow::Result<(&'a str, &'a str, Option<u16>)>;
+    fn eigenurl_normalized(&self) -> anyhow::Result<http::Uri>;
+    fn get_client_ip<'a>(&'a self) -> Option<&'a str>;
     fn get_authorization_token(&self) -> anyhow::Result<String>;
     fn get_header_in<'a, 'b>(&'a self, name: &'b str) -> Option<&'a str>;
     fn get_header_out<'a, 'b>(&'a self, name: &'b str) -> Option<&'a str>;
@@ -83,11 +83,15 @@ fn split_authority(authority: &str) -> Result<(&str, Option<u16>)> {
 }
 
 // RFC 7239 "Forwarded"
-fn try_parse_forwarded(forwarded: Option<&str>) -> Option<(&str, &str, Option<u16>)> {
-    forwarded.and_then(|forwarded| {
+fn try_parse_forwarded_parts(
+    forwarded: Option<&str>,
+) -> (Option<&str>, Option<&str>, Option<&str>, Option<&str>) {
+    forwarded.map_or((None, None, None, None), |forwarded| {
         let elem = forwarded.split(',').next().unwrap_or("").trim();
         let mut proto = None;
         let mut host = None;
+        let mut src = None;
+        let mut by = None;
 
         for part in elem.split(';') {
             let part = part.trim();
@@ -99,19 +103,26 @@ fn try_parse_forwarded(forwarded: Option<&str>) -> Option<(&str, &str, Option<u1
             let val = kv.next().unwrap_or("").trim().trim_matches('"');
 
             match key.as_str() {
-                "proto" => proto = Some(val),
-                "host" => host = Some(val),
+                "proto" => proto = proto.or(Some(val)),
+                "host" => host = host.or(Some(val)),
+                "for" => src = src.or(Some(val)),
+                "by" => by = by.or(Some(val)),
                 _ => {}
             }
         }
-        match host {
-            Some(host) => match split_authority(host) {
-                Ok((host, port)) => Some((proto.unwrap_or("http"), host, port)),
-                Err(_) => None,
-            },
-            None => None,
-        }
+        (by, src, host, proto)
     })
+}
+
+fn try_parse_forwarded_host(forwarded: Option<&str>) -> Option<(&str, &str, Option<u16>)> {
+    let (_, _, host, proto) = try_parse_forwarded_parts(forwarded);
+    match host {
+        Some(host) => match split_authority(host) {
+            Ok((host, port)) => Some((proto.unwrap_or("http"), host, port)),
+            Err(_) => None,
+        },
+        None => None,
+    }
 }
 
 fn try_parse_xforwarded<'a>(
@@ -156,6 +167,32 @@ fn try_parse_xforwarded<'a>(
     })
 }
 
+fn try_parse_x_forwarded_for(xffor: Option<&str>) -> Option<&str> {
+    xffor.and_then(|value| {
+        let addr = value.split(',').next()?.trim();
+        // bracketed IPv6
+        if addr.starts_with('[')
+            && let Some(end) = addr.find(']')
+        {
+            // Extract the IPv6 address without brackets
+            return Some(&addr[1..end]);
+        }
+        // IPv4 with optional port
+        if addr.matches('.').count() == 3 {
+            if let Some(end) = addr.find(':') {
+                return Some(&addr[..end]);
+            }
+            return Some(addr);
+        }
+        // assumed plain IPv6
+        if addr.find(':').is_some() {
+            return Some(addr);
+        }
+        // something else
+        None
+    })
+}
+
 fn try_parse_host(host: Option<&str>) -> Option<(&str, &str, Option<u16>)> {
     host.and_then(|host| match split_authority(host.trim()) {
         Ok((host, port)) => Some(("http", host, port)),
@@ -168,7 +205,7 @@ pub fn normalized_uri(scheme: &str, host: &str, port: Option<u16>, path: &str) -
     let host = host.to_ascii_lowercase();
     let port = port
         .or(match scheme.as_str() {
-            // NOTE: wss? shouldn't be possible from either eigenuri nor dpop — it's a client-side
+            // NOTE: wss? shouldn't be possible from either eigenurl nor dpop — it's a client-side
             // concern; the protocol is https?. We'll allow it for compatibility reasons only.
             "https" | "wss" => Some(443),
             "http" | "ws" => Some(80),
@@ -189,8 +226,8 @@ impl RequestOps for ngx::http::Request {
         self.method().to_string()
     }
 
-    fn eigenuri_parts(&self) -> Result<(&str, &str, Option<u16>)> {
-        try_parse_forwarded(self.get_header_in("forwarded"))
+    fn eigenurl_parts(&self) -> Result<(&str, &str, Option<u16>)> {
+        try_parse_forwarded_host(self.get_header_in("forwarded"))
             .or_else(|| {
                 try_parse_xforwarded(
                     self.get_header_in("x-forwarded-proto"),
@@ -199,13 +236,20 @@ impl RequestOps for ngx::http::Request {
                 )
             })
             .or_else(|| try_parse_host(self.get_header_in("host")))
-            .ok_or_else(|| anyhow!("unable to determine eigenuri from Request"))
+            .ok_or_else(|| anyhow!("unable to determine eigenurl from Request"))
     }
 
     /// NOTE: does not contain query, per rfc9449 (DPoP)
-    fn eigenuri_normalized(&self) -> Result<Uri> {
-        let (scheme, host, port) = self.eigenuri_parts()?;
+    fn eigenurl_normalized(&self) -> Result<Uri> {
+        let (scheme, host, port) = self.eigenurl_parts()?;
         normalized_uri(scheme, host, port, self.path().to_str()?)
+    }
+
+    fn get_client_ip(&self) -> Option<&str> {
+        try_parse_forwarded_parts(self.get_header_in("forwarded"))
+            .1
+            .or_else(|| try_parse_x_forwarded_for(self.get_header_in("x-forwarded-for")))
+            .or_else(|| self.get_header_in("x-real-ip").map(|v| v.trim()))
     }
 
     fn get_header_in(&self, name: &str) -> Option<&str> {
@@ -224,11 +268,13 @@ impl RequestOps for ngx::http::Request {
     fn get_authorization_token(&self) -> Result<String> {
         self.get_header_in("authorization")
             .and_then(|v| v.split_once(' '))
-            .and_then(|(scheme, token)| match scheme {
-                "Bearer" => Some(token),
-                "DPoP" => Some(token),
-                _ => None,
-            })
+            .and_then(
+                |(scheme, token)| match scheme.to_ascii_lowercase().as_str() {
+                    "bearer" => Some(token),
+                    "dpop" => Some(token),
+                    _ => None,
+                },
+            )
             .ok_or_else(|| anyhow!("no token"))
             .map(String::from)
     }
@@ -305,37 +351,147 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_forwarded() {
-        assert_eq!(None, try_parse_forwarded(None));
+    fn test_try_parse_forwarded_parts() {
+        // None input
+        assert_eq!((None, None, None, None), try_parse_forwarded_parts(None));
+        // Empty string
+        assert_eq!(
+            (None, None, None, None),
+            try_parse_forwarded_parts(Some(""))
+        );
+        // Single fields
+        assert_eq!(
+            Some("10.0.0.1"),
+            try_parse_forwarded_parts(Some("by=10.0.0.1")).0
+        );
+        assert_eq!(
+            Some("192.168.1.1"),
+            try_parse_forwarded_parts(Some("for=192.168.1.1")).1
+        );
+        assert_eq!(
+            Some("example.com"),
+            try_parse_forwarded_parts(Some("host=example.com")).2
+        );
+        assert_eq!(
+            Some("https"),
+            try_parse_forwarded_parts(Some("proto=https")).3
+        );
+        // All fields
+        assert_eq!(
+            (
+                Some("10.0.0.1"),
+                Some("192.168.1.1"),
+                Some("example.com"),
+                Some("https")
+            ),
+            try_parse_forwarded_parts(Some(
+                "for=192.168.1.1;proto=https;host=example.com;by=10.0.0.1"
+            ))
+        );
+        // Quoted values
+        assert_eq!(
+            (
+                None,
+                Some("192.168.1.1"),
+                Some("example.com"),
+                Some("https")
+            ),
+            try_parse_forwarded_parts(Some(
+                r#"for="192.168.1.1";proto="https";host="example.com""#
+            ))
+        );
+        // Whitespace handling
+        assert_eq!(
+            (
+                None,
+                Some("192.168.1.1"),
+                Some("example.com"),
+                Some("https")
+            ),
+            try_parse_forwarded_parts(Some(
+                "  for = 192.168.1.1 ; proto = https ; host = example.com  "
+            ))
+        );
+        // Case-insensitive keys
+        assert_eq!(
+            (
+                Some("10.0.0.1"),
+                Some("192.168.1.1"),
+                Some("example.com"),
+                Some("https")
+            ),
+            try_parse_forwarded_parts(Some(
+                "FOR=192.168.1.1;PROTO=https;Host=example.com;By=10.0.0.1"
+            ))
+        );
+        // Multiple forwarded entries
+        assert_eq!(
+            Some("192.168.1.1"),
+            try_parse_forwarded_parts(Some("for=192.168.1.1, for=172.16.0.1")).1
+        );
+        // Empty value
+        assert_eq!(
+            (None, Some(""), None, Some("https")),
+            try_parse_forwarded_parts(Some("for=;proto=https"))
+        );
+        // Missing equals
+        assert_eq!(
+            (None, Some(""), None, Some("https")),
+            try_parse_forwarded_parts(Some("for;proto=https"))
+        );
+        // Unknown fields skipped
+        assert_eq!(
+            (None, Some("192.168.1.1"), None, Some("https")),
+            try_parse_forwarded_parts(Some("for=192.168.1.1;unknown=value;proto=https"))
+        );
+        // IPv6 address
+        assert_eq!(
+            Some("[2001:db8:cafe::17]"),
+            try_parse_forwarded_parts(Some(r#"for="[2001:db8:cafe::17]""#)).1
+        );
+        // IPv6 with port
+        assert_eq!(
+            Some("[2001:db8:cafe::17]:4711"),
+            try_parse_forwarded_parts(Some(r#"for="[2001:db8:cafe::17]:4711""#)).1
+        );
+        // Empty parts skipped
+        assert_eq!(
+            (None, Some("192.168.1.1"), None, Some("https")),
+            try_parse_forwarded_parts(Some(";;for=192.168.1.1;;proto=https;;"))
+        );
+        // Duplicate keys (first wins)
+        assert_eq!(
+            Some("192.168.1.1"),
+            try_parse_forwarded_parts(Some("for=192.168.1.1;for=172.16.0.1")).1
+        );
+    }
+
+    #[test]
+    fn test_forwarded_host() {
+        assert_eq!(None, try_parse_forwarded_host(None));
+        // regular, no port
         assert_eq!(
             Some(("http", "some_host", None)),
-            try_parse_forwarded(Some(
+            try_parse_forwarded_host(Some(
                 "Forwarded: by=someone;for=client;host=some_host;proto=http"
             ))
         );
-        // default proto http
-        assert_eq!(
-            Some(("http", "some_host", None)),
-            try_parse_forwarded(Some("Forwarded: by=someone;for=client;host=some_host"))
-        );
-        // with port
+        // regular, with port
         assert_eq!(
             Some(("http", "some_host", Some(1234))),
-            try_parse_forwarded(Some("Forwarded: by=someone;for=client;host=some_host:1234"))
+            try_parse_forwarded_host(Some("Forwarded: by=someone;for=client;host=some_host:1234"))
         );
         // None with unparseable port
         assert_eq!(
             None,
-            try_parse_forwarded(Some(
+            try_parse_forwarded_host(Some(
                 "Forwarded: by=someone;for=client;host=some_host:invalid"
             ))
         );
-        // multi-valued
+        // None without host
         assert_eq!(
-            Some(("http", "some_host", Some(1234))),
-            try_parse_forwarded(Some(
-                "Forwarded: by=someone;for=client;host=some_host:1234,by=someone-else;for=someone;host=weird_host:777"
-            ))
+            None,
+            try_parse_forwarded_host(Some("Forwarded: by=someone;for=client"))
         );
     }
 
@@ -455,5 +611,53 @@ mod tests {
             normalized_uri("wss", "host", Some(123), "/path")?
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_x_forwarded_for() {
+        // Plain IPv4
+        assert_eq!(
+            Some("192.168.1.1"),
+            try_parse_x_forwarded_for(Some("192.168.1.1"))
+        );
+        // Plain IPv6
+        assert_eq!(
+            Some("2001:db8::1"),
+            try_parse_x_forwarded_for(Some("2001:db8::1"))
+        );
+        // IPv6 in brackets
+        assert_eq!(
+            Some("2001:db8::1"),
+            try_parse_x_forwarded_for(Some("[2001:db8::1]"))
+        );
+        // IPv4 with port
+        assert_eq!(
+            Some("192.168.1.1"),
+            try_parse_x_forwarded_for(Some("192.168.1.1:8080"))
+        );
+        // IPv6 in brackets with port
+        assert_eq!(
+            Some("2001:db8::1"),
+            try_parse_x_forwarded_for(Some("[2001:db8::1]:8080"))
+        );
+        // Multiple values
+        assert_eq!(
+            Some("192.168.1.1"),
+            try_parse_x_forwarded_for(Some("192.168.1.1, 10.0.0.1, 172.16.0.1"))
+        );
+        // Multiple with IPv6
+        assert_eq!(
+            Some("2001:db8::1"),
+            try_parse_x_forwarded_for(Some("[2001:db8::1], 192.168.1.1"))
+        );
+        // Whitespace handling
+        assert_eq!(
+            Some("192.168.1.1"),
+            try_parse_x_forwarded_for(Some("  192.168.1.1  , 10.0.0.1"))
+        );
+        // Empty string
+        assert_eq!(None, try_parse_x_forwarded_for(Some("")));
+        // No header
+        assert_eq!(None, try_parse_x_forwarded_for(None));
     }
 }

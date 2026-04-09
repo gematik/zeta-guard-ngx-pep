@@ -38,4 +38,4 @@ pub mod roots;
 pub mod client;
 
 mod util;
-pub use util::utc_now;
+pub use util::{SESSION_OVERHEAD, utc_now};

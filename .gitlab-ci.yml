@@ -15,6 +15,7 @@ workflow:
     - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
       when: never
     - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
 
 stages:
   - build
@@ -25,7 +26,7 @@ stages:
 include:
   - component: "$CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-scanning@v0.4.2"
     inputs:
-      analyzer-image: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/aquasec/trivy:latest"
+      analyzer-image: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/aquasec/trivy:0.69.3@sha256:7228e304ae0f610a1fad937baa463598cadac0c2ac4027cc68f3a8b997115689"
       cs-image: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
       git-strategy: fetch
       severity: HIGH,CRITICAL
@@ -51,14 +52,28 @@ variables:
   BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.94-slim-bookworm
   NGINX_VERSION: "1.29.5" # NOTE: keep in sync with .cargo/config.toml and Dockerfile
   BASE_IMAGE: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginxinc/nginx-unprivileged:$NGINX_VERSION-trixie-otel"
+  BASE_IMAGE_HSM_SIM: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/debian:bookworm"
+
   IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+  IMAGE_HSM_SIM: $CI_REGISTRY_IMAGE/hsm_sim:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
 
 before_script:
   - docker context create docker
-  - docker buildx create --name ci-builder --use --driver docker-container --driver-opt image="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/moby/buildkit:buildx-stable-1" docker
-  - docker buildx use ci-builder
   - printf "%s" "$CI_DEPENDENCY_PROXY_PASSWORD" | docker login "$CI_DEPENDENCY_PROXY_SERVER" -u "$CI_DEPENDENCY_PROXY_USER" --password-stdin
   - printf "%s" "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+  - docker buildx create --name ci-builder --use --driver docker-container --driver-opt image="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/moby/buildkit:buildx-stable-1" docker
+  - docker buildx use ci-builder
+  - |
+    for i in $(seq 5); do
+      if docker buildx inspect --bootstrap --builder ci-builder >/dev/null; then
+        break
+      fi
+      if [[ $i == 5 ]]; then
+        printf "Unable to bootstrap builder\n"
+        exit 1
+      fi
+      sleep 1
+    done
 
 build-env:
   stage: build
@@ -70,9 +85,8 @@ build-env:
   script:
     - |
       docker buildx build \
-        --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1.7 \
+        --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1 \
         --build-arg BASE_IMAGE_BUILD="$BASE_IMAGE_BUILD" \
-        --build-arg BASE_IMAGE="$BASE_IMAGE" \
         --build-arg AZDO_CRATES_MIRROR_URL="$AZDO_CRATES_MIRROR_URL" \
         --cache-from type=registry,ref="$CI_REGISTRY_IMAGE:buildcache" \
         --cache-to type=registry,ref="$CI_REGISTRY_IMAGE:buildcache,mode=max,compression=zstd" \
@@ -126,7 +140,7 @@ build:
       printf "!! build image %s\n\n" "$IMAGE"
 
       docker buildx build \
-        --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1.7 \
+        --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1 \
         --build-arg BASE_IMAGE_BUILD="$BASE_IMAGE_BUILD" \
         --build-arg BASE_IMAGE="$BASE_IMAGE" \
         --target ci \
@@ -134,15 +148,29 @@ build:
         --push \
         "$@" \
         .
+
+      printf "!! build image %s\n\n" "$IMAGE_HSM_SIM"
+
+      docker buildx build \
+        --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1 \
+        --build-arg BASE_IMAGE_BUILD="$BASE_IMAGE_BUILD" \
+        --build-arg BASE_IMAGE_HSM_SIM="$BASE_IMAGE_HSM_SIM" \
+        --target ci-hsm-sim \
+        --tag "$IMAGE_HSM_SIM" \
+        --push \
+        "$@" \
+        .
+
   artifacts:
     when: always
     paths:
       - target/release/libngx_pep.so
+      - target/release/hsm_sim
       - clippy.json
       - coverage.lcov
       - .pkg-version
       - ngx_pep.cdx.json
-      - prefix/test-*/logs
+      - prefix/test.log
 
 sonarqube:
   stage: test
@@ -162,7 +190,7 @@ sonarqube:
       sonar-scanner
       ${TRACE+-Dsonar.verbose=true}
       ${SONAR_QUALITY_GATE_ENABLED:+-Dsonar.qualitygate.wait=$SONAR_QUALITY_GATE_ENABLED}
-      -Dsonar.projectVersion="$(cat /usr/src/ngx_pep/.pkg-version)"
+      -Dsonar.projectVersion="$(cat .pkg-version)"
       -Dsonar.links.homepage=${CI_PROJECT_URL}
       -Dsonar.links.ci=${CI_PROJECT_URL}/-/pipelines
       -Dsonar.links.issue=${CI_PROJECT_URL}/-/issues
@@ -195,14 +223,20 @@ trigger_helm:
   variables:
     PEPPROXY_IMAGE_TAG: "$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA" # e.g. main-cafebabe
 
-tag_main:
+tag_image:
   stage: publish
   rules:
     # don't trigger for nightly builds — they are supposed to check dependency issues in
     # *previously* built and released images, and not build/tag anything themselves.
     - if: $CI_PIPELINE_SOURCE == "schedule"
       when: never
+    - if: $CI_COMMIT_TAG
+      variables:
+        TARGET_TAG: "$CI_COMMIT_TAG"
+      when: on_success
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      variables:
+        TARGET_TAG: "$CI_DEFAULT_BRANCH"
       when: on_success
     - when: never
   needs:
@@ -212,9 +246,13 @@ tag_main:
       optional: true
   script:
     - |
-      docker pull "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
-      docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:$CI_DEFAULT_BRANCH"
-      docker push "$CI_REGISTRY_IMAGE:$CI_DEFAULT_BRANCH"
+      docker pull "$IMAGE"
+      docker tag "$IMAGE" "$CI_REGISTRY_IMAGE:$TARGET_TAG"
+      docker push "$CI_REGISTRY_IMAGE:$TARGET_TAG"
+
+      docker pull "$IMAGE_HSM_SIM"
+      docker tag "$IMAGE_HSM_SIM" "$CI_REGISTRY_IMAGE/hsm_sim:$TARGET_TAG"
+      docker push "$CI_REGISTRY_IMAGE/hsm_sim:$TARGET_TAG"
 
 publish_artifacts:
   stage: publish
@@ -235,11 +273,14 @@ publish_artifacts:
   needs:
     - job: build
       artifacts: true
+    - job: container-scanning
+      artifacts: true
   script:
     - git clone https://zeta-sdk:${REPORTING_TOKEN}@tas-devtools-gitlab.spree.de/zeta/reporting.git
     - mkdir -p ./reporting/zeta-guard/ngx_pep/
     - find . -path ./reporting -prune -o -name 'ngx_pep.cdx.json' -exec cp --parents '{}' ./reporting/zeta-guard/ngx_pep/ \;
     - find . -path ./reporting -prune -o -name 'coverage.lcov' -exec cp --parents '{}' ./reporting/zeta-guard/ngx_pep/ \;
+    - find . -path ./reporting -prune -o -name 'gl-container-scanning-report.json' -exec cp --parents '{}' ./reporting/zeta-guard/ngx_pep/ \;
     - cd reporting
     - git config user.email "ci@tas-devtools-gitlab.spree.de"
     - git config  user.name "ci"

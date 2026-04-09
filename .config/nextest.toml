@@ -9,14 +9,14 @@ command = [
   "/usr/bin/env",
   "bash",
   "-c",
-  "printf \"Building nginx module...\\n\\n\"; LLVM_PROFILE_FILE=/dev/null cargo build --features its --lib",
+  "printf \"Building nginx module and ossl_hsm...\\n\\n\"; LLVM_PROFILE_FILE=/dev/null cargo build --features its --lib; LLVM_PROFILE_FILE=/dev/null cargo build -p ossl_hsm",
 ]
 capture-stdout = false
 capture-stderr = false
 
 [test-groups]
-# semaphore because we only provision 8 nginx prefix dirs in build.rs
-integration = { max-threads = 8 }
+# semaphore because we only provision 4 nginx prefix dirs in build.rs
+integration = { max-threads = 4 }
 
 [[profile.default.overrides]]
 filter = "kind(test)"

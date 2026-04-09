@@ -25,8 +25,8 @@
 use super::model::*;
 use super::util::*;
 use anyhow::anyhow;
-use libcrux::{aead, digest};
 use serde::Serialize;
+use std::time::Duration;
 
 const EXPIRES_AFTER_SECONDS: u64 = 24 * 60 * 60;
 
@@ -37,6 +37,8 @@ pub struct Config {
     pub sk: PrivateKeys,
     pub cert_data: CertData,
     pub ocsp_url: Option<String>,
+    pub ocsp_request: Vec<u8>,
+    pub ocsp_ttl: Duration,
 }
 
 impl Config {
@@ -46,6 +48,8 @@ impl Config {
         private_keys: AslPrivateKeys,
         cert_data: CertData,
         ocsp_url: Option<String>,
+        ocsp_request: Vec<u8>,
+        ocsp_ttl: Duration,
     ) -> Result<Self, AslError> {
         Ok(Config {
             env,
@@ -53,25 +57,27 @@ impl Config {
             sk: PrivateKeys::try_from(&private_keys)?,
             cert_data,
             ocsp_url,
+            ocsp_request,
+            ocsp_ttl,
         })
     }
 
-    pub fn is_default(self: &Self) -> bool {
+    pub fn is_default(&self) -> bool {
         self.signed_keys.cdv == 0
     }
 }
 
 #[derive(Debug)]
 pub struct HandshakeState {
-    pub ss_e: Vec<u8>,
+    pub ss_e: [u8; 64],
     pub transcript: Vec<u8>, // M1 || M2
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct SessionState {
-    pub key_id: Vec<u8>,
-    pub k2_c2s_app_data: Vec<u8>,
-    pub k2_s2c_app_data: Vec<u8>,
+    pub key_id: [u8; 32],
+    pub k2_c2s_app_data: [u8; 32],
+    pub k2_s2c_app_data: [u8; 32],
     pub expires: u64,
     pub enc_ctr: u64,
 }
@@ -93,15 +99,18 @@ struct SignedAslKeysRef<'a> {
 pub fn initiate_handshake(
     conf: &Config,
     msg1: &[u8],
-    ocsp_response: &[u8],
+    ocsp_response: Option<&[u8]>,
 ) -> Result<(HandshakeState, Vec<u8>), AslError> {
-    let m1: Message1 = serde_cbor::from_slice(msg1).to_error().map_err(AslError::DecodingError)?;
+    let m1: Message1 = serde_cbor::from_slice(msg1)
+        .to_error()
+        .map_err(AslError::DecodingError)?;
     if m1.message_type != MESSAGE_TYPE_1 {
         return Err(AslError::DecodingError(anyhow!("message_type not m1")));
     }
 
-    let mat =
-        derive_handshake_material(&m1.ecdh_pk, &m1.pqc_pk).to_error().map_err(AslError::DecodingError)?;
+    let mat = derive_handshake_material(&m1.ecdh_pk, &m1.pqc_pk)
+        .to_error()
+        .map_err(AslError::DecodingError)?;
     let keys = derive_handshake_keys(&mat.ss_p)?;
 
     let server_keys = SignedAslKeysRef {
@@ -109,11 +118,15 @@ pub fn initiate_handshake(
         signature_es256: &conf.signed_keys.signature_es256,
         cert_hash: &conf.signed_keys.cert_hash,
         cdv: conf.signed_keys.cdv,
-        ocsp_response,
+        ocsp_response: ocsp_response.unwrap_or(&[]),
     };
-    let signed_public_vau_keys =
-        serde_cbor::to_vec(&server_keys).to_error()?;
-    let aead_ciphertext_msg_2 = encrypt_handshake(&keys.k1_s2c, &signed_public_vau_keys)?;
+    let signed_public_vau_keys = serde_cbor::to_vec(&server_keys).to_error()?;
+    let mut aead_ciphertext_msg_2 = vec![0u8; HANDSHAKE_OVERHEAD + signed_public_vau_keys.len()];
+    encrypt_handshake(
+        &keys.k1_s2c,
+        &signed_public_vau_keys,
+        &mut aead_ciphertext_msg_2,
+    )?;
 
     let m2 = Message2 {
         message_type: String::from(MESSAGE_TYPE_2),
@@ -142,15 +155,19 @@ pub fn finish_handshake(
 ) -> Result<(SessionState, Vec<u8>), AslError> {
     let keys = derive_handshake_keys(&state.ss_e)?;
 
-    let m3: Message3 = serde_cbor::from_slice(msg3).to_error().map_err(AslError::DecodingError)?;
+    let m3: Message3 = serde_cbor::from_slice(msg3)
+        .to_error()
+        .map_err(AslError::DecodingError)?;
     if m3.message_type != MESSAGE_TYPE_3 {
         return Err(AslError::DecodingError(anyhow!("message_type not m3")));
     }
 
-    let inner_cbor =
-        decrypt_handshake(&keys.k1_c2s, &m3.aead_ct).map_err(|_| AslError::DecryptionFailure)?;
-    let inner: Message3InnerLayer =
-        serde_cbor::from_slice(&inner_cbor).to_error().map_err(AslError::DecodingError)?;
+    let mut inner_cbor = vec![0u8; m3.aead_ct.len() - HANDSHAKE_OVERHEAD];
+    decrypt_handshake(&keys.k1_c2s, &m3.aead_ct, &mut inner_cbor)
+        .map_err(|_| AslError::DecryptionFailure)?;
+    let inner: Message3InnerLayer = serde_cbor::from_slice(&inner_cbor)
+        .to_error()
+        .map_err(AslError::DecodingError)?;
     if inner.eso || inner.erp {
         return Err(AslError::MissingParameters);
     }; // not supported
@@ -166,17 +183,26 @@ pub fn finish_handshake(
 
     let mut client_transcript = state.transcript.clone();
     client_transcript.extend(m3.aead_ct); // = ciphertext_msg_3
-    let client_hash = digest::hash(digest::Algorithm::Sha256, &client_transcript);
-    let expected_hash =
-        decrypt_handshake(&mat.k2_c2s_key_confirmation, &m3.aead_ct_key_confirmation)?;
-    if client_hash != expected_hash {
+    let client_hash = libcrux_sha2::sha256(&client_transcript);
+    let mut expected_hash = [0u8; 32];
+    decrypt_handshake(
+        &mat.k2_c2s_key_confirmation,
+        &m3.aead_ct_key_confirmation,
+        &mut expected_hash,
+    )?;
+    if expected_hash != client_hash {
         return Err(AslError::TranscriptError);
     }
 
     let mut server_transcript = state.transcript.clone();
     server_transcript.extend(msg3);
-    let server_hash = digest::hash(digest::Algorithm::Sha256, &server_transcript);
-    let ct_key_confirmation = encrypt_handshake(&mat.k2_s2c_key_confirmation, &server_hash)?;
+    let server_hash = libcrux_sha2::sha256(&server_transcript);
+    let mut ct_key_confirmation = vec![0u8; HANDSHAKE_OVERHEAD + server_hash.len()];
+    encrypt_handshake(
+        &mat.k2_s2c_key_confirmation,
+        &server_hash,
+        &mut ct_key_confirmation,
+    )?;
 
     let m4 = Message4 {
         message_type: String::from(MESSAGE_TYPE_4),
@@ -196,39 +222,48 @@ pub fn finish_handshake(
     Ok((session, msg4))
 }
 
+/// Decrypt an ASL session request. `out` must be `request.len() - SESSION_OVERHEAD` bytes.
+/// Returns the request counter.
 pub fn decrypt_request(
     conf: &Config,
     state: &SessionState,
     request: &[u8],
-) -> Result<(u64, Vec<u8>), AslError> {
-    let key = aead::Key::from_slice(aead::Algorithm::Aes256Gcm, &state.k2_c2s_app_data).to_error()?;
-    let res = decrypt_session(&key, &state.key_id, conf.env, MessageMode::Request, request)?;
-    Ok(res)
+    out: &mut [u8],
+) -> Result<u64, AslError> {
+    decrypt_session(
+        &state.k2_c2s_app_data,
+        &state.key_id,
+        conf.env,
+        MessageMode::Request,
+        request,
+        out,
+    )
 }
 
+/// Encrypt an ASL session response. `out` must be `plain.len() + SESSION_OVERHEAD` bytes.
 pub fn encrypt_response(
     conf: &Config,
     state: &SessionState,
     req_ctr: u64,
     plain: &[u8],
-) -> Result<Vec<u8>, AslError> {
-    let key = aead::Key::from_slice(aead::Algorithm::Aes256Gcm, &state.k2_s2c_app_data).to_error()?;
-    let res = encrypt_session(
-        &key,
+    out: &mut [u8],
+) -> Result<(), AslError> {
+    encrypt_session(
+        &state.k2_s2c_app_data,
         &state.key_id,
         conf.env,
         MessageMode::Response,
         req_ctr,
         state.enc_ctr,
         plain,
-    )?;
-    Ok(res)
+        out,
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::keys::*;
     use super::*;
+    use crate::client::raw_keys_from_bytes;
 
     fn create_config() -> Config {
         const SERVER_ECDH_SK_HEX: &str =
@@ -236,7 +271,8 @@ mod tests {
         const SERVER_ECDH_PK_HEX: &str = "72943a491acc09bd121d98e6f3699259d2deaf880d33fa103b193dee2679783a137ada82d2d5b143eeec63b62f6a97b7315dd34739284b816100bb1cc333a8ab";
         const SERVER_PQC_SK_HEX: &str = "84428ca0db4237d1172a0b0eaf4917b47cc608b5a92a7710d236c5a84cb542b96f8fd870fd849494434ca2ba9e78c945d411bc0abc8b1a7c1a90c581792b2cbd397f9450b6bcf4ced316260f687bf7cacb89187213a67930904797720331534211fa32709ac07113949bc84c95f65c089689fd02bbbe02678a3c04e76948dd33385fa159da10acf3605d7b858d9e59a44212c963eb25fd3459ee956d01a729f9840a53630cbe8980cd7c7f907c0619a803f22a94f963aed29999e6fc982cf7be5ee9bdfcd28729587fb7c98f9686b99f55c3b60a8504e826e463be1905883175237596cad2a190e3134851274ce3078ad4195392c625bf4b7d5ff783760598d41451ea1626159192a569b345031f38b6b26f7c735ea836d9a6bfba217d5305393728a5feac4220f1bb3c551a975a89fe8b0e22f5b0c011ac6afb8f94d9c684b3151828a8296aacfcf195a5434a4ad4917c5859ceeca071ebcebed6918b7b6ce70c9027a9ba1bc07f77fac5401c8b6172a994f67170ec244018af976694b62245cb099ed29b2c4c807e63b3bee5bb3f21c869554a3c0f1c9457b1a2b6d7337cd2aeff0466d62598d7fc6c5bb7108a6c710f5acf6f656bbbba60301784e0785b375b761340ba8146164adaa8ec780309d34eaa8933d94797741b9fbb85c84e1a7156e3ac741c2008134a0807946282923e138a4b26aa69f02b3fd55b0898ceb074443a554e8ea80cbd206413c7cd2196734aec6fa6931919db0c7aea5e7c240d582318aa396d5c130992ac58a7693e0b5a6ba6d83fd5483d2dda4260471799fb9cabbcad0560762c5a2286cba1ce482082183460131ef78cb2a3ab8e3c7786b2222e73f4a90a478b1064c9ffe04289fca983a9b203fca00c0abf10ca2197e778d959c0621b8f7b3c2b22fc65613a987a26a7c82a63c7627c75e16c7df6c0506aac3a9b590f52696cebaefef367f9312c9d0b89b771b7d44a47ad0060753752522b79bd423ad239121db9c42c9860d5bc7179d962e6d6a99e8a285b975840aa761bfc7aaa835888a23dc4009621415763689ed0167b5573917a6010fdf97ddc047abd073efa733fa95574054571bd16988c6605381b73b9f023742a3f4c8b38ac702576e241a41987a1a4a128d2223125a4bdbc33ef65af4282c8bbea453ac86d612c6c9c26754efa6921941b5d2c09a020aff2d4a3bcd41a0959125e9b6261321a920c89658671db665e582bcc3d877b9d04c5c90680b11607beb1c1fb73a6a2903b1a9c3e2d0b36d45713b65199b3e85c74441b650cba37119b8219bf88688445c7336de1495705c2145883d1d25512b7478394039092242094345e2406d8c57cb7543481e27cafd749e8f8bbe900450ab9459fd58f06ab24ae5a522f8c510e0034bdf4cf46618e34fc57e9ccc124a203a985ca6aab7fcadac9023ca78303238ce2143a2ca4b97800eec0b0b2e27f56813fb1778f56e69684a53d10e63ff89bb8e0d908b1c72a2d2bb04d2562edd4a007bc1533795e77436667c5794bd2015f1805fe2c01ecaa1e3827b1b227b08b6115674157679697b1900dd03822abba0803bcc3d7644d2150b2c3974b9fa80ab82842aafa3691964837e43a56070e11da26b5dc97ac36028ba414a6c01844c3050d40b2636098a4d3a3d28741d358716ff8c1509cab01aa03c0f796ae92834440cd23f53c5d787cb8184a2a6b98f9e1bab3a8c5fe4b04b4fccf5e770a94677d91236fc06bccef73ad594456487a4547235e6b5811fb805b65b74eca47ac6d997e8896b15e5099891855bfc86e4f2967912b6c98398c05b70c590386f5f844e33a336d2b911b9923294393973389e05536a40751ee2910bfe373cc973509c9c093b1a3fc704e3273c6d4574ef3b1425aa56a026a2a0ff17d61164d3d8729f7b56da0805630d24dad8bbedef2186b0107762b86cd078def21b0e8e8b67ba8c301ab73d70325ac6b5654c058e5c01d1d6966f30b161fab8639c5608fbb8b590b4e5d4615814322b4e75ca7c2cfdbecc2c09c4d97608ffd5c239dd46b203c125db68771499f1b26a36deb7f46d7c98d4357de70a10e199036755eee93159dc247039bce6e729d9ef77574f2c02d2847f046105d646786b514daf7a57c935b7605361d01248d5b9b7e72516e78992a28030d553b8884c11765b3542a6dcd782c5a4a2278939b62b14979a968a9f9168eba89c19cb7bda956768b059fe8b8d6c080e1d590fb0a163f536b8c7988057c5d88357756dc9def5b8583823a0fc720d0dc646b9537eb776604eb2a93996a91e73b409a1552e78102a97201ac4da5ca547016ba0e6645c8d16b995338a366422a173da7851651d78b98e897ce23a253a09e8ce57b6779609ea204b24b13a44663ea4a17231895f898ceb2f915cd177efef3c88e6b41d2c3a74f40502c9350628a74c63b3673d4915f68349af7c9141c5f8dd906061c074bdb2d59f87ac5116cc84ba13c398ba203c6039c2bc4ac6a774160db218a1401714584b247235c8100463da3352fc566f12ab9fe387b62b0c269a628d31219b532a8d8f397ad455fee1c7647f612d129961c07b01960393c491a323b236be64b826a87c00bba4603cab7b2165ce869eda4ccca15bc98479409c09f1d491c0498aab2d29d29c51b6d784d07c86580251c822b26cfe1684c75422ffbcffad011528394e9bc63a827484fb05279ba06a0c7aab211aeb4e9c72af72a3e31ccb6d60bfbe03efdf41895a455f2199e9f4b7168f51f95932c2210bc1a197e7d991ea4111188717123d407960303b34613347443b885651c6038ea3686598813071a9f0f320fc1b94d96f56fb0a1587ea32ec7e86cc5793b412c4e33f770633c675e6288eb23c31b630ebd916b871b098e787e79fb3f7cacc8aa559196a4c6dfd3bb9fcc436a43491a66018d10b14cd219ac9c320c487c02c7a49b88b3fa1bb35172b9e79b42e6d2af7f8582853641a8f8a047f402cd17631a50c5a6d02d5df4236e421a880b8bd4749a01a4c70ef8bb8080301b828922e70f5dc05f10759e2f18096986301b52989a4552eaf67d1499a7fbe6298eb5b39a9750877c17d6e630fb9830cdca38a4c8b401a853f773a64738548989241926905f77a9f240b0393c4222286eaef145db2a7486593e8111b4f8c56507293ada2313e336847708a9c57213c83ccae273897efc6110205153d5189f823d8c744772c22d07e92709006a1e45614e431cee4aa3a2e4bff6c7796989ab5c81f61dd423624ae8595744f831e1f5b5c56e8ccde0384d1f312ea66a1cdfac9c8c2d698e58b5036ba871f4247d845fd97265bdef1ba1db360721d462bacd71c3bcfa015553f4dae1ed82b59a1e0b2af4acdd5039aed98f1e55f26a66b391ae";
         const SERVER_PQC_PK_HEX: &str = "b5dc97ac36028ba414a6c01844c3050d40b2636098a4d3a3d28741d358716ff8c1509cab01aa03c0f796ae92834440cd23f53c5d787cb8184a2a6b98f9e1bab3a8c5fe4b04b4fccf5e770a94677d91236fc06bccef73ad594456487a4547235e6b5811fb805b65b74eca47ac6d997e8896b15e5099891855bfc86e4f2967912b6c98398c05b70c590386f5f844e33a336d2b911b9923294393973389e05536a40751ee2910bfe373cc973509c9c093b1a3fc704e3273c6d4574ef3b1425aa56a026a2a0ff17d61164d3d8729f7b56da0805630d24dad8bbedef2186b0107762b86cd078def21b0e8e8b67ba8c301ab73d70325ac6b5654c058e5c01d1d6966f30b161fab8639c5608fbb8b590b4e5d4615814322b4e75ca7c2cfdbecc2c09c4d97608ffd5c239dd46b203c125db68771499f1b26a36deb7f46d7c98d4357de70a10e199036755eee93159dc247039bce6e729d9ef77574f2c02d2847f046105d646786b514daf7a57c935b7605361d01248d5b9b7e72516e78992a28030d553b8884c11765b3542a6dcd782c5a4a2278939b62b14979a968a9f9168eba89c19cb7bda956768b059fe8b8d6c080e1d590fb0a163f536b8c7988057c5d88357756dc9def5b8583823a0fc720d0dc646b9537eb776604eb2a93996a91e73b409a1552e78102a97201ac4da5ca547016ba0e6645c8d16b995338a366422a173da7851651d78b98e897ce23a253a09e8ce57b6779609ea204b24b13a44663ea4a17231895f898ceb2f915cd177efef3c88e6b41d2c3a74f40502c9350628a74c63b3673d4915f68349af7c9141c5f8dd906061c074bdb2d59f87ac5116cc84ba13c398ba203c6039c2bc4ac6a774160db218a1401714584b247235c8100463da3352fc566f12ab9fe387b62b0c269a628d31219b532a8d8f397ad455fee1c7647f612d129961c07b01960393c491a323b236be64b826a87c00bba4603cab7b2165ce869eda4ccca15bc98479409c09f1d491c0498aab2d29d29c51b6d784d07c86580251c822b26cfe1684c75422ffbcffad011528394e9bc63a827484fb05279ba06a0c7aab211aeb4e9c72af72a3e31ccb6d60bfbe03efdf41895a455f2199e9f4b7168f51f95932c2210bc1a197e7d991ea4111188717123d407960303b34613347443b885651c6038ea3686598813071a9f0f320fc1b94d96f56fb0a1587ea32ec7e86cc5793b412c4e33f770633c675e6288eb23c31b630ebd916b871b098e787e79fb3f7cacc8aa559196a4c6dfd3bb9fcc436a43491a66018d10b14cd219ac9c320c487c02c7a49b88b3fa1bb35172b9e79b42e6d2af7f8582853641a8f8a047f402cd17631a50c5a6d02d5df4236e421a880b8bd4749a01a4c70ef8bb8080301b828922e70f5dc05f10759e2f18096986301b52989a4552eaf67d1499a7fbe6298eb5b39a9750877c17d6e630fb9830cdca38a4c8b401a853f773a64738548989241926905f77a9f240b0393c4222286eaef145db2a7486593e8111b4f8c56507293ada2313e336847708a9c57213c83ccae273897efc6110205153d5189f823d8c744772c22d07e92709006a1e45614e431cee4aa3a2e4bff6c7796989ab5c81f61dd423624ae8595744f831e1f5b5c56e8ccde0384d1f312ea66a1cdfac";
-        const SERVER_SIG_SK_HEX: &str = "BD37298383EB3D620DA1ED367A9A0898E02443FADFF0AF783E1FBBFDF8250D95";
+        const SERVER_SIG_SK_HEX: &str =
+            "BD37298383EB3D620DA1ED367A9A0898E02443FADFF0AF783E1FBBFDF8250D95";
         const SERVER_SIG_CERT_HEX: &str = "3082017330820119a003020102021450fe87e05a3c00463e0a18387c3dbda92f4828fd300a06082a8648ce3d040302300f310d300b06035504030c0474657374301e170d3235313033303039333430395a170d3335313032383039333430395a300f310d300b06035504030c04746573743059301306072a8648ce3d020106082a8648ce3d030107034200048bf54a359336ad068fc57282552526875f0884a8d5b3bc09716edcaa7e0b4443084eea5f2445fea6cfe558edf4a9efea2732efa2d5888b66be9b5b08101448c2a3533051301d0603551d0e0416041461dd7c90fc9bdf91f8b4c3eaa0ceda715bd523f5301f0603551d2304183016801461dd7c90fc9bdf91f8b4c3eaa0ceda715bd523f5300f0603551d130101ff040530030101ff300a06082a8648ce3d0403020348003045022100d0621bf50aee3ff00713393825f2993adc88a091d1f227e8a2319bc7a33b0e4302201a0276dcceabbf9e7dae50669d9186663f3f00a954e1d9eb87b844bd8733cfe4";
         const REF_DATE_UTC: u64 = 0x69000000u64;
 
@@ -268,6 +304,8 @@ mod tests {
             sk,
             cert_data,
             ocsp_url: None,
+            ocsp_request: vec![],
+            ocsp_ttl: Duration::from_mins(5),
         }
     }
 
@@ -283,7 +321,10 @@ mod tests {
     #[test]
     fn it_provides_key_version() {
         let conf = create_config();
-        assert_eq!(conf.signed_keys.version(), "b28a377426822eca7ac923e644ad05ba6a3f203095c2c8fd5682ecaae9cc41a9-1");
+        assert_eq!(
+            conf.signed_keys.version(),
+            "b28a377426822eca7ac923e644ad05ba6a3f203095c2c8fd5682ecaae9cc41a9-1"
+        );
     }
 
     #[test]
@@ -293,7 +334,7 @@ mod tests {
         let conf = create_config();
         let msg1 = hex::decode(MESSAGE1_HEX).unwrap();
 
-        let result2 = initiate_handshake(&conf, &msg1, &[]);
+        let result2 = initiate_handshake(&conf, &msg1, None);
         assert!(result2.is_ok());
 
         let (handshake, msg2) = result2.unwrap();
@@ -320,7 +361,7 @@ mod tests {
 
         let conf = create_config();
         let handshake = HandshakeState {
-            ss_e: hex::decode(SS_E_HEX).unwrap(),
+            ss_e: hex::decode(SS_E_HEX).unwrap().try_into().unwrap(),
             transcript: [
                 hex::decode(MESSAGE1_HEX).unwrap(),
                 hex::decode(MESSAGE2_HEX).unwrap(),
@@ -334,14 +375,14 @@ mod tests {
         assert!(result4.is_ok());
 
         let (session, msg4) = result4.unwrap();
-        assert_eq!(session.key_id, hex::decode(EXPECTED_KEY_ID).unwrap());
+        assert_eq!(&session.key_id[..], hex::decode(EXPECTED_KEY_ID).unwrap());
         assert_eq!(
-            session.k2_c2s_app_data,
-            hex::decode(EXPECTED_C2S_KEY).unwrap()
+            &session.k2_c2s_app_data[..],
+            hex::decode(EXPECTED_C2S_KEY).unwrap().as_slice()
         );
         assert_eq!(
-            session.k2_s2c_app_data,
-            hex::decode(EXPECTED_S2C_KEY).unwrap()
+            &session.k2_s2c_app_data[..],
+            hex::decode(EXPECTED_S2C_KEY).unwrap().as_slice()
         );
         assert!(msg4.len() > 32); // enough for key confirmation, i.e. sha256 block len
     }
@@ -358,19 +399,17 @@ mod tests {
 
         let conf = create_config();
         let session = SessionState {
-            key_id: hex::decode(KEY_ID_HEX).unwrap(),
-            k2_c2s_app_data: hex::decode(C2S_KEY_HEX).unwrap(),
-            k2_s2c_app_data: vec![], // unused
-            expires: 0,              // unused
-            enc_ctr: 0,              // unused
+            key_id: hex::decode(KEY_ID_HEX).unwrap().try_into().unwrap(),
+            k2_c2s_app_data: hex::decode(C2S_KEY_HEX).unwrap().try_into().unwrap(),
+            k2_s2c_app_data: [0u8; 32], // unused
+            expires: 0,                 // unused
+            enc_ctr: 0,                 // unused
         };
 
         let msg = hex::decode(CRYPTO_MESSAGE_HEX).unwrap();
 
-        let result = decrypt_request(&conf, &session, &msg);
-        assert!(result.is_ok());
-
-        let (req_ctr, plain) = result.unwrap();
+        let mut plain = vec![0u8; msg.len() - SESSION_OVERHEAD];
+        let req_ctr = decrypt_request(&conf, &session, &msg, &mut plain).unwrap();
         assert_eq!(req_ctr, EXPECTED_REQUEST_COUNTER);
         assert_eq!(plain, hex::decode(EXPECTED_MESSAGE_HEX).unwrap());
     }
@@ -387,19 +426,17 @@ mod tests {
 
         let conf = create_config();
         let session = SessionState {
-            key_id: hex::decode(KEY_ID_HEX).unwrap(),
-            k2_c2s_app_data: vec![], // unused
-            k2_s2c_app_data: hex::decode(S2C_KEY_HEX).unwrap(),
+            key_id: hex::decode(KEY_ID_HEX).unwrap().try_into().unwrap(),
+            k2_c2s_app_data: [0u8; 32], // unused
+            k2_s2c_app_data: hex::decode(S2C_KEY_HEX).unwrap().try_into().unwrap(),
             expires: 0, // unused
             enc_ctr: 0,
         };
 
         let plain = hex::decode(PLAIN_MESSAGE_HEX).unwrap();
 
-        let result = encrypt_response(&conf, &session, REQUEST_COUNTER, &plain);
-        assert!(result.is_ok());
-
-        let crypt = result.unwrap();
+        let mut crypt = vec![0u8; plain.len() + SESSION_OVERHEAD];
+        encrypt_response(&conf, &session, REQUEST_COUNTER, &plain, &mut crypt).unwrap();
         assert!(crypt.starts_with(&hex::decode(EXPECTED_HEADER).unwrap()));
     }
 }

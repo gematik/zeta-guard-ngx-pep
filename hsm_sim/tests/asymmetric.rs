@@ -149,6 +149,67 @@ async fn sign_and_verify_p256() {
     assert!(ecdsa_sig.verify(&digest, &ec_key).unwrap());
 }
 
+async fn sign_and_verify_curve(
+    suffix: &str,
+    digest_alg: openssl::hash::MessageDigest,
+    sig_len: usize,
+) {
+    let mut client = common::hsm_client().await;
+    let key_id = format!("sign-test.{suffix}");
+
+    let pub_resp = client
+        .get_public_key(GetPublicKeyRequest {
+            key_id: key_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    let data = b"hello world";
+    let digest = openssl::hash::hash(digest_alg, data).unwrap();
+
+    let sign_resp = client
+        .sign(SignRequest {
+            key_id: key_id.clone(),
+            data: digest.to_vec(),
+            algorithm: DigestAlgorithm::None.into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(sign_resp.signature.len(), sig_len);
+
+    let half = sig_len / 2;
+    let r = openssl::bn::BigNum::from_slice(&sign_resp.signature[..half]).unwrap();
+    let s = openssl::bn::BigNum::from_slice(&sign_resp.signature[half..]).unwrap();
+    let ecdsa_sig = openssl::ecdsa::EcdsaSig::from_private_components(r, s).unwrap();
+
+    let pkey = openssl::pkey::PKey::public_key_from_der(&pub_resp.public_key_der).unwrap();
+    let ec_key = pkey.ec_key().unwrap();
+    assert!(ecdsa_sig.verify(&digest, &ec_key).unwrap());
+}
+
+#[tokio::test]
+async fn sign_and_verify_p384() {
+    sign_and_verify_curve("p384", openssl::hash::MessageDigest::sha384(), 96).await;
+}
+
+#[tokio::test]
+async fn sign_and_verify_brainpool_p256() {
+    sign_and_verify_curve("bp256", openssl::hash::MessageDigest::sha256(), 64).await;
+}
+
+#[tokio::test]
+async fn sign_and_verify_brainpool_p384() {
+    sign_and_verify_curve("bp384", openssl::hash::MessageDigest::sha384(), 96).await;
+}
+
+#[tokio::test]
+async fn sign_and_verify_brainpool_p512() {
+    sign_and_verify_curve("bp512", openssl::hash::MessageDigest::sha512(), 128).await;
+}
+
 #[tokio::test]
 async fn sign_with_server_side_hashing() {
     let mut client = common::hsm_client().await;

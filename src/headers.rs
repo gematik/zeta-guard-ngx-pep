@@ -42,9 +42,9 @@ pub fn ensure_api_version_header_out<R: RequestOps>(request: &mut R) -> Result<(
 
 pub fn ensure_user_info_header_in<R: RequestOps>(
     request: &mut R,
-    user_info: ZetaUserInfo,
+    user_info: &ZetaUserInfo,
 ) -> Result<()> {
-    request.ensure_header_in("ZETA-User-Info", &to_base64_encoded_json(&user_info)?)
+    request.ensure_header_in("ZETA-User-Info", &to_base64_encoded_json(user_info)?)
 }
 
 pub fn ensure_popp_token_header_in<R: RequestOps>(

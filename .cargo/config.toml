@@ -3,4 +3,4 @@ xtask = "run --manifest-path xtask/Cargo.toml --"
 
 [env]
 NGINX_SOURCE_DIR = { value = ".nginx", relative = true }
-NGINX_VERSION = "1.29.5" # NOTE: keep in sync with .gitlab-ci.yml and Dockerfile
+NGINX_VERSION = "1.29.8" # NOTE: keep in sync with .gitlab-ci.yml and Dockerfile, and with nginx-ingress version (major.minor) in .gitlab-ci.yaml

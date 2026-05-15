@@ -22,191 +22,163 @@
  * #L%
  */
 
+use std::fs;
+use std::path::Path;
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use asl::roots::build_cert_data;
 use asl::{Config, Environment, ToError, generate_asl_keys};
-use der::Encode;
-use der::asn1::OctetString;
-use der::oid::db::rfc5912::ID_SHA_1;
-use sec1::EcPrivateKey;
-use sec1::der::Decode;
-use sec1::pkcs8::PrivateKeyInfo;
-use sha1_smol::Sha1;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-use x509_cert::serial_number::SerialNumber;
-use x509_cert::spki::AlgorithmIdentifierOwned;
-use x509_ocsp::{CertId, OcspRequest, Request, TbsRequest, Version};
-use x509_parser::certificate::X509Certificate;
-use x509_parser::extensions::{GeneralName, ParsedExtension};
-use x509_parser::oid_registry::Oid;
-use x509_parser::oid_registry::asn1_rs::oid;
-use x509_parser::parse_x509_certificate;
-use x509_parser::prelude::{Pem, parse_x509_pem};
-use x509_parser::x509::X509Name;
+use openssl::asn1::Asn1Time;
+use openssl::ec::EcKey;
+use openssl::hash::MessageDigest;
+use openssl::nid::Nid;
+use openssl::ocsp::{OcspCertId, OcspRequest};
+use openssl::pkey::{PKey, Private, Public};
+use openssl::sign::Signer;
+use openssl::x509::{X509, X509NameRef};
+
+use crate::ossl_store;
+
+#[derive(Default)]
+pub struct OcspConfig {
+    pub url: Option<String>,
+    pub ttl: Duration,
+    pub cert_id: Option<OcspCertId>,
+    pub request: Vec<u8>,
+}
+
+#[derive(Default)]
+pub struct AslConfig {
+    pub asl: Config,
+    pub ocsp: OcspConfig,
+}
 
 use crate::conf::OcspMode;
 
-fn load_file(name: &Path) -> Result<Vec<u8>> {
+fn load_file(name: &str) -> Result<Vec<u8>> {
     fs::read(name).context(format!("failed to load asl keys {:?}", &name))
 }
 
-fn load_pem_entry(name: &Path) -> Result<Vec<u8>> {
-    Ok(parse_x509_pem(&load_file(name)?).to_error()?.1.contents)
+fn parse_certificate(name: &str) -> Result<X509> {
+    X509::from_pem(&load_file(name)?).to_error()
 }
 
-fn parse_certificate(der: &[u8]) -> Result<X509Certificate<'_>> {
-    Ok(parse_x509_certificate(der).to_error()?.1)
+fn get_public_key(cert: &X509) -> Result<EcKey<Public>> {
+    let pkey = cert.public_key()?;
+    let ec = pkey.ec_key()?;
+    Ok(ec)
 }
 
-fn load_private_key(blob: &[u8], pubkey: &[u8]) -> Result<Vec<u8>> {
-    let pem = Pem::iter_from_buffer(blob)
-        .filter_map(|entry| entry.ok())
-        .find(|entry| entry.label.contains("PRIVATE KEY"))
-        .context("could not parse ASL private key")?;
+fn load_private_key(name: &str, pubkey: &EcKey<Public>) -> Result<PKey<Private>> {
+    if let Some(stripped) = name.strip_prefix("store:") {
+        return ossl_store::load_pkey(stripped);
+    }
 
-    let ec_pk_bytes: Vec<u8> = match pem.label.as_str() {
-        "EC PRIVATE KEY" => Ok(pem.contents),
-        "PRIVATE KEY" => PrivateKeyInfo::from_der(&pem.contents)
-            .map(|pkcs8| pkcs8.private_key.to_vec())
-            .to_error(),
-        _ => bail!("could not parse ASL private key"), // should not happen with filter above
-    }?;
+    let ec_key =
+        EcKey::private_key_from_pem(&load_file(name)?).context("could not parse ASL signer key")?;
 
-    let ec_key = EcPrivateKey::from_der(&ec_pk_bytes).context("could not parse EC private key")?;
-
-    if let Some(pk) = ec_key.public_key
-        && pk != pubkey
-    {
+    let mut ctx = openssl::bn::BigNumContext::new()?;
+    let points_equal = ec_key
+        .public_key()
+        .eq(ec_key.group(), pubkey.public_key(), &mut ctx)
+        .context("could not compare ASL signer key and certificate")?;
+    if !points_equal {
         bail!("ASL signer key does not match certificate");
     }
 
-    Ok(ec_key.private_key.to_vec())
+    Ok(PKey::from_ec_key(ec_key)?)
 }
 
 #[inline(always)]
-fn get_cn(name: &X509Name) -> Option<String> {
-    name.iter_common_name()
+fn get_cn(name: &X509NameRef) -> Option<String> {
+    name.entries_by_nid(Nid::COMMONNAME)
         .next()
-        .and_then(|entry| entry.as_str().ok())
-        .map(|s| s.to_string())
+        .and_then(|cn| Some(cn.data().as_utf8().ok()?.to_string()))
 }
 
 fn get_cert_info(der: &[u8]) -> Option<(String, String)> {
-    let cert = parse_certificate(der).ok()?;
-    Some((
-        get_cn(&cert.tbs_certificate.subject)?,
-        get_cn(&cert.tbs_certificate.issuer)?,
-    ))
+    let cert = X509::from_der(der).ok()?;
+    Some((get_cn(cert.subject_name())?, get_cn(cert.issuer_name())?))
 }
 
-const AUTHORITY_INFO_ACCESS_OID: Oid = oid! {1.3.6.1.5.5.7.1.1};
-const ACCESS_METHOD_OCSP_OID: Oid = oid! {1.3.6.1.5.5.7.48.1};
-
-fn parse_ocsp_url(cert: &X509Certificate) -> Option<String> {
-    if let Ok(maybe_ext) = cert.get_extension_unique(&AUTHORITY_INFO_ACCESS_OID)
-        && let Some(opt_ext) = maybe_ext
-        && let ParsedExtension::AuthorityInfoAccess(ocsp_ext) = opt_ext.parsed_extension()
-    {
-        return ocsp_ext
-            .accessdescs
+fn parse_ocsp_url(cert: &X509) -> Option<String> {
+    Some(
+        cert.authority_info()?
             .iter()
-            .find(|desc| desc.access_method == ACCESS_METHOD_OCSP_OID)
-            .map(|desc| &desc.access_location)
-            .and_then(|loc| match loc {
-                GeneralName::URI(str) => Some(str.to_string()),
-                _ => None,
-            });
-    }
-    None
+            .find(|ext| ext.method().nid() == Nid::AD_OCSP)?
+            .location()
+            .uri()?
+            .to_string(),
+    )
 }
 
-fn sha1_hash(data: &[u8]) -> Vec<u8> {
-    let mut md = Sha1::new(); // libcrux does not implement SHA1 yet
-    md.update(data);
-    md.digest().bytes().to_vec()
+fn expires_soon(cert: &X509) -> bool {
+    Asn1Time::days_from_now(7)
+        .map(|soon| cert.not_after().lt(&soon))
+        .unwrap_or(false)
 }
 
-fn build_ocsp_request(issuer_name: &X509Name, issuer_key: &[u8], signer_serial: &[u8]) -> Vec<u8> {
-    let issuer_name_hash =
-        OctetString::new(sha1_hash(issuer_name.as_raw())).expect("ocsp issuer name hash");
-    let issuer_key_hash = OctetString::new(sha1_hash(issuer_key)).expect("ocsp issuer key hash");
-    let serial_number = SerialNumber::new(signer_serial).expect("ocsp signer serial number");
-
-    let request = OcspRequest {
-        tbs_request: TbsRequest {
-            version: Version::V1,
-            requestor_name: None,
-            request_list: vec![Request {
-                req_cert: CertId {
-                    hash_algorithm: AlgorithmIdentifierOwned {
-                        oid: ID_SHA_1,
-                        parameters: None,
-                    },
-                    issuer_name_hash,
-                    issuer_key_hash,
-                    serial_number,
-                },
-                single_request_extensions: None,
-            }],
-            request_extensions: None,
-        },
-        optional_signature: None,
-    };
-
-    request.to_der().expect("ocsp request encoding")
+fn ecdsa_sign(signer_pk: &PKey<Private>, data: &[u8]) -> Result<Vec<u8>> {
+    Signer::new(MessageDigest::sha256(), signer_pk)?
+        .sign_oneshot_to_vec(data)
+        .context("ECDSA signature")
 }
 
-const SECONDS_PER_WEEK: f64 = 604800f64;
-fn expires_soon(cert: &X509Certificate) -> bool {
-    cert.tbs_certificate
-        .validity
-        .time_to_expiration()
-        .is_some_and(|expires| expires.as_seconds_f64() < SECONDS_PER_WEEK)
+fn build_ocsp_request(subject: &X509, issuer: &X509) -> Result<(OcspCertId, Vec<u8>)> {
+    // Weirdness since OcspCertId is not cloneable
+    let cert_id1 = OcspCertId::from_cert(MessageDigest::sha1(), subject, issuer)?;
+    let cert_id2 = OcspCertId::from_cert(MessageDigest::sha1(), subject, issuer)?;
+    let mut ocsp_request = OcspRequest::new()?;
+    ocsp_request.add_id(cert_id1)?;
+    Ok((cert_id2, ocsp_request.to_der()?))
 }
 
-pub fn asl_file_path(conf_dir: &Path, maybe_file: &Option<String>) -> Option<PathBuf> {
-    maybe_file.as_ref().map(|file| conf_dir.join(file))
+pub fn asl_file_path(conf_dir: &Path, maybe_file: &Option<String>) -> Option<String> {
+    maybe_file.as_ref().map(|file| {
+        if file.starts_with("store:") {
+            file.to_string()
+        } else {
+            conf_dir.join(file).to_string_lossy().to_string()
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn create_asl_config(
     is_testing: bool,
-    signer_cert_file: Option<PathBuf>,
-    signer_key_file: Option<PathBuf>,
-    ca_cert_file: Option<PathBuf>,
-    roots_file: Option<PathBuf>,
+    signer_cert_file: Option<String>,
+    signer_key_file: Option<String>,
+    ca_cert_file: Option<String>,
+    roots_file: Option<String>,
     rca: Option<String>,
     ocsp_mode: OcspMode,
     ocsp_ttl: Duration,
-) -> Result<Config> {
+) -> Result<AslConfig> {
     if signer_cert_file.is_none()
         && signer_key_file.is_none()
         && ca_cert_file.is_none()
         && roots_file.is_none()
     {
-        return Ok(Config::default());
+        return Ok(AslConfig::default());
     }
     if !(signer_cert_file.is_some()
         && signer_key_file.is_some()
         && ca_cert_file.is_some()
         && roots_file.is_some())
     {
-        anyhow::bail!(
-            "must have either all or none of ASL signer_cert, signer_key, ca_cert, roots_json"
-        );
+        bail!("must have either all or none of ASL signer_cert, signer_key, ca_cert, roots_json");
     }
 
-    let signer_der = load_pem_entry(&signer_cert_file.unwrap())?;
-    let signer = parse_certificate(&signer_der)?;
-    let ca_der = load_pem_entry(&ca_cert_file.unwrap())?;
-    let ca = parse_certificate(&ca_der)?;
+    let signer = parse_certificate(&signer_cert_file.unwrap())?;
+    let signer_der = signer.to_der()?;
+    let ca = parse_certificate(&ca_cert_file.unwrap())?;
+    let ca_der = ca.to_der()?;
 
     if expires_soon(&signer) {
         println!(
             "WARNING, ASL signer certificate expires soon: {}",
-            signer.validity.not_after
+            signer.not_after()
         );
     }
 
@@ -214,12 +186,12 @@ pub fn create_asl_config(
     let cert_data = build_cert_data(&signer_der, &ca_der, &roots_bytes, rca, &get_cert_info)
         .context("failed to build ASL cert data")?;
 
-    let signer_pk = signer.subject_pki.subject_public_key.as_ref();
-    let signer_sk = load_private_key(&load_file(&signer_key_file.unwrap())?, signer_pk)?;
+    let signer_pk = get_public_key(&signer)?;
+    let signer_sk = load_private_key(&signer_key_file.unwrap(), &signer_pk)?;
     let (server_keys, private_keys) =
         generate_asl_keys(30, "").context("failed to generate ASL keys")?;
     let signed_keys = server_keys
-        .sign(&signer_der, &signer_sk, 1)
+        .sign_with(&signer_der, 1, |data| ecdsa_sign(&signer_sk, data))
         .context("failed to sign ASL keys")?;
 
     let asl_env = if is_testing {
@@ -228,27 +200,25 @@ pub fn create_asl_config(
         Environment::Production
     };
 
+    let asl_config = Config::new_with_keys(asl_env, signed_keys, private_keys, cert_data)
+        .context("failed to build ASL configuration")?;
+
     let ocsp_url = match ocsp_mode {
         OcspMode::Disable => None,
         OcspMode::Cert => parse_ocsp_url(&signer),
         OcspMode::Override(uri) => Some(uri.to_string()),
     };
-    let ocsp_request = build_ocsp_request(
-        &ca.subject,
-        ca.subject_pki.subject_public_key.data.as_ref(),
-        signer.raw_serial(),
-    );
+    let (cert_id, ocsp_request) =
+        build_ocsp_request(&signer, &ca).context("failed to generate OCSP request")?;
+    let ocsp_config = OcspConfig {
+        url: ocsp_url,
+        ttl: ocsp_ttl,
+        cert_id: Some(cert_id),
+        request: ocsp_request,
+    };
 
-    let config = Config::new_with_keys(
-        asl_env,
-        signed_keys,
-        private_keys,
-        cert_data,
-        ocsp_url,
-        ocsp_request,
-        ocsp_ttl,
-    )
-    .context("failed to build ASL configuration")?;
-
-    Ok(config)
+    Ok(AslConfig {
+        asl: asl_config,
+        ocsp: ocsp_config,
+    })
 }

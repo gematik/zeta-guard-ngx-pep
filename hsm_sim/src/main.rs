@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use tokio::signal::unix::SignalKind;
 use tonic::transport::Server;
 
 use hsm_sim::proto::hsm_proxy_service_server::HsmProxyServiceServer;
@@ -41,6 +42,14 @@ struct Cli {
     /// gRPC listen address
     #[arg(long, default_value = "[::1]:50051")]
     listen: String,
+}
+
+async fn termination_signal() -> std::io::Result<()> {
+    let mut term = tokio::signal::unix::signal(SignalKind::terminate())?;
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => r,
+        _ = term.recv() => Ok(()),
+    }
 }
 
 #[tokio::main]
@@ -84,18 +93,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_serving::<HsmProxyServiceServer<HsmProxyServiceImpl>>()
         .await;
 
-    Server::builder()
+    let server = Server::builder()
         .add_service(health_service)
         .add_service(reflection)
         .add_service(HsmProxyServiceServer::new(service))
         .serve_with_shutdown(addr, async {
-            tokio::signal::ctrl_c().await.ok();
-            eprintln!("[hsm_sim] Shutting down (2s grace period)");
-            // Give in-flight RPCs time to finish, then exit even if clients
-            // (e.g. k8s health probes) keep connections open.
+            termination_signal().await.ok();
+            eprintln!("[hsm_sim] shutting down…");
+        });
+
+    // serve_with_shutdown can hang due to ”half-dead” clients, e.g. when ossl_hsm connected
+    // pre-fork, and didn't reconnect yet.
+    tokio::select! {
+        res = server => res?,
+        _ = async {
+            termination_signal().await.ok();
+            // allow in-flight rpcs to finish. exits promptly when server future completes (select!)
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        })
-        .await?;
+        } => {}
+    }
 
     Ok(())
 }

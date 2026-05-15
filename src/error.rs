@@ -46,10 +46,31 @@ pub enum ZetaError {
     DPoP(#[source] anyhow::Error),
     #[error("PoPP error: {0}")]
     PoPP(#[source] anyhow::Error),
+    #[error("PoPP header missing")]
+    PoPPMissing,
+    #[error("PoPP actorId mismatch: want {access_token_sub}, got {actor_id}")]
+    PoPPInvalidActor {
+        access_token_sub: String,
+        actor_id: String,
+    },
     #[error("Impossible Travel: {0}")]
     ImpossibleTravel(#[source] anyhow::Error),
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
+}
+
+#[macro_export]
+macro_rules! zeta_anyhow {
+    ( $type: ident, $($arg:tt)+ ) => {
+        $crate::error::ZetaError::$type(anyhow::anyhow!($($arg)+))
+    };
+}
+
+#[macro_export]
+macro_rules! zeta_bail {
+    ( $type: ident, $($arg:tt)+ ) => {
+        return Err($crate::zeta_anyhow!($type, $($arg)+))
+    };
 }
 
 impl ZetaError {
@@ -59,6 +80,8 @@ impl ZetaError {
             Self::AccessTokenInvalid(_) => 401,
             Self::DPoP(_) => 401,
             Self::PoPP(_) => 403,
+            Self::PoPPMissing => 400,
+            Self::PoPPInvalidActor { .. } => 403,
             Self::ImpossibleTravel(_) => 401,
             Self::Internal(_) => 500,
         }

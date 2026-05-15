@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "asl"
-version = "0.5.1"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -152,7 +152,6 @@ dependencies = [
  "serde_bytes",
  "serde_cbor",
  "serde_json",
- "sha1_smol",
  "thiserror",
  "uuid",
  "x509-parser 0.17.0",
@@ -1283,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "hsm_sim"
-version = "0.5.1"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2101,9 +2100,9 @@ dependencies = [
 
 [[package]]
 name = "ngx-tickle"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76232145196736fdace52aca5117c94e27c9f9c53c37050524df76ed6a672f6e"
+checksum = "e9e333e5e7caf5f3fbc5f5662c3737266eb5ee031a416c5b1758308860bfb339"
 dependencies = [
  "anyhow",
  "async-task",
@@ -2118,7 +2117,7 @@ dependencies = [
 
 [[package]]
 name = "ngx_pep"
-version = "0.5.1"
+version = "1.0.1"
 dependencies = [
  "ambassador",
  "anyhow",
@@ -2130,6 +2129,7 @@ dependencies = [
  "const-oid",
  "der",
  "fastrand",
+ "foreign-types",
  "futures",
  "hex",
  "hsm_sim",
@@ -2146,6 +2146,7 @@ dependencies = [
  "ngx-tickle",
  "ngx_pep",
  "openssl",
+ "openssl-sys",
  "p12-keystore",
  "p256",
  "prettyplease",
@@ -2153,13 +2154,11 @@ dependencies = [
  "rstest",
  "scc 3.6.10",
  "schemars",
- "sec1",
  "serde",
  "serde_cbor",
  "serde_json",
  "serde_yaml_ng",
  "serial_test",
- "sha1_smol",
  "sha2",
  "strum",
  "syn",
@@ -2388,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "ossl_hsm"
-version = "0.5.1"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -2841,7 +2840,7 @@ dependencies = [
 
 [[package]]
 name = "purl"
-version = "0.5.1"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "argp",
@@ -3574,12 +3573,6 @@ dependencies = [
  "cpufeatures 0.2.17",
  "digest",
 ]
-
-[[package]]
-name = "sha1_smol"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"

@@ -46,7 +46,7 @@ pub async fn read_request_body(
     }
     .await;
 
-    let body = try_join_all(bufs.iter().map(|buf| buf.read()))
+    let result = try_join_all(bufs.iter().map(|buf| buf.read()))
         .await
         .map(|chunks| {
             let total: usize = chunks.iter().map(|c| c.len()).sum();
@@ -55,9 +55,12 @@ pub async fn read_request_body(
                 out.extend_from_slice(&c);
             }
             out
-        })?;
-
-    Ok(Ok(body))
+        });
+    unsafe {
+        // dec request count bumped by ngx_http_read_client_request_body, after copying the bufs
+        ngx_http_finalize_request(request.into(), Status::NGX_OK.0);
+    }
+    Ok(Ok(result?))
 }
 
 fn read_client_request_body<'a>(
@@ -129,9 +132,5 @@ extern "C" fn client_request_body_handler(request: *mut ngx_http_request_t) {
 
     if let Some(waker) = ctx.body.waker.borrow_mut().take() {
         waker.wake();
-    }
-    unsafe {
-        // dec request count bumped by ngx_http_read_client_request_body
-        ngx_http_finalize_request(request, Status::NGX_OK.0);
     }
 }

@@ -29,9 +29,10 @@ use std::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
 use std::ptr;
 
 use nginx_sys::{
-    ngx_chain_t, ngx_conf_t, ngx_http_client_body_handler_pt, ngx_http_compile_complex_value_t,
-    ngx_http_complex_value_t, ngx_http_request_t, ngx_int_t, ngx_pool_t, ngx_rbtree_node_t,
-    ngx_rbtree_t, ngx_shm_zone_t, ngx_shmtx_t, ngx_slab_pool_t, ngx_str_t,
+    ngx_chain_t, ngx_conf_t, ngx_connection_t, ngx_http_client_body_handler_pt,
+    ngx_http_compile_complex_value_t, ngx_http_complex_value_t, ngx_http_request_t, ngx_int_t,
+    ngx_pool_t, ngx_rbtree_node_t, ngx_rbtree_t, ngx_shm_zone_t, ngx_shmtx_t, ngx_slab_pool_t,
+    ngx_str_t,
 };
 
 #[unsafe(no_mangle)]
@@ -235,3 +236,6 @@ pub unsafe extern "C" fn ngx_http_complex_value(
 ) -> ngx_int_t {
     0
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ngx_http_run_posted_requests(c: *mut ngx_connection_t) {}

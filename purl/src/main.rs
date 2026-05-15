@@ -25,8 +25,9 @@
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use argp::{FromArgs, parse_args_or_exit};
 use base64ct::{Base64UrlUnpadded, Encoding};
 use futures::channel::mpsc::channel;
@@ -34,8 +35,8 @@ use futures::{SinkExt, StreamExt};
 use http::Method;
 use ngx_pep::client::asl::{asl_handshake, asl_request, encode_http_request};
 use ngx_pep::client::{
-    ClientRegistration, create_dpop_proof, create_smcb_token, exchange_access_token, get_nonce,
-    register_client,
+    ClientRegistration, create_dpop_proof, create_popp_token, create_smcb_token,
+    exchange_access_token, get_nonce, get_with_dpop, insecure_access_token_sub, register_client,
 };
 use reqwest::{Client, ClientBuilder, Url};
 use sha2::{Digest, Sha256};
@@ -51,6 +52,7 @@ mod typify {
 enum Subcommand {
     Curl(Curl),
     Asl(Asl),
+    Bench(Bench),
 }
 
 /// cli args
@@ -63,6 +65,18 @@ struct Args {
     /// password for pkcs12 keystore — env: PURL_P12_PASS
     #[argp(option, short = 'w')]
     p12_pass: Option<String>,
+
+    /// path to pkcs12 keystore to sign popp token with — env: PURL_POPP_P12
+    #[argp(option, short = 'P')]
+    popp_p12: Option<String>,
+
+    /// password for popp pkcs12 keystore — env: PURL_POPP_P12_PASS
+    #[argp(option, short = 'W')]
+    popp_p12_pass: Option<String>,
+
+    /// alias in popp pkcs12 keystore — env: PURL_POPP_P12_ALIAS
+    #[argp(option, short = 'A', default = "\"alias\".to_string()")]
+    popp_p12_alias: String,
 
     /// authserver base url, e.g. https://zeta-dev…/auth/ — env: PURL_AUTH
     #[argp(option, short = 'a')]
@@ -92,6 +106,26 @@ impl Args {
     fn p12_pass(&self) -> String {
         std::env::var("PURL_P12_PASS")
             .unwrap_or_else(|_| self.p12_pass.clone().expect("require -w or PURL_P12_PASS"))
+    }
+
+    pub fn popp_p12(&self) -> PathBuf {
+        Path::new(
+            &std::env::var("PURL_POPP_P12")
+                .unwrap_or_else(|_| self.popp_p12.clone().expect("require -P or PURL_POPP_P12")),
+        )
+        .to_path_buf()
+    }
+
+    pub fn popp_p12_pass(&self) -> String {
+        std::env::var("PURL_POPP_P12_PASS").unwrap_or_else(|_| {
+            self.popp_p12_pass
+                .clone()
+                .expect("require -W or PURL_POPP_P12_PASS")
+        })
+    }
+
+    pub fn popp_p12_alias(&self) -> String {
+        std::env::var("PURL_POPP_P12_ALIAS").unwrap_or(self.popp_p12_alias.clone())
     }
 
     fn auth(&self) -> String {
@@ -158,6 +192,14 @@ struct Asl {
     /// asl target *without* /ASL, e.g.  https://zeta-dev…
     #[argp(positional)]
     target: String,
+
+    /// number of concurrent tasks for the benchmark
+    #[argp(option, short = 'T', default = "16")]
+    n_tasks: u16,
+
+    /// number of inner requests per cycle
+    #[argp(option, short = 'N', default = "10")]
+    n_messages: u16,
 }
 
 impl Asl {
@@ -191,7 +233,7 @@ where
                 match f().await {
                     Ok(times) => tx.send(Some(times)).await.expect("send"),
                     Err(_e) => {
-                        // println!("{e}");
+                        // println!("{_e:?}");
                         tx.send(None).await.expect("send")
                     }
                 };
@@ -240,12 +282,12 @@ async fn asl(
     client: Client,
     access_token: &str,
 ) -> Result<()> {
-    const N_TASKS: usize = 10;
-    const N_MESSAGES: usize = 10;
-
     let access_token = access_token.to_string();
+    let n_tasks = cmd.n_tasks;
+    let n_messages = cmd.n_messages;
     let cmd = cmd.clone();
     let registration = registration.clone();
+
     benchmark(
         move || async move {
             let mut times = vec![];
@@ -257,6 +299,7 @@ async fn asl(
                 &access_token,
             )
             .await?;
+
             times.push(Instant::now().duration_since(start).as_secs_f32());
 
             let inner = encode_http_request(
@@ -270,9 +313,10 @@ async fn asl(
                 None,
             )?;
 
-            for req_ctr in 0..N_MESSAGES {
+            for req_ctr in 0..n_messages {
                 start = Instant::now();
-                let _ = asl_request(
+
+                asl_request(
                     &registration,
                     client.clone(),
                     &access_token,
@@ -284,12 +328,13 @@ async fn asl(
                     None,
                 )
                 .await?;
+
                 times.push(Instant::now().duration_since(start).as_secs_f32());
             }
 
             Ok(times)
         },
-        N_TASKS,
+        n_tasks.into(),
     )
     .await;
     Ok(())
@@ -327,7 +372,113 @@ async fn curl(
     Err(Command::new("curl").args(&curl_args).exec())?
 }
 
-#[tokio::main(worker_threads = 8)]
+/// Benchmark GET via reqwest with optional PoPP
+#[derive(FromArgs, PartialEq, Debug, Clone)]
+#[argp(subcommand, name = "bench")]
+struct Bench {
+    /// request method
+    #[argp(option, short = 'X', default = "\"GET\".to_string()")]
+    request: String,
+
+    /// pass PoPP
+    #[argp(switch)]
+    popp: bool,
+
+    /// PoPP: override actorId claim
+    #[argp(option)]
+    popp_actor_id_override: Option<String>,
+
+    /// expect response status, 0: any
+    #[argp(option, default = "0")]
+    expect_status: u16,
+
+    /// number of concurrent tasks for the benchmark
+    #[argp(option, short = 'T', default = "16")]
+    n_tasks: u16,
+
+    /// target, e.g. https://zeta-dev…/proxy/hellozeta
+    #[argp(positional)]
+    target: String,
+}
+
+impl Bench {
+    pub fn target_url(&self) -> Result<Url> {
+        self.target.parse().context("unable to parse target URL")
+    }
+}
+
+async fn bench(
+    cmd: &Bench,
+    registration: &ClientRegistration,
+    client: Client,
+    access_token: &str,
+    p12_path: &Path,
+    p12_pass: &str,
+    p12_alias: &str,
+) -> Result<()> {
+    let access_token = access_token.to_string();
+    let registration = registration.clone();
+    let popp = match cmd.popp {
+        true => {
+            let start = SystemTime::now();
+            let now = start
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_secs();
+            let actor_id = cmd
+                .popp_actor_id_override
+                .clone()
+                .unwrap_or_else(|| insecure_access_token_sub(&access_token).unwrap());
+            Some(create_popp_token(&actor_id, p12_path, p12_pass, p12_alias, now, now).await?)
+        }
+        false => None,
+    };
+    let client = client.clone();
+    let target = cmd.target_url()?.clone();
+    let expect_status = cmd.expect_status;
+    benchmark(
+        move || async move {
+            let mut times = vec![];
+            let start = Instant::now();
+            let mut request = get_with_dpop(&registration, client, &access_token, target)?;
+            if let Some(popp) = popp {
+                request = request.header("popp", popp);
+            };
+            match request.send().await {
+                Ok(response) => {
+                    if expect_status != 0 && response.status() != expect_status {
+                        println!(
+                            "unespected status; want={expect_status}, got={}",
+                            response.status()
+                        );
+                        bail!(
+                            "unespected status; want={expect_status}, got={}",
+                            response.status()
+                        );
+                    }
+                }
+                Err(e) => {
+                    if expect_status != 0
+                        && let Some(status) = e.status()
+                        && status != expect_status
+                    {
+                        println!("{e}");
+                        bail!("{e}");
+                    }
+                }
+            }
+
+            times.push(Instant::now().duration_since(start).as_secs_f32());
+
+            Ok(times)
+        },
+        cmd.n_tasks.into(),
+    )
+    .await;
+    Ok(())
+}
+
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args: Args = parse_args_or_exit(argp::DEFAULT);
     let client: Client = ClientBuilder::new()
@@ -354,8 +505,21 @@ async fn main() -> Result<()> {
         &client,
     )
     .await?;
+
     match &args.command {
         Subcommand::Curl(cmd) => curl(&args, cmd, &registration, &access_token).await,
         Subcommand::Asl(cmd) => asl(cmd, &registration, client, &access_token).await,
+        Subcommand::Bench(cmd) => {
+            bench(
+                cmd,
+                &registration,
+                client,
+                &access_token,
+                &args.popp_p12(),
+                &args.popp_p12_pass(),
+                &args.popp_p12_alias(),
+            )
+            .await
+        }
     }
 }

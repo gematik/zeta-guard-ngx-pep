@@ -46,6 +46,9 @@ tests() {
 		# shellcheck disable=SC1091
 		. /usr/local/share/cov-env
 
+		# test.log might contain output from previous runs (cache)
+		printf "" >prefix/test.log
+
 		cargo nextest run --workspace ${NEXTEST_FILTERSET:+--filterset "$NEXTEST_FILTERSET"}
 		local result=$?
 

@@ -28,7 +28,6 @@ use asl::{
     client::{self, raw_keys_from_bytes},
     decrypt_request, encrypt_response, finish_handshake, generate_asl_keys, initiate_handshake,
 };
-use std::time::Duration;
 
 #[test]
 fn it_performs_roundtrip() {
@@ -57,17 +56,8 @@ fn it_performs_roundtrip() {
         ca: vec![],
         rca_chain: vec![],
     };
-    let ocsp_url = Some("https://ocsp2.example.org/".to_string());
-    let server_config = Config::new_with_keys(
-        Environment::Testing,
-        signed_keys,
-        private_keys,
-        cert_data,
-        ocsp_url,
-        vec![],
-        Duration::from_mins(5),
-    )
-    .unwrap();
+    let server_config =
+        Config::new_with_keys(Environment::Testing, signed_keys, private_keys, cert_data).unwrap();
     let server_cache = MemorySessionCache::new();
 
     // Step 1: Client initiates Handshake with M1 to generic /ASL endpoint
@@ -117,14 +107,14 @@ fn it_performs_roundtrip() {
     let maybe_client_session = client::finish_handshake(client_continuation, &m4);
     assert!(maybe_client_session.is_ok());
     let mut client_session = maybe_client_session.unwrap();
-    println!("key_id: {}", hex::encode(&client_session.key_id));
+    println!("key_id: {}", hex::encode(client_session.key_id));
     println!(
         "k2_c2s_app_data: {}",
-        hex::encode(&client_session.k2_c2s_app_data)
+        hex::encode(client_session.k2_c2s_app_data)
     );
     println!(
         "k2_s2_s2c_app_data: {}",
-        hex::encode(&client_session.k2_s2c_app_data)
+        hex::encode(client_session.k2_s2c_app_data)
     );
 
     // Step 6: Client sends a request to the server at endpoint from ZETA-ASL-CID header

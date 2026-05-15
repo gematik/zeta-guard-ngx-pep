@@ -4,3 +4,35 @@
 # - Keep the expiry 1 week before the next planned release
 # - If it is determined that we are unaffected please make use of vulnerabilites.openvex.json
 ###############################################
+
+# bsdutils, libblkid1, libmount1, libsmartcols1, login, mount  - util-linux: TOCTOU in the mount program when setting up loop devices
+CVE-2026-27456 exp:2026-05-10
+
+libc-bin, libc6 - glibc: glibc: Incorrect DNS response parsing via crafted DNS server response
+CVE-2026-4437 exp:2026-05-10
+
+libc-bin, libc6 - glibc: glibc: glibc: glibc: Invalid DNS hostname returned via gethostbyaddr functions
+CVE-2026-4438 exp:2026-05-10
+
+libc-bin, libc6 - glibc: glibc: Heap Buffer Overflow in `scanf` with `%mc` format specifier and...
+CVE-2026-5450 exp:2026-05-10
+
+libc-bin, libc6 - glibc: glibc: Information disclosure or denial of service via ungetwc function with...
+CVE-2026-5928 exp:2026-05-10
+
+liblzma5 - z: XZ Utils: Denial of Service via buffer overflow in index decoding...
+CVE-2026-34743 exp:2026-05-10
+
+libsystemd0 - systemd: systemd: Arbitrary code execution or Denial of Service via spurious IPC...
+CVE-2026-29111 exp:2026-05-10
+CVE-2026-40225 exp:2026-05-10
+CVE-2026-40226 exp:2026-05-10
+
+libtinfo6 - ncurses: ncurses: Buffer overflow vulnerability may lead to arbitrary code execution.
+CVE-2025-69720 exp:2026-05-10
+
+tar - tar: tar: Hidden file injection via crafted archives
+CVE-2026-5704 exp:2026-05-10
+
+zlib1g - zlib: zlib: Denial of Service via infinite loop in CRC32 combine functions...
+CVE-2026-27171 exp:2026-05-10

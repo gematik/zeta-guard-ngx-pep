@@ -26,7 +26,6 @@ use super::model::*;
 use super::util::*;
 use anyhow::anyhow;
 use serde::Serialize;
-use std::time::Duration;
 
 const EXPIRES_AFTER_SECONDS: u64 = 24 * 60 * 60;
 
@@ -36,9 +35,6 @@ pub struct Config {
     pub signed_keys: SignedAslKeys,
     pub sk: PrivateKeys,
     pub cert_data: CertData,
-    pub ocsp_url: Option<String>,
-    pub ocsp_request: Vec<u8>,
-    pub ocsp_ttl: Duration,
 }
 
 impl Config {
@@ -47,18 +43,12 @@ impl Config {
         signed_keys: SignedAslKeys,
         private_keys: AslPrivateKeys,
         cert_data: CertData,
-        ocsp_url: Option<String>,
-        ocsp_request: Vec<u8>,
-        ocsp_ttl: Duration,
     ) -> Result<Self, AslError> {
         Ok(Config {
             env,
             signed_keys,
             sk: PrivateKeys::try_from(&private_keys)?,
             cert_data,
-            ocsp_url,
-            ocsp_request,
-            ocsp_ttl,
         })
     }
 
@@ -303,9 +293,6 @@ mod tests {
             signed_keys,
             sk,
             cert_data,
-            ocsp_url: None,
-            ocsp_request: vec![],
-            ocsp_ttl: Duration::from_mins(5),
         }
     }
 
@@ -314,7 +301,6 @@ mod tests {
         let conf = Config::default();
         assert_eq!(conf.env, Environment::Production);
         assert_eq!(conf.signed_keys.cdv, 0);
-        assert_eq!(conf.ocsp_url, None);
         assert!(conf.is_default());
     }
 

@@ -44,7 +44,7 @@ pub mod proto {
 
 use proto::hsm_proxy_service_server::HsmProxyService;
 use proto::{
-    DecryptRequest, DecryptResponse, DigestAlgorithm, EccCurve, EncryptRequest, EncryptResponse,
+    DecryptRequest, DecryptResponse, DigestAlgorithm, EncryptRequest, EncryptResponse,
     GetCertificateRequest, GetCertificateResponse, GetPublicKeyRequest, GetPublicKeyResponse,
     HealthCheckRequest, HealthCheckResponse, SignRequest, SignResponse,
     SymmetricEncryptionAlgorithm, health_check_response::ServingStatus,
@@ -85,22 +85,74 @@ impl CertAuthority {
 // HKDF-based EC key derivation
 // =============================================================================
 
-fn parse_curve(key_id: &str) -> Result<(Nid, EccCurve, usize), Status> {
-    if key_id.ends_with(".p256") {
-        Ok((Nid::X9_62_PRIME256V1, EccCurve::NistP256, 32))
-    } else if key_id.ends_with(".p384") {
-        Ok((Nid::SECP384R1, EccCurve::NistP384, 48))
-    } else if key_id.ends_with(".p521") {
-        Ok((Nid::SECP521R1, EccCurve::NistP521, 66))
-    } else {
-        Err(Status::invalid_argument(
-            "key_id must end with .p256, .p384, or .p521",
-        ))
+/// EC curves the simulator can derive keys for.
+///
+/// The set tracks the provider's supported curves (gemSpec_Krypt A_28868):
+/// P-256/P-384 (MUSS) and brainpoolP{256,384,512}r1 (KÖNNEN). Suffix parsing
+/// is purely a sim convenience so HKDF can pick a curve deterministically;
+/// real HSMs use opaque key IDs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Curve {
+    NistP256,
+    NistP384,
+    BrainpoolP256,
+    BrainpoolP384,
+    BrainpoolP512,
+}
+
+impl Curve {
+    fn from_key_id(key_id: &str) -> Result<Self, Status> {
+        if key_id.ends_with(".p256") {
+            Ok(Self::NistP256)
+        } else if key_id.ends_with(".p384") {
+            Ok(Self::NistP384)
+        } else if key_id.ends_with(".bp256") {
+            Ok(Self::BrainpoolP256)
+        } else if key_id.ends_with(".bp384") {
+            Ok(Self::BrainpoolP384)
+        } else if key_id.ends_with(".bp512") {
+            Ok(Self::BrainpoolP512)
+        } else {
+            Err(Status::invalid_argument(
+                "key_id must end with .p256, .p384, .bp256, .bp384, or .bp512",
+            ))
+        }
+    }
+
+    fn nid(self) -> Nid {
+        match self {
+            Self::NistP256 => Nid::X9_62_PRIME256V1,
+            Self::NistP384 => Nid::SECP384R1,
+            Self::BrainpoolP256 => Nid::BRAINPOOL_P256R1,
+            Self::BrainpoolP384 => Nid::BRAINPOOL_P384R1,
+            Self::BrainpoolP512 => Nid::BRAINPOOL_P512R1,
+        }
+    }
+
+    /// Field/coordinate/scalar size in bytes. For these curves (no P-521) the
+    /// scalar, the r/s components, and the matching SHA-2 digest all share
+    /// this length, so one accessor covers all three.
+    fn byte_len(self) -> usize {
+        match self {
+            Self::NistP256 | Self::BrainpoolP256 => 32,
+            Self::NistP384 | Self::BrainpoolP384 => 48,
+            Self::BrainpoolP512 => 64,
+        }
+    }
+
+    /// JWK "crv" name per RFC 7518 §6.2.1.1 (NIST) and RFC 8812 §3 (brainpool).
+    fn jwk_name(self) -> &'static str {
+        match self {
+            Self::NistP256 => "P-256",
+            Self::NistP384 => "P-384",
+            Self::BrainpoolP256 => "brainpoolP256",
+            Self::BrainpoolP384 => "brainpoolP384",
+            Self::BrainpoolP512 => "brainpoolP512",
+        }
     }
 }
 
 /// Derive a deterministic EC private key from a key_id via HKDF-SHA256.
-/// The curve is parsed from the key_id suffix (.p256, .p384, .p521).
 fn derive_ec_key(key_id: &str, nid: Nid, scalar_len: usize) -> Result<EcKey<Private>> {
     let mut raw = vec![0u8; scalar_len];
     openssl::kdf::hkdf(
@@ -257,8 +309,8 @@ impl CacheDir {
     }
 
     /// Load or derive+cache an EC key.
-    async fn ec_key(&self, key_id: &str) -> Result<(EcKey<Private>, EccCurve), Status> {
-        let (nid, curve, scalar_len) = parse_curve(key_id)?;
+    async fn ec_key(&self, key_id: &str) -> Result<(EcKey<Private>, Curve), Status> {
+        let curve = Curve::from_key_id(key_id)?;
         let file = format!("{key_id}.key.pem");
 
         if let Some(pem) = self.read(&file).await {
@@ -275,7 +327,7 @@ impl CacheDir {
         let kid = key_id.to_string();
         let (ec_key, pem) =
             tokio::task::spawn_blocking(move || -> Result<(EcKey<Private>, Vec<u8>)> {
-                let ec_key = derive_ec_key(&kid, nid, scalar_len)?;
+                let ec_key = derive_ec_key(&kid, curve.nid(), curve.byte_len())?;
                 let pkey = PKey::from_ec_key(ec_key.clone()).context("PKey")?;
                 let pem = pkey.private_key_to_pem_pkcs8().context("PEM encode")?;
                 Ok((ec_key, pem))
@@ -374,12 +426,7 @@ impl HsmProxyService for HsmProxyServiceImpl {
         let signature = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
             let digest = match digest_algorithm {
                 DigestAlgorithm::None => {
-                    let expected_len = match curve {
-                        EccCurve::NistP256 => 32,
-                        EccCurve::NistP384 => 48,
-                        EccCurve::NistP521 => 64,
-                        _ => anyhow::bail!("Unsupported curve"),
-                    };
+                    let expected_len = curve.byte_len();
                     anyhow::ensure!(
                         req.data.len() == expected_len,
                         "Pre-hashed data must be {expected_len} bytes for {curve:?}, got {}",
@@ -405,13 +452,7 @@ impl HsmProxyService for HsmProxyServiceImpl {
             let r = ecdsa_sig.r().to_vec();
             let s = ecdsa_sig.s().to_vec();
 
-            let component_len = match curve {
-                EccCurve::NistP256 => 32,
-                EccCurve::NistP384 => 48,
-                EccCurve::NistP521 => 66,
-                _ => anyhow::bail!("Unsupported curve"),
-            };
-
+            let component_len = curve.byte_len();
             let mut signature = vec![0u8; component_len * 2];
             let r_offset = component_len - r.len();
             let s_offset = component_len - s.len();
@@ -461,13 +502,8 @@ impl HsmProxyService for HsmProxyServiceImpl {
                 )
                 .context("EC point encode")?;
 
-            let (crv, coord_len) = match curve {
-                EccCurve::NistP256 => ("P-256", 32),
-                EccCurve::NistP384 => ("P-384", 48),
-                EccCurve::NistP521 => ("P-521", 66),
-                _ => anyhow::bail!("Unsupported curve"),
-            };
-
+            let crv = curve.jwk_name();
+            let coord_len = curve.byte_len();
             let x = &pub_bytes[1..1 + coord_len];
             let y = &pub_bytes[1 + coord_len..1 + 2 * coord_len];
 

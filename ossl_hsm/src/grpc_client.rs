@@ -90,6 +90,11 @@ impl RuntimeState {
             .block_on(
                 Channel::builder(uri)
                     .connect_timeout(std::time::Duration::from_secs(5))
+                    // HTTP/2 keepalive: prevent idle connections from being silently
+                    // dropped by iptables/load-balancers/conntrack/middleboxes …
+                    .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+                    .keep_alive_timeout(std::time::Duration::from_secs(10))
+                    .keep_alive_while_idle(true)
                     .connect(),
             )
             .context("connect")?;
@@ -133,56 +138,84 @@ pub fn init() {
     });
 }
 
-/// Execute a gRPC call, reconnecting if needed (e.g. after nginx fork).
-fn with_client<F, T>(f: F) -> Result<T, String>
+/// Execute a gRPC call, reconnecting if needed.
+///
+/// Reconnects happen on:
+/// - first call (cold cache),
+/// - PID mismatch (post-fork in nginx workers),
+/// - any error from `f` (transport break, server restart, idle conn reaped).
+///
+/// On `f` error, drops the cached runtime and retries once; if that fails too,
+/// the error is returned and the next call will reconnect again. So a worker
+/// recovers as soon as the server is reachable, driven by sign traffic.
+fn with_client<F, T>(mut f: F) -> Result<T, String>
 where
-    F: FnOnce(&mut RuntimeState) -> Result<T, String>,
+    F: FnMut(&mut RuntimeState) -> Result<T, String>,
 {
-    let mut state = client_state()?
-        .lock()
-        .map_err(|e| format!("Lock error: {}", e))?;
+    const MAX_ATTEMPTS: usize = 2;
+    let mut last_err = String::from("with_client: no attempts made");
+    for attempt in 1..=MAX_ATTEMPTS {
+        let mut state = client_state()?
+            .lock()
+            .map_err(|e| format!("Lock error: {e}"))?;
 
-    let current_pid = std::process::id();
-    let need_reconnect = state.rt.as_ref().is_none_or(|rt| rt.pid != current_pid);
+        let current_pid = std::process::id();
+        let need_reconnect = state.rt.as_ref().is_none_or(|rt| rt.pid != current_pid);
+        if need_reconnect {
+            match RuntimeState::connect(state.uri.clone()) {
+                Ok(rt) => {
+                    state.rt = Some(rt);
+                }
+                Err(e) => {
+                    last_err = format!("reconnect (attempt {attempt}/{MAX_ATTEMPTS}): {e}");
+                    eprintln!("[ossl_hsm] {last_err}");
+                    continue;
+                }
+            }
+        }
 
-    if need_reconnect {
-        let rt = RuntimeState::connect(state.uri.clone())
-            .map_err(|e| format!("during reconnect: {e}"))?;
-        state.rt.replace(rt);
+        let state = &mut *state;
+        match f(state.rt.as_mut().unwrap()) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last_err = e;
+                eprintln!(
+                    "[ossl_hsm] gRPC call failed (attempt {attempt}/{MAX_ATTEMPTS}): {last_err}; \
+                     dropping cached connection"
+                );
+                state.rt = None;
+            }
+        }
     }
-
-    let state = &mut *state;
-    f(state.rt.as_mut().unwrap())
+    Err(last_err)
 }
 
 /// Sign data via the gRPC server. Returns IEEE P1363 signature bytes.
 pub fn sign(key_id: &str, digest: &[u8]) -> Result<Vec<u8>, String> {
-    let request = SignRequest {
-        key_id: key_id.to_string(),
-        data: digest.to_vec(),
-        algorithm: DigestAlgorithm::None as i32, // provider already hashed
-    };
-
     with_client(|rt| {
+        let request = SignRequest {
+            key_id: key_id.to_string(),
+            data: digest.to_vec(),
+            algorithm: DigestAlgorithm::None as i32, // provider already hashed
+        };
         let response = rt
             .runtime
             .block_on(rt.client.sign(request))
-            .map_err(|e| format!("gRPC Sign error: {}", e))?;
+            .map_err(|e| format!("gRPC Sign error: {e}"))?;
         Ok(response.into_inner().signature)
     })
 }
 
 /// Get the public key PEM via the gRPC server.
 pub fn get_public_key(key_id: &str) -> Result<PublicKeyInfo, String> {
-    let request = GetPublicKeyRequest {
-        key_id: key_id.to_string(),
-    };
-
     with_client(|rt| {
+        let request = GetPublicKeyRequest {
+            key_id: key_id.to_string(),
+        };
         let response = rt
             .runtime
             .block_on(rt.client.get_public_key(request))
-            .map_err(|e| format!("gRPC GetPublicKey error: {}", e))?;
+            .map_err(|e| format!("gRPC GetPublicKey error: {e}"))?;
         let resp = response.into_inner();
         Ok(PublicKeyInfo {
             pem: resp.public_key_pem,

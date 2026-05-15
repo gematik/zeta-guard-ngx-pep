@@ -45,15 +45,17 @@ A nginx source tree is required to build the module, and to run the integration 
 The `NGINX_VERSION` is configured in `.cargo/config.toml`, but an exported env variable
 can override it.
 
-> [!IMPORTANT]  
+> [!IMPORTANT]
 > Once initially, and for every `NGINX_VERSION` change, `cargo xtask configure` must be
 > run. This fetches tarballs into `.nginx-cache`, verifies signatures, and configures the
 > source tree in `.nginx`. This is built automatically and installed into `./prefix` by
 > `build.rs`.
 
-> [!IMPORTANT]  
-> The current `NGINX_VERSION` is mentioned in `Dockerfile` (for the local docker build),
-> and `.gitlab-ci` for the base images. Keep in sync with `.cargo/config.toml`!
+> [!IMPORTANT]
+> The current `NGINX_VERSION` is mentioned in `Dockerfile`, `.cargo/config.toml`, and
+> `.gitlab-ci.yml`. Keep in sync!
+> Additionally, major.minor (e.g. 1.29.x) should match the nginx version used in the
+> nginx-ingress base image in `.gitlab-ci.yml`.
 
 `prefix` is set as nginx' prefix, so most paths are relative to that directory,
 e.g.:
@@ -244,6 +246,85 @@ grpcurl -plaintext -d '{"key_id": "tls.p256"}' \
   '[::1]:50051' gematik.zetaguard.hsmproxy.v1.HsmProxyService/GetCertificate \
   | jq -r .certificatePem > prefix/conf/tls.p256.pem
 ```
+
+## nginx-ingress with ossl_hsm support
+
+To build a `nginx/nginx-ingress` container with installed ossl_hsm provider, you can use:
+
+```sh
+docker buildx build -t nginx-ingress:local --target nginx-ingress .
+```
+
+You can then use the `store:hsm:<keyid>` syntax as `ssl_certificate_key`. The ingress
+controller doesn't support it natively, so you can't use `ingress.spec.tls`, but must
+use a snippet:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    nginx.org/rewrite-target: /
+    nginx.org/server-snippets: |
+      # no tls: section → no SSL listener otherwise
+      listen 443 ssl;listen [::]:443 ssl;
+
+      # /etc/nginx/certs mounted to controllers above
+      ssl_certificate "/etc/nginx/certs/tls.p256.cert.pem";
+      # invoking ossl_hsm
+      ssl_certificate_key "store:hsm:tls.p256";
+
+      if ($scheme = http) {
+        return 301 https://$host:443$request_uri;
+      }
+  name: echo
+  namespace: default
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: fqdn.internal
+    http:
+      paths:
+      - backend:
+          service:
+            name: echo
+            port:
+              name: http
+        path: /echo/
+        pathType: Prefix
+```
+
+For this to work, you must define env `HSM_PROXY_ADDR`, and mount certificate files to
+`/etc/nginx/certs`, e.g. with the `oci://ghcr.io/nginx/charts/nginx-ingress` Helm chart:
+
+```yaml
+controller:
+  image:
+    ## The image repository of the Ingress Controller.
+    repository: your/nginx-ingress
+    ## The tag of the Ingress Controller image. If not specified the appVersion from Chart.yaml is used as a tag.
+    tag: your-tag
+
+  ## The additional environment variables to be set on the Ingress Controller pods.
+  env:
+  - name: HSM_PROXY_ADDR
+    value: your-hsm:50051
+
+  ## The volumes of the Ingress Controller pods.
+  volumes:
+  - name: certs
+    secret:
+      secretName: your-certs
+
+  ## The volumeMounts of the Ingress Controller pods.
+  volumeMounts:
+  - name: certs
+    mountPath: /etc/nginx/certs
+
+  ## Enable custom NGINX configuration snippets in Ingress, VirtualServer, VirtualServerRoute and TransportServer resources.
+  enableSnippets: true
+```
+
 
 ## License
 

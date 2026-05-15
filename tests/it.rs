@@ -37,8 +37,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use ngx_pep::client::{
-    admission_from_x509, create_dpop_proof, create_popp_token, get_with_dpop, read_smcb_p12,
-    test_popp_token_payload,
+    admission_from_x509, create_dpop_proof, create_popp_token, get_with_dpop,
+    insecure_access_token_sub, read_smcb_p12, test_popp_token_payload,
 };
 mod common;
 use common::{NginxLease, TestContext, context, nginx};
@@ -187,7 +187,10 @@ async fn popp_and_upstream_headers(
     .send()
     .await?;
 
-    assert!(resp.status() == 403);
+    assert!(resp.status() == 400);
+
+    let error: HttpZetaErrorResponse = resp.json().await?;
+    assert!(error.error == "PoPPMissing");
 
     // invalid popp header
     let resp = get_with_dpop(
@@ -210,8 +213,15 @@ async fn popp_and_upstream_headers(
     let now = get_current_timestamp();
     let iat = now;
     let proof_time = now - 10;
-    let popp =
-        create_popp_token(&popp_p12, &popp_p12_pass, &popp_p12_alias, iat, proof_time).await?;
+    let popp = create_popp_token(
+        &insecure_access_token_sub(&access_token)?,
+        &popp_p12,
+        &popp_p12_pass,
+        &popp_p12_alias,
+        iat,
+        proof_time,
+    )
+    .await?;
 
     let resp = get_with_dpop(
         &context.registration,
@@ -252,8 +262,57 @@ async fn popp_and_upstream_headers(
     let popp_token: String =
         Base64::decode_vec(&echo.headers["zeta-popp-token-content"])?.try_into()?;
     let popp_token: Value = serde_json::from_str(&popp_token)?;
-    let expected_popp_token = test_popp_token_payload(iat, proof_time);
+    let expected_popp_token =
+        test_popp_token_payload(&insecure_access_token_sub(&access_token)?, iat, proof_time);
     assert!(popp_token == expected_popp_token);
+
+    // don't pass on zeta-client-data unless configured, A_26492-02
+    let target_without_client_data = nginx.url().await?.join("echo/")?;
+
+    let resp = get_with_dpop(
+        &context.registration,
+        context.client.clone(),
+        &access_token,
+        target_without_client_data.clone(),
+    )?
+    .send()
+    .await?;
+
+    assert!(resp.status() == 200);
+
+    let echo: Echo = resp.json().await?;
+    assert!(
+        !echo.headers.contains_key("zeta-client-data"),
+        "zeta-client-data present when it shouldn't"
+    );
+
+    // invalid actorId
+    let now = get_current_timestamp();
+    let iat = now;
+    let proof_time = now - 10;
+    let popp = create_popp_token(
+        "invalid",
+        &popp_p12,
+        &popp_p12_pass,
+        &popp_p12_alias,
+        iat,
+        proof_time,
+    )
+    .await?;
+
+    let resp = get_with_dpop(
+        &context.registration,
+        context.client.clone(),
+        &access_token,
+        target.clone(),
+    )?
+    .header("popp", &popp)
+    .send()
+    .await?;
+
+    assert!(resp.status() == 403);
+    let error: HttpZetaErrorResponse = resp.json().await?;
+    assert!(error.error == "PoPPInvalidActor");
 
     echo_sever.abort();
     let _ = echo_sever.await;
@@ -780,7 +839,7 @@ async fn error_responses(
 
     let access_token = context.access_token().await?;
 
-    // missing popp header, to get 403
+    // missing popp header, to get 400
     let resp = get_with_dpop(
         &context.registration,
         context.client.clone(),
@@ -790,17 +849,24 @@ async fn error_responses(
     .send()
     .await?;
 
-    assert!(resp.status() == 403);
+    assert!(resp.status() == 400);
     assert!(
         resp.headers()
             .iter()
             .any(|(name, value)| *name == "content-type" && *value == "application/json")
     );
     let response_json: HttpZetaErrorResponse = resp.json().await?;
-    assert!(response_json.error == "PoPP");
-    assert!(response_json.error_description == Some("PoPP error: missing PoPP header".to_string()));
+    assert!(response_json.error == "PoPPMissing");
+    assert!(response_json.error_description == Some("PoPP header missing".to_string()));
     assert!(
-        response_json.error_uri == Some(nginx.url().await?.join("/doc/errors/PoPP.html")?.into())
+        response_json.error_uri
+            == Some(
+                nginx
+                    .url()
+                    .await?
+                    .join("/doc/errors/PoPPMissing.html")?
+                    .into()
+            )
     );
 
     // uses Forwarded, X-Forwarded, or Host for error base uri
@@ -831,7 +897,8 @@ async fn error_responses(
 
         let response_json: HttpZetaErrorResponse = resp.json().await?;
         assert!(
-            response_json.error_uri == Some("http://example.invalid/doc/errors/PoPP.html".parse()?)
+            response_json.error_uri
+                == Some("http://example.invalid/doc/errors/PoPPMissing.html".parse()?)
         );
     }
 

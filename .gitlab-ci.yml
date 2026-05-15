@@ -50,11 +50,12 @@ variables:
   DOCKER_CERT_PATH: $DOCKER_TLS_CERTDIR/client
   DOCKER_TLS_VERIFY: "1"
   BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.94-slim-bookworm
-  NGINX_VERSION: "1.29.5" # NOTE: keep in sync with .cargo/config.toml and Dockerfile
+  NGINX_VERSION: "1.29.8" # NOTE: keep in sync with .cargo/config.toml and Dockerfile, and with nginx-ingress version (major.minor)
   BASE_IMAGE: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginxinc/nginx-unprivileged:$NGINX_VERSION-trixie-otel"
+  BASE_IMAGE_INGRESS: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx/nginx-ingress:5.4.1" # NOTE: keep in sync with Dockerfile, contained nginx major.minor must match NGINX_VERSION
   BASE_IMAGE_HSM_SIM: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/debian:bookworm"
-
   IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+  IMAGE_INGRESS: $CI_REGISTRY_IMAGE/nginx-ingress:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
   IMAGE_HSM_SIM: $CI_REGISTRY_IMAGE/hsm_sim:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
 
 before_script:
@@ -143,6 +144,8 @@ build:
         --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1 \
         --build-arg BASE_IMAGE_BUILD="$BASE_IMAGE_BUILD" \
         --build-arg BASE_IMAGE="$BASE_IMAGE" \
+        --build-arg BASE_IMAGE_HSM_SIM="$BASE_IMAGE_HSM_SIM" \
+        --build-arg BASE_IMAGE_INGRESS="$BASE_IMAGE_INGRESS" \
         --target ci \
         --tag "$IMAGE" \
         --push \
@@ -154,9 +157,25 @@ build:
       docker buildx build \
         --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1 \
         --build-arg BASE_IMAGE_BUILD="$BASE_IMAGE_BUILD" \
+        --build-arg BASE_IMAGE="$BASE_IMAGE" \
         --build-arg BASE_IMAGE_HSM_SIM="$BASE_IMAGE_HSM_SIM" \
+        --build-arg BASE_IMAGE_INGRESS="$BASE_IMAGE_INGRESS" \
         --target ci-hsm-sim \
         --tag "$IMAGE_HSM_SIM" \
+        --push \
+        "$@" \
+        .
+
+      printf "!! build image %s\n\n" "$IMAGE_INGRESS"
+
+      docker buildx build \
+        --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1 \
+        --build-arg BASE_IMAGE_BUILD="$BASE_IMAGE_BUILD" \
+        --build-arg BASE_IMAGE="$BASE_IMAGE" \
+        --build-arg BASE_IMAGE_HSM_SIM="$BASE_IMAGE_HSM_SIM" \
+        --build-arg BASE_IMAGE_INGRESS="$BASE_IMAGE_INGRESS" \
+        --target ci-nginx-ingress \
+        --tag "$IMAGE_INGRESS" \
         --push \
         "$@" \
         .
@@ -166,6 +185,7 @@ build:
     paths:
       - target/release/libngx_pep.so
       - target/release/hsm_sim
+      - target/release/libossl_hsm.so
       - clippy.json
       - coverage.lcov
       - .pkg-version
@@ -253,6 +273,10 @@ tag_image:
       docker pull "$IMAGE_HSM_SIM"
       docker tag "$IMAGE_HSM_SIM" "$CI_REGISTRY_IMAGE/hsm_sim:$TARGET_TAG"
       docker push "$CI_REGISTRY_IMAGE/hsm_sim:$TARGET_TAG"
+
+      docker pull "$IMAGE_INGRESS"
+      docker tag "$IMAGE_INGRESS" "$CI_REGISTRY_IMAGE/nginx-ingress:$TARGET_TAG"
+      docker push "$CI_REGISTRY_IMAGE/nginx-ingress:$TARGET_TAG"
 
 publish_artifacts:
   stage: publish

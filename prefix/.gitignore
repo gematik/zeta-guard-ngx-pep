@@ -10,3 +10,4 @@
 !/conf
 /conf/*
 !/conf/tls.p256.pem
+!/conf/asl.p256.pem

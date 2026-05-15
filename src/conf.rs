@@ -118,9 +118,6 @@ pub struct MainConfig {
     pub pdp_issuer: Option<String>,
     pub popp_issuer: Option<String>,
     pub jwks_refresh_interval: Duration,
-    pub http_client_idle_timeout: Duration,
-    pub http_client_max_idle_per_host: usize,
-    pub http_client_tcp_keepalive: Duration,
     pub http_client_connect_timeout: Duration,
     pub http_client_timeout: Duration,
     pub http_client_accept_invalid_certs: bool,
@@ -142,9 +139,6 @@ impl Default for MainConfig {
             pdp_issuer: None,
             popp_issuer: None,
             jwks_refresh_interval: Duration::from_secs(300), // NOTE: not exposed as directive r.n.
-            http_client_idle_timeout: Duration::from_secs(30),
-            http_client_max_idle_per_host: 64,
-            http_client_tcp_keepalive: Duration::from_secs(30),
             http_client_connect_timeout: Duration::from_secs(2),
             http_client_timeout: Duration::from_secs(10),
             http_client_accept_invalid_certs: false,
@@ -174,39 +168,6 @@ impl MainConfig {
 unsafe impl HttpModuleMainConf for Module {
     type MainConf = MainConfig;
 }
-
-conf_handler!(
-    pep_http_client_idle_timeout,
-    MainConfig,
-    |conf: &mut MainConfig, val: &str| -> anyhow::Result<*mut c_char> {
-        let val = Duration::from_secs(val.parse()?);
-        conf.http_client_idle_timeout = val;
-
-        Ok(ngx::core::NGX_CONF_OK)
-    }
-);
-
-conf_handler!(
-    pep_http_client_max_idle_per_host,
-    MainConfig,
-    |conf: &mut MainConfig, val: &str| -> anyhow::Result<*mut c_char> {
-        let val: usize = val.parse()?;
-        conf.http_client_max_idle_per_host = val;
-
-        Ok(ngx::core::NGX_CONF_OK)
-    }
-);
-
-conf_handler!(
-    pep_http_client_tcp_keepalive,
-    MainConfig,
-    |conf: &mut MainConfig, val: &str| -> anyhow::Result<*mut c_char> {
-        let val = Duration::from_secs(val.parse()?);
-        conf.http_client_tcp_keepalive = val;
-
-        Ok(ngx::core::NGX_CONF_OK)
-    }
-);
 
 conf_handler!(
     pep_http_client_connect_timeout,
@@ -425,7 +386,22 @@ pub struct LocationConfig {
     pub dpop_validity: Option<Duration>,
 
     pub require_popp: Option<bool>,
-    pub popp_validity: Option<Duration>,
+    pub popp_validity: Option<PoppValidity>,
+
+    pub forward_client_data: Option<bool>,
+}
+
+/// How long a PoPP token is considered valid. See gemSpec_Zeta_Guide_PoPP
+/// §3.x: operators must be able to pick either a fixed duration since `iat`,
+/// or a "same calendar quarter" rule (matching the German statutory
+/// healthcare billing cycle).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PoppValidity {
+    /// Token valid for this duration after `iat`.
+    Fixed(Duration),
+    /// Token valid while `iat` and the check time are in the same calendar
+    /// quarter (UTC).
+    Quarter,
 }
 
 impl LocationConfig {
@@ -436,10 +412,50 @@ impl LocationConfig {
         self.dpop_validity
             .unwrap_or_else(|| Duration::from_secs(300))
     }
-    pub fn ppop_validity(&self) -> Duration {
-        self.popp_validity
-            .unwrap_or_else(|| Duration::from_secs(31536000)) // TODO: implement quarterly basis
+    pub fn popp_validity(&self) -> PoppValidity {
+        self.popp_validity.unwrap_or(PoppValidity::Quarter)
     }
+    /// Unix epoch second up to which a PoPP token with the given `iat` is
+    /// considered valid, including `leeway`.
+    pub fn popp_valid_until(&self, iat: i64, leeway: i64) -> i64 {
+        match self.popp_validity() {
+            PoppValidity::Fixed(d) => iat + d.as_secs() as i64 + leeway,
+            PoppValidity::Quarter => end_of_quarter_utc(iat) + leeway,
+        }
+    }
+}
+
+/// Last Unix epoch second of the UTC calendar quarter containing `epoch`.
+fn end_of_quarter_utc(epoch: i64) -> i64 {
+    let t: libc::time_t = epoch as _;
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let tm = unsafe {
+        libc::gmtime_r(&t, tm.as_mut_ptr());
+        tm.assume_init()
+    };
+    // tm_mon: 0=Jan..11=Dec. Quarter index 0..3 = tm_mon / 3.
+    // First month of next quarter = (q + 1) * 3, wrapping into next year at 12.
+    let (next_y, next_m) = match tm.tm_mon / 3 {
+        0 => (tm.tm_year, 3),     // Q1 (Jan-Mar) → Apr
+        1 => (tm.tm_year, 6),     // Q2 (Apr-Jun) → Jul
+        2 => (tm.tm_year, 9),     // Q3 (Jul-Sep) → Oct
+        _ => (tm.tm_year + 1, 0), // Q4 (Oct-Dec) → Jan (next year)
+    };
+    let mut next_q_start = libc::tm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: 1,
+        tm_mon: next_m,
+        tm_year: next_y,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: 0,
+        tm_gmtoff: 0,
+        tm_zone: std::ptr::null_mut(),
+    };
+    let next_q_start_epoch = unsafe { libc::timegm(&mut next_q_start) };
+    next_q_start_epoch as i64 - 1
 }
 
 unsafe impl HttpModuleLocationConf for Module {
@@ -570,26 +586,36 @@ conf_handler!(
     pep_popp_validity,
     LocationConfig,
     |conf: &mut LocationConfig, val: &str| -> anyhow::Result<*mut c_char> {
-        let val = Duration::from_secs(val.parse()?);
-
-        conf.dpop_validity = Some(val);
+        let validity = if val.eq_ignore_ascii_case("quarter") {
+            PoppValidity::Quarter
+        } else {
+            PoppValidity::Fixed(parse_duration("pep_popp_validity", 's', val)?)
+        };
+        conf.popp_validity = Some(validity);
 
         Ok(ngx::core::NGX_CONF_OK)
     }
 );
 
-pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 26] = [
+conf_handler!(
+    pep_forward_client_data,
+    LocationConfig,
+    |conf: &mut LocationConfig, val: &str| -> anyhow::Result<*mut c_char> {
+        if val.eq_ignore_ascii_case("on") {
+            conf.forward_client_data = Some(true);
+        } else if val.eq_ignore_ascii_case("off") {
+            conf.forward_client_data = Some(false);
+        } else {
+            anyhow::bail!("Unable to parse pep_forward_client_data: {val}")
+        }
+
+        Ok(ngx::core::NGX_CONF_OK)
+    }
+);
+
+pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 24] = [
     main_command!("pep_pdp_issuer", pep_pdp_issuer),
     main_command!("pep_popp_issuer", pep_popp_issuer),
-    main_command!("pep_http_client_idle_timeout", pep_http_client_idle_timeout),
-    main_command!(
-        "pep_http_client_max_idle_per_host",
-        pep_http_client_max_idle_per_host
-    ),
-    main_command!(
-        "pep_http_client_tcp_keepalive",
-        pep_http_client_tcp_keepalive
-    ),
     main_command!(
         "pep_http_client_connect_timeout",
         pep_http_client_connect_timeout
@@ -615,6 +641,7 @@ pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 26] = [
     loc_command!("pep_dpop_validity", pep_dpop_validity),
     loc_command!("pep_require_popp", pep_require_popp),
     loc_command!("pep_popp_validity", pep_popp_validity),
+    loc_command!("pep_forward_client_data", pep_forward_client_data),
     loc_command!("asl", asl),
     // terminate sequence
     ngx_command_t::empty(),
@@ -627,7 +654,107 @@ mod tests {
 
     use ngx::http::Merge;
 
-    use crate::conf::LocationConfig;
+    use crate::conf::{LocationConfig, PoppValidity, end_of_quarter_utc};
+
+    /// Days within a given UTC year and month (1-based day)
+    fn utc_epoch(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> i64 {
+        let mut tm = libc::tm {
+            tm_sec: sec as i32,
+            tm_min: min as i32,
+            tm_hour: hour as i32,
+            tm_mday: day as i32,
+            tm_mon: month as i32 - 1,
+            tm_year: year - 1900,
+            tm_wday: 0,
+            tm_yday: 0,
+            tm_isdst: 0,
+            tm_gmtoff: 0,
+            tm_zone: std::ptr::null_mut(),
+        };
+        unsafe { libc::timegm(&mut tm) as i64 }
+    }
+
+    #[test]
+    fn end_of_q1() {
+        // Mid-Feb 2026 → Mar 31 23:59:59 UTC
+        let iat = utc_epoch(2026, 2, 15, 12, 0, 0);
+        let expected = utc_epoch(2026, 3, 31, 23, 59, 59);
+        assert_eq!(end_of_quarter_utc(iat), expected);
+    }
+
+    #[test]
+    fn end_of_q2() {
+        let iat = utc_epoch(2026, 5, 15, 12, 0, 0);
+        let expected = utc_epoch(2026, 6, 30, 23, 59, 59);
+        assert_eq!(end_of_quarter_utc(iat), expected);
+    }
+
+    #[test]
+    fn end_of_q3() {
+        let iat = utc_epoch(2026, 8, 15, 12, 0, 0);
+        let expected = utc_epoch(2026, 9, 30, 23, 59, 59);
+        assert_eq!(end_of_quarter_utc(iat), expected);
+    }
+
+    #[test]
+    fn end_of_q4() {
+        // Dec 15 2026 → Dec 31 2026 23:59:59 (not Jan 1 2027)
+        let iat = utc_epoch(2026, 11, 15, 12, 0, 0);
+        let expected = utc_epoch(2026, 12, 31, 23, 59, 59);
+        assert_eq!(end_of_quarter_utc(iat), expected);
+    }
+
+    #[test]
+    fn end_of_quarter_at_exact_last_second() {
+        // iat = last second of Q2 → returns itself
+        let iat = utc_epoch(2026, 6, 30, 23, 59, 59);
+        assert_eq!(end_of_quarter_utc(iat), iat);
+    }
+
+    #[test]
+    fn end_of_quarter_at_quarter_start() {
+        // iat = first second of Q3 → returns last second of Q3
+        let iat = utc_epoch(2026, 7, 1, 0, 0, 0);
+        let expected = utc_epoch(2026, 9, 30, 23, 59, 59);
+        assert_eq!(end_of_quarter_utc(iat), expected);
+    }
+
+    #[test]
+    fn end_of_quarter_leap_year_q1() {
+        // 2024 is a leap year; Feb 29 is in Q1, end is still Mar 31
+        let iat = utc_epoch(2024, 2, 29, 12, 0, 0);
+        let expected = utc_epoch(2024, 3, 31, 23, 59, 59);
+        assert_eq!(end_of_quarter_utc(iat), expected);
+    }
+
+    #[test]
+    fn popp_valid_until_seconds_mode() {
+        let cfg = LocationConfig {
+            popp_validity: Some(PoppValidity::Fixed(Duration::from_secs(3600))),
+            ..Default::default()
+        };
+        assert_eq!(cfg.popp_valid_until(1_000_000, 60), 1_000_000 + 3600 + 60);
+    }
+
+    #[test]
+    fn popp_valid_until_quarter_mode() {
+        let cfg = LocationConfig {
+            popp_validity: Some(PoppValidity::Quarter),
+            ..Default::default()
+        };
+        let iat = utc_epoch(2026, 5, 15, 12, 0, 0); // Q2
+        let end_q2 = utc_epoch(2026, 6, 30, 23, 59, 59);
+        assert_eq!(cfg.popp_valid_until(iat, 60), end_q2 + 60);
+    }
+
+    #[test]
+    fn popp_valid_until_default_is_quarter() {
+        // Unconfigured → Quarter semantics (matches TODO from prior implementation).
+        let cfg = LocationConfig::default();
+        let iat = utc_epoch(2026, 5, 15, 12, 0, 0);
+        let end_q2 = utc_epoch(2026, 6, 30, 23, 59, 59);
+        assert_eq!(cfg.popp_valid_until(iat, 0), end_q2);
+    }
 
     #[test]
     fn merge_inherits_unset_values() {
@@ -642,6 +769,7 @@ mod tests {
             dpop_validity: None,
             require_popp: None,
             popp_validity: None,
+            forward_client_data: None,
         };
         let mut child = LocationConfig {
             pep: Some(false),
@@ -652,6 +780,7 @@ mod tests {
             dpop_validity: None,
             require_popp: None,
             popp_validity: None,
+            forward_client_data: None,
         };
         child.merge(&parent).expect("merge");
         assert_eq!(child.pep, Some(false));

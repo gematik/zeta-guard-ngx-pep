@@ -26,6 +26,10 @@ For cross-signing CAs:
 openssl x509 -req -CA ca1_cert.pem -CAkey ca1_key.pem -in ca2_csr.pem -out ca2_by_ca1_cert.pem -days 3650 -extfile cross_extension.cfg
 ```
 
+Create CSR from existing certificate:
+```shell
+openssl x509 -x509toreq  -copy_extensions copyall -in subject_cert.pem -signkey subject_key.pem -out subject_csr2.pem
+```
 
 # Setup of roots.json
 

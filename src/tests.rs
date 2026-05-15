@@ -22,6 +22,8 @@
  * #L%
  */
 
+#![cfg_attr(test, allow(clippy::needless_lifetimes))]
+
 use ambassador::Delegate;
 use anyhow::Ok;
 use rstest::fixture;
@@ -78,6 +80,9 @@ pub async fn request_mock() -> RequestMock {
     mock.request
         .expect_ensure_header_out()
         .returning(|_name, _value| Ok(()));
+    mock.request
+        .expect_get_client_ip()
+        .returning(|| Some("127.0.0.1"));
 
     mock
 }

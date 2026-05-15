@@ -313,9 +313,17 @@ pub async fn create_smcb_token(
     sign_jwt_brainpool(&header, &id, &key)
 }
 
-pub fn test_popp_token_payload(iat: u64, patient_proof_time: u64) -> Value {
+pub fn insecure_access_token_sub(access_token: &str) -> anyhow::Result<String> {
+    let access_token: TokenData<Value> = insecure_decode(access_token)?;
+    Ok(access_token.claims["sub"]
+        .as_str()
+        .context("sub missing")?
+        .to_string())
+}
+
+pub fn test_popp_token_payload(actor_id: &str, iat: u64, patient_proof_time: u64) -> Value {
     json!({
-      "actorId": "883110000168650",
+      "actorId": actor_id,
       "actorProfessionOid": "1.2.276.0.76.4.32",
       "iat": iat,
       "insurerId": "109500969",
@@ -328,6 +336,7 @@ pub fn test_popp_token_payload(iat: u64, patient_proof_time: u64) -> Value {
 }
 
 pub async fn create_popp_token(
+    actor_id: &str,
     p12_path: &Path,
     p12_pass: &str,
     p12_alias: &str,
@@ -346,8 +355,7 @@ pub async fn create_popp_token(
     header.kid = Some(p12_alias.to_string());
     let ee = Base64::encode_string(chain.chain()[0].as_der());
     header.x5c = Some(vec![ee]);
-
-    let payload = test_popp_token_payload(iat, patient_proof_time);
+    let payload = test_popp_token_payload(actor_id, iat, patient_proof_time);
     let key = EncodingKey::from_ec_der(chain.key());
     Ok(jsonwebtoken::encode(&header, &payload, &key)?)
 }
@@ -434,8 +442,8 @@ async fn create_client_assertion(
                     "packaging_type": "packaging",
                     "platform": "linux"
                 },
-                "product_id": "product_id",
-                "product_version": "0.0.0",
+                "product_id": "ZETA-Test-Client",
+                "product_version": "0.0.1",
                 "public_key": PUBLIC_KEY_PEM.clone(),
             },
             "posture_type": "software",

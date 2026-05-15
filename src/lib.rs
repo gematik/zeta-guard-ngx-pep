@@ -56,6 +56,7 @@ mod error;
 mod headers;
 mod jwk_cache;
 mod ocsp_cache;
+mod ossl_store;
 mod pep;
 mod request_body;
 mod request_ops;
@@ -103,18 +104,12 @@ where
 #[derive(Debug, Default)]
 struct ModuleCtx {
     pep: RefCell<PepCtx>,
-    asl: RefCell<AslCtx>,
     body: RequestBody,
 }
 
 #[derive(Debug, Default)]
 struct PepCtx {
-    task: Option<Task<ZetaResult<()>>>,
-}
-
-#[derive(Debug, Default)]
-struct AslCtx {
-    task: Option<Task<()>>,
+    result: Option<ZetaResult<()>>,
 }
 
 impl ModuleCtx {
@@ -130,21 +125,14 @@ impl ModuleCtx {
             })
     }
 
-    pub fn take_pep_task(request: &Request) -> Option<Task<ZetaResult<()>>> {
+    pub fn take_pep_result(request: &Request) -> Option<ZetaResult<()>> {
         let ctx = Self::get(request);
-        ctx.pep.borrow_mut().task.take()
+        ctx.pep.borrow_mut().result.take()
     }
 
-    pub fn insert_pep_task(request: &Request, task: Task<ZetaResult<()>>) {
+    pub fn insert_pep_result(request: &Request, result: ZetaResult<()>) {
         let ctx = Self::get(request);
-        #[allow(clippy::let_underscore_future)]
-        let _ = ctx.pep.borrow_mut().task.insert(task);
-    }
-
-    pub fn insert_asl_task(request: &Request, task: Task<()>) {
-        let ctx = Self::get(request);
-        #[allow(clippy::let_underscore_future)]
-        let _ = ctx.asl.borrow_mut().task.insert(task);
+        let _ = ctx.pep.borrow_mut().result.insert(result);
     }
 }
 
@@ -304,11 +292,11 @@ mod prod {
         log_debug!("initializing http client…");
         CLIENT.get_or_init(|| {
             ClientBuilder::new()
+                .user_agent(concat!("ZETA Guard PEP/", env!("CARGO_PKG_VERSION")))
                 .redirect(Policy::none())
                 .http2_adaptive_window(true)
-                .pool_idle_timeout(conf.http_client_idle_timeout)
-                .pool_max_idle_per_host(conf.http_client_max_idle_per_host)
-                .tcp_keepalive(conf.http_client_tcp_keepalive)
+                .pool_max_idle_per_host(0)
+                .tcp_keepalive(None)
                 .connect_timeout(conf.http_client_connect_timeout)
                 .timeout(conf.http_client_timeout)
                 .use_rustls_tls()

@@ -22,26 +22,12 @@
  * #L%
  */
 
-use crate::error::{ZetaError, ZetaResult};
-use crate::headers::{
-    ensure_api_version_header_out, ensure_client_data_header_in, ensure_popp_token_header_in,
-    ensure_user_info_header_in,
-};
-use crate::jwk_cache::JwkCacheOps;
-use crate::request_ops::{ConfigOps, RequestOps, normalized_uri};
-use crate::typify::{
-    AccessTokenPayload, AccessTokenPayloadAud, AccessTokenPayloadPlatform, ClientData,
-    ClientDataPlatform, DPoPProofJwtPayload, ZetaUserInfo,
-};
-use crate::{ModuleCtx, spawn_compat};
-use crate::{
-    conf::{LocationConfig, MainConfig},
-    jwk_cache::jwk_cache,
-    log_debug,
-};
+use std::collections::HashSet;
+use std::ptr::addr_of_mut;
+
 use anyhow::{Context, anyhow, bail};
+use async_compat::CompatExt;
 use base64ct::{Base64UrlUnpadded, Encoding};
-use futures::FutureExt;
 use http::Uri;
 use jsonwebtoken::DecodingKey;
 use jsonwebtoken::jwk::{KeyAlgorithm, ThumbprintHash};
@@ -54,19 +40,36 @@ use ngx::{
     core::Status,
     http::{HTTPStatus, HttpModuleLocationConf, Request},
 };
+use ngx_tickle::RequestSpawn;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
-use std::ptr::addr_of_mut;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
-use crate::Module;
+use crate::ModuleCtx;
+use crate::error::{ZetaError, ZetaResult};
+use crate::headers::{
+    ensure_api_version_header_out, ensure_client_data_header_in, ensure_popp_token_header_in,
+    ensure_user_info_header_in,
+};
+use crate::jwk_cache::JwkCacheOps;
+use crate::request_ops::{ConfigOps, RequestOps, normalized_uri};
+use crate::typify::{
+    AccessTokenPayload, AccessTokenPayloadAud, AccessTokenPayloadPlatform, ClientData,
+    ClientDataPlatform, DPoPProofJwtPayload, ZetaUserInfo,
+};
+use crate::zeta_bail;
+use crate::{Module, zeta_anyhow};
+use crate::{
+    conf::{LocationConfig, MainConfig},
+    jwk_cache::jwk_cache,
+    log_debug,
+};
 
 async fn verify_access_token(
     main_config: &MainConfig,
     location_config: &LocationConfig,
     token: &str,
     now: u64,
+    client_ip: Option<String>,
 ) -> ZetaResult<TokenData<AccessTokenPayload>> {
     let header = decode_header(token).context("while decoding authorization token header")?;
     let kid = header.kid.ok_or_else(|| anyhow!("no kid"))?;
@@ -77,7 +80,7 @@ async fn verify_access_token(
         )));
     }
 
-    let jwk = jwk_cache().get_jwk_pdp(kid).await?;
+    let jwk = jwk_cache().get_jwk_pdp(kid, client_ip).await?;
 
     if jwk.common.key_algorithm != Some(KeyAlgorithm::ES256) {
         return Err(ZetaError::AccessToken(anyhow!(
@@ -169,60 +172,89 @@ async fn verify_access_token(
 
 async fn verify_popp(
     location_config: &LocationConfig,
+    access_token_sub: &str,
     popp: &str,
     now: u64,
-) -> anyhow::Result<TokenData<Value>> {
-    let header = decode_header(popp)?;
+    client_ip: Option<String>,
+) -> ZetaResult<TokenData<Value>> {
+    let header = decode_header(popp).map_err(|e| ZetaError::PoPP(e.into()))?;
 
     match &header.typ {
         Some(typ) => {
             if typ != "vnd.telematik.popp+jwt" {
-                bail!("invalid typ {typ}");
+                zeta_bail!(PoPP, "invalid typ {typ}");
             }
         }
-        None => bail!("no typ"),
+        None => zeta_bail!(PoPP, "no typ"),
     };
 
     if header.alg != Algorithm::ES256 {
-        anyhow::bail!("unsupported token alg {:?}", header.alg);
+        zeta_bail!(PoPP, "unsupported token alg {:?}", header.alg);
     }
-    let kid = header.kid.ok_or_else(|| anyhow!("no kid"))?;
+    let kid = header.kid.ok_or_else(|| zeta_anyhow!(PoPP, "no kid"))?;
 
-    let jwk = jwk_cache().get_jwk_popp(kid).await?;
+    let jwk = jwk_cache()
+        .get_jwk_popp(kid, client_ip)
+        .await
+        .map_err(ZetaError::PoPP)?;
 
     let mut validation = Validation::new(Algorithm::ES256);
     validation.required_spec_claims.remove("exp");
-    let key = DecodingKey::from_jwk(&jwk)?;
+    let key = DecodingKey::from_jwk(&jwk)
+        .context("invalid jwk")
+        .map_err(ZetaError::PoPP)?;
 
-    // TODO: Fix schema and use PoPpTokenPayload instead of Value
-    let token_data: TokenData<Value> = decode(popp, &key, &validation)?;
+    let token_data: TokenData<Value> = decode(popp, &key, &validation)
+        .context("validating PoPP token")
+        .map_err(ZetaError::PoPP)?;
 
-    let iat: u64 = token_data.claims["iat"]
-        .as_u64()
-        .context("while parsing iat")?;
-    let iat: i64 = iat.try_into().context("iat u64->i64 overflow")?;
-    let now: i64 = now.try_into()?;
+    let iat = token_data.claims["iat"]
+        .as_i64()
+        .context("iat missing")
+        .map_err(ZetaError::PoPP)?;
+    let now: i64 = now
+        .try_into()
+        .context("now u64->i64 overflow")
+        .map_err(ZetaError::PoPP)?;
     let valid_since = now - iat;
-    let leeway: i64 = location_config.leeway().as_secs().try_into()?;
+    let leeway: i64 = location_config
+        .leeway()
+        .as_secs()
+        .try_into()
+        .context("invalid leeway")
+        .map_err(ZetaError::PoPP)?;
     if valid_since + leeway < 0 {
-        anyhow::bail!(
+        zeta_bail!(
+            PoPP,
             "iat invalid; valid_since: want >= 0, got {}, iat = {}, leeway = {}",
             valid_since + leeway,
             iat,
             leeway
         );
     }
-    let ppop_validity: i64 = location_config.ppop_validity().as_secs().try_into()?;
-    let valid_until = iat + ppop_validity + leeway;
+    let valid_until = location_config.popp_valid_until(iat, leeway);
     if valid_until < now {
-        anyhow::bail!(
-            "not longer valid: want {} + {} + {} = {} < {}",
-            iat,
-            ppop_validity,
-            leeway,
+        zeta_bail!(
+            PoPP,
+            "not longer valid: want valid_until ({}) >= now ({}), iat={}, leeway={}, mode={:?}",
             valid_until,
-            now
+            now,
+            iat,
+            leeway,
+            location_config.popp_validity()
         );
+    }
+
+    let actor_id = token_data.claims["actorId"]
+        .as_str()
+        .context("actorId missing")?
+        .to_string();
+
+    if access_token_sub != actor_id {
+        return Err(ZetaError::PoPPInvalidActor {
+            access_token_sub: access_token_sub.to_string(),
+            actor_id,
+        });
     }
 
     Ok(token_data)
@@ -371,12 +403,20 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
     let main_config = request.main_config()?;
     let location_config = request.location_config()?;
 
+    let client_ip = request.get_client_ip().map(String::from);
+
     let access_token = request
         .get_authorization_token()
         .map_err(ZetaError::AccessToken)?;
     let ath = Sha256::digest(&access_token).to_vec();
-    let access_token =
-        verify_access_token(main_config, location_config, &access_token, now).await?;
+    let access_token = verify_access_token(
+        main_config,
+        location_config,
+        &access_token,
+        now,
+        client_ip.clone(),
+    )
+    .await?;
 
     let dpop = request
         .get_header_in("dpop")
@@ -399,47 +439,59 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
 
     verify_client_ip(main_config, &access_token.claims, request.get_client_ip())?;
 
-    if location_config.require_popp.unwrap_or(false) {
+    let access_token_claims = access_token.claims;
+
+    let require_popp = location_config.require_popp.unwrap_or(false);
+    let forward_client_data = location_config.forward_client_data.unwrap_or(false);
+
+    if require_popp {
         if main_config.popp_issuer.is_none() {
             return Err(ZetaError::PoPP(anyhow!("No `pep_popp_issuer` configured")));
         }
 
         let popp = request
             .get_header_in("popp")
-            .ok_or(ZetaError::PoPP(anyhow!("missing PoPP header")))?;
-        let token_data = verify_popp(location_config, popp, now)
-            .await
-            .map_err(ZetaError::PoPP)?;
+            .ok_or(ZetaError::PoPPMissing)?;
+        let token_data = verify_popp(
+            location_config,
+            &access_token_claims.sub,
+            popp,
+            now,
+            client_ip.clone(),
+        )
+        .await?;
         ensure_popp_token_header_in(request, token_data.claims)?;
     }
 
-    let claims = access_token.claims;
-    ensure_user_info_header_in(
-        request,
-        ZetaUserInfo {
-            common_name: claims.common_name.context("missing common_name")?.clone(),
-            identifier: claims.sub.clone(),
-            profession_oid: claims.profession_oid.clone(),
-            organization_name: claims.organization_name.clone(),
-        },
-    )?;
+    if forward_client_data {
+        let platform = access_token_claims.platform.map(|p| match p {
+            AccessTokenPayloadPlatform::Android => ClientDataPlatform::Android,
+            AccessTokenPayloadPlatform::Apple => ClientDataPlatform::Apple,
+            AccessTokenPayloadPlatform::Windows => ClientDataPlatform::Windows,
+            AccessTokenPayloadPlatform::Linux => ClientDataPlatform::Linux,
+        });
+        ensure_client_data_header_in(
+            request,
+            ClientData {
+                client_id: access_token_claims.client_id.clone(),
+                platform,
+                product_id: access_token_claims.product_id.clone(),
+                product_version: access_token_claims.product_version.clone(),
+            },
+        )?;
+    }
 
-    let platform = claims.platform.map(|p| match p {
-        AccessTokenPayloadPlatform::Android => ClientDataPlatform::Android,
-        AccessTokenPayloadPlatform::Apple => ClientDataPlatform::Apple,
-        AccessTokenPayloadPlatform::Windows => ClientDataPlatform::Windows,
-        AccessTokenPayloadPlatform::Linux => ClientDataPlatform::Linux,
-    });
+    let user_info = ZetaUserInfo {
+        common_name: access_token_claims
+            .common_name
+            .context("missing common_name")?
+            .clone(),
+        identifier: access_token_claims.sub.clone(),
+        profession_oid: access_token_claims.profession_oid.clone(),
+        organization_name: access_token_claims.organization_name.clone(),
+    };
 
-    ensure_client_data_header_in(
-        request,
-        ClientData {
-            client_id: claims.client_id.clone(),
-            platform,
-            product_id: claims.product_id.clone(),
-            product_version: claims.product_version.clone(),
-        },
-    )?;
+    ensure_user_info_header_in(request, &user_info)?;
 
     Ok(())
 }
@@ -450,13 +502,8 @@ pub fn handler(request: &mut Request) -> Status {
     match config.pep {
         Some(true) => {
             // Check if we were called *again*
-            if let Some(task) = ModuleCtx::take_pep_task(request) {
-                // task should be finished when re-entering the handler
-                if !task.is_finished() {
-                    ngx_log_error!(NGX_LOG_ERR, request.log(), "pep: Task not finished");
-                    return HTTPStatus::INTERNAL_SERVER_ERROR.into();
-                }
-                return match task.now_or_never().expect("Task result") {
+            if let Some(result) = ModuleCtx::take_pep_result(request) {
+                return match result {
                     Ok(()) => Status::NGX_OK, // OK: allow access, move to next phase
                     Err(err) => {
                         log_debug!("pep: {err}");
@@ -483,20 +530,21 @@ pub fn handler(request: &mut Request) -> Status {
                 };
             }
 
-            let r_ptr = AtomicPtr::new(request.into());
-            let task = spawn_compat(async move {
-                let r_ptr = r_ptr.load(Ordering::Relaxed);
-                let request = unsafe { ngx::http::Request::from_ngx_http_request(r_ptr) };
+            if let Err(e) = request.spawn(async move |request| {
+                async {
+                    let result = pep_handler(request).await;
+                    ModuleCtx::insert_pep_result(request, result);
 
-                let result = pep_handler(request).await;
-
-                let c: *mut ngx_connection_t = request.connection().cast();
-                // trigger „write” event so nginx calls our handler again
-                unsafe { ngx_post_event((*c).write, addr_of_mut!(ngx_posted_events)) };
-                result
-            });
-
-            ModuleCtx::insert_pep_task(request, task);
+                    let c: *mut ngx_connection_t = request.connection().cast();
+                    // trigger „write” event so nginx calls our handler again
+                    unsafe { ngx_post_event((*c).write, addr_of_mut!(ngx_posted_events)) };
+                }
+                .compat()
+                .await;
+            }) {
+                ngx_log_error!(NGX_LOG_ERR, request.log(), "pep: spawn error — {e:?}");
+                return Status::NGX_ERROR;
+            }
 
             Status::NGX_AGAIN
         }
@@ -577,14 +625,15 @@ mod tests {
         let jwk = Jwk::from_encoding_key(&EC_PRIVATE_KEY, Algorithm::ES256).expect("jwk");
         with_jwk_cache_mock(|mock| {
             mock.expect_get_jwk_pdp()
-                .with(eq("kid".to_string()))
-                .returning(move |_| Ok(jwk.clone()));
+                .with(eq("kid".to_string()), mockall::predicate::always())
+                .returning(move |_, _| Ok(jwk.clone()));
         })
         .await;
 
         let now = 1;
         let token = make_jwt(Header::new(Algorithm::ES256), AccessTokenPayload::default());
-        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result =
+            verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None).await;
         assert!(result.is_ok());
 
         // aud
@@ -596,7 +645,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result =
+            verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None).await;
         assert!(result.is_ok());
 
         // multiple auds
@@ -615,7 +665,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result =
+            verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None).await;
         assert!(result.is_ok());
 
         // fail when we require more auds than present on token
@@ -625,7 +676,8 @@ mod tests {
         ]));
 
         let token = make_jwt(Header::new(Algorithm::ES256), AccessTokenPayload::default());
-        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result =
+            verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None).await;
         assert!(result.is_err_and(|err| err.to_string().contains("missing_aud")));
         request_mock
             .lcfg
@@ -646,7 +698,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result =
+            verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None).await;
         assert!(result.is_ok());
 
         // fail when missing scope(s)
@@ -657,7 +710,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result =
+            verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None).await;
         assert!(result.is_err_and(|err| err.to_string().contains("required_scope2")));
 
         let token = make_jwt(
@@ -667,7 +721,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result =
+            verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None).await;
         assert!(
             result.is_err_and(|err| err.to_string().contains("required_scope1")
                 && err.to_string().contains("required_scope2"))
@@ -680,7 +735,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result =
+            verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None).await;
         assert!(
             result.is_err_and(|err| err.to_string().contains("required_scope1")
                 && err.to_string().contains("required_scope2"))
@@ -694,7 +750,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result =
+            verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None).await;
         assert!(
             result.is_err_and(|err| err.to_string().contains("required_scope1")
                 && err.to_string().contains("required_scope2"))
@@ -709,7 +766,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result =
+            verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None).await;
         assert!(result.is_err_and(|err| err.to_string().contains("iat invalid")));
 
         // leeway
@@ -721,7 +779,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result =
+            verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None).await;
         assert!(result.is_ok());
 
         let now = 1;
@@ -732,7 +791,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now).await;
+        let result =
+            verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None).await;
         assert!(result.is_err_and(|err| err.to_string().contains("iat invalid")));
     }
 
@@ -744,8 +804,8 @@ mod tests {
         with_jwk_cache_mock(|mock| {
             let jwk = jwk.clone();
             mock.expect_get_jwk_pdp()
-                .with(eq("kid".to_string()))
-                .returning(move |_| Ok(jwk.clone()));
+                .with(eq("kid".to_string()), mockall::predicate::always())
+                .returning(move |_, _| Ok(jwk.clone()));
         })
         .await;
 
@@ -874,6 +934,104 @@ mod tests {
         .await;
 
         assert!(result.is_err_and(|err| err.to_string().contains("invalid typ")));
+    }
+
+    /// Build a `libc::tm`-derived UTC epoch for fixture dates.
+    fn utc_epoch(year: i32, month: u32, day: u32) -> i64 {
+        let mut tm = libc::tm {
+            tm_sec: 0,
+            tm_min: 0,
+            tm_hour: 0,
+            tm_mday: day as i32,
+            tm_mon: month as i32 - 1,
+            tm_year: year - 1900,
+            tm_wday: 0,
+            tm_yday: 0,
+            tm_isdst: 0,
+            tm_gmtoff: 0,
+            tm_zone: std::ptr::null_mut(),
+        };
+        unsafe { libc::timegm(&mut tm) as i64 }
+    }
+
+    fn make_popp_jwt(iat: i64, actor_id: &str) -> String {
+        let mut header = Header::new(Algorithm::ES256);
+        header.typ = Some("vnd.telematik.popp+jwt".to_string());
+        let payload = serde_json::json!({
+            "actorId": actor_id,
+            "iat": iat,
+        });
+        make_jwt(header, &payload)
+    }
+
+    #[rstest]
+    #[tokio::test]
+    #[serial] // jwk cache
+    async fn verifies_popp_quarter_mode(#[future(awt)] mut request_mock: RequestMock) {
+        let jwk = Jwk::from_encoding_key(&EC_PRIVATE_KEY, Algorithm::ES256).expect("jwk");
+        with_jwk_cache_mock(|mock| {
+            let jwk = jwk.clone();
+            mock.expect_get_jwk_popp()
+                .returning(move |_, _| Ok(jwk.clone()));
+        })
+        .await;
+        request_mock.lcfg.popp_validity = Some(crate::conf::PoppValidity::Quarter);
+
+        // iat = 2026-06-01 (Q2). Default sub is "sub".
+        let iat = utc_epoch(2026, 6, 1);
+        let popp = make_popp_jwt(iat, "sub");
+
+        // within the same quarter → Ok
+        let now = utc_epoch(2026, 6, 15) as u64;
+        let result = verify_popp(&request_mock.lcfg, "sub", &popp, now, None).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        // past Q2 end + past default leeway (60s) → Err
+        let start_q3 = utc_epoch(2026, 7, 1) as u64;
+        let result = verify_popp(&request_mock.lcfg, "sub", &popp, start_q3 + 3600, None).await;
+        assert!(result.is_err_and(|err| err.to_string().contains("not longer valid")));
+
+        // just past Q2 end but within leeway → Ok (leeway absorbs the boundary)
+        let result = verify_popp(&request_mock.lcfg, "sub", &popp, start_q3 + 30, None).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        // actorId must still match access_token_sub
+        let result = verify_popp(&request_mock.lcfg, "other", &popp, now, None).await;
+        assert!(matches!(result, Err(ZetaError::PoPPInvalidActor { .. })));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    #[serial] // jwk cache
+    async fn verifies_popp_seconds_mode(#[future(awt)] mut request_mock: RequestMock) {
+        let jwk = Jwk::from_encoding_key(&EC_PRIVATE_KEY, Algorithm::ES256).expect("jwk");
+        with_jwk_cache_mock(|mock| {
+            let jwk = jwk.clone();
+            mock.expect_get_jwk_popp()
+                .returning(move |_, _| Ok(jwk.clone()));
+        })
+        .await;
+        request_mock.lcfg.popp_validity = Some(crate::conf::PoppValidity::Fixed(
+            std::time::Duration::from_secs(600),
+        ));
+
+        let iat: i64 = 1_000_000;
+        let popp = make_popp_jwt(iat, "sub");
+
+        // inside 600s window → Ok
+        let result = verify_popp(&request_mock.lcfg, "sub", &popp, iat as u64 + 300, None).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        // past 600s + 60s leeway → Err
+        let result = verify_popp(
+            &request_mock.lcfg,
+            "sub",
+            &popp,
+            iat as u64 + 600 + 61,
+            None,
+        )
+        .await;
+        assert!(result.is_err_and(|err| err.to_string().contains("not longer valid")));
     }
 
     #[rstest]

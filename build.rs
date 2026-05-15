@@ -226,7 +226,6 @@ fn resolve_schema(path: PathBuf) -> Result<RootSchema> {
 fn generate_schema() -> Result<()> {
     let schemas = vec![
         resolve_schema(Path::new("./src/schema/access-token.yaml").to_path_buf())?,
-        resolve_schema(Path::new("./src/schema/popp-token.yaml").to_path_buf())?,
         resolve_schema(Path::new("./src/schema/client-data.yaml").to_path_buf())?,
         resolve_schema(Path::new("./src/schema/zeta-user-info.yaml").to_path_buf())?,
         resolve_schema(Path::new("./src/schema/dpop-token.yaml").to_path_buf())?,

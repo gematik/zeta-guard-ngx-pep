@@ -72,13 +72,13 @@ unsafe extern "C" fn store_open(
         }
     };
 
-    eprintln!("[ossl_hsm] store_open('{}')", uri_str);
+    eprintln!("[ossl_hsm] store_open({})", uri_str);
 
     // Parse the URI
     let key_id = if let Some(rest) = uri_str.strip_prefix("hsm:") {
         rest.to_string()
     } else {
-        eprintln!("[ossl_hsm] store_open: URI must start with 'hsm:'");
+        eprintln!("[ossl_hsm] store_open: URI must start with hsm:");
         return std::ptr::null_mut();
     };
 
@@ -86,8 +86,6 @@ unsafe extern "C" fn store_open(
         eprintln!("[ossl_hsm] store_open: empty key ID in URI");
         return std::ptr::null_mut();
     }
-
-    eprintln!("[ossl_hsm] store_open: key_id='{}'", key_id);
 
     let ctx = Box::new(StoreCtx {
         key_id,
@@ -118,8 +116,6 @@ unsafe extern "C" fn store_load(
         return 1;
     }
 
-    eprintln!("[ossl_hsm] store_load: loading key '{}'", ctx.key_id);
-
     let cb = match OSSLCallback::try_new(object_cb, object_cbarg) {
         Ok(cb) => cb,
         Err(_) => {
@@ -137,8 +133,8 @@ unsafe extern "C" fn store_load(
     let reference_size = std::mem::size_of::<KeyHandle>();
 
     eprintln!(
-        "[ossl_hsm] store_load: passing KeyHandle reference ({} bytes)",
-        reference_size
+        "[ossl_hsm] store_load: passing KeyHandle reference, key_id={}, {} bytes",
+        &ctx.key_id, reference_size
     );
 
     let object_type: libc::c_int = OSSL_OBJECT_PKEY;
@@ -172,11 +168,7 @@ unsafe extern "C" fn store_load(
 
     ctx.loaded = true;
 
-    // Call the callback with our parameters
-    let ret = cb.call(&params);
-    eprintln!("[ossl_hsm] store_load: callback returned {}", ret);
-
-    1
+    cb.call(&params)
 }
 
 /// Check if we've reached end of objects
@@ -186,16 +178,13 @@ unsafe extern "C" fn store_eof(loaderctx: *mut libc::c_void) -> libc::c_int {
     }
 
     let ctx = unsafe { &*(loaderctx as *const StoreCtx) };
-    let eof = if ctx.loaded { 1 } else { 0 };
-    eprintln!("[ossl_hsm] store_eof: {}", eof);
-    eof
+    if ctx.loaded { 1 } else { 0 }
 }
 
 /// Close the store and free resources
 unsafe extern "C" fn store_close(loaderctx: *mut libc::c_void) -> libc::c_int {
     if !loaderctx.is_null() {
-        let ctx = unsafe { Box::from_raw(loaderctx as *mut StoreCtx) };
-        eprintln!("[ossl_hsm] store_close: key_id='{}'", ctx.key_id);
+        let _ = unsafe { Box::from_raw(loaderctx as *mut StoreCtx) };
     }
     1
 }

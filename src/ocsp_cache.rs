@@ -21,15 +21,16 @@
  * For additional notes and disclaimer from gematik and in case of changes by gematik find details in the "Readme" file.
  * #L%
  */
+use crate::asl_keys::OcspConfig;
 use crate::{CLIENT, log_debug};
-use anyhow::{Context, bail};
-use asl::Config;
-use der::{DateTime, Decode};
+use anyhow::{Context, anyhow, bail};
+use foreign_types::ForeignTypeRef;
 use http::header::CONTENT_TYPE;
+use openssl::asn1::{Asn1GeneralizedTimeRef, Asn1Time, Asn1TimeRef};
+use openssl::ocsp::{OcspCertId, OcspCertStatus, OcspResponse};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use x509_ocsp::{BasicOcspResponse, CertStatus, OcspResponse, OcspResponseStatus};
 
 #[derive(Clone, Default)]
 struct CachedOcspResponse {
@@ -42,16 +43,18 @@ pub static OCSP_CACHE: OnceLock<OcspCache> = OnceLock::new();
 pub struct OcspCache {
     ocsp_url: Option<String>,
     ocsp_request: Vec<u8>,
+    ocsp_cert_id: Option<OcspCertId>,
     ocsp_ttl: Duration,
     ocsp_response: RwLock<CachedOcspResponse>,
 }
 
 impl OcspCache {
-    pub fn init(conf: &Config) {
+    pub fn init(conf: OcspConfig) {
         OCSP_CACHE.get_or_init(|| OcspCache {
-            ocsp_url: conf.ocsp_url.clone(),
-            ocsp_request: conf.ocsp_request.clone(),
-            ocsp_ttl: conf.ocsp_ttl,
+            ocsp_url: conf.url,
+            ocsp_request: conf.request,
+            ocsp_cert_id: conf.cert_id,
+            ocsp_ttl: conf.ttl,
             ocsp_response: RwLock::new(CachedOcspResponse::default()),
         });
     }
@@ -59,7 +62,7 @@ impl OcspCache {
     pub async fn get_ocsp(&self) -> Option<Vec<u8>> {
         // OCSP stapling disabled
         #[allow(clippy::question_mark)]
-        if self.ocsp_url.is_none() {
+        if self.ocsp_url.is_none() || self.ocsp_cert_id.is_none() {
             return None;
         }
 
@@ -87,10 +90,9 @@ impl OcspCache {
         // Update cache (write locked)
         let mut cached = self.ocsp_response.write().await;
         *cached = response;
-        log_debug!(
-            "OCSP cache updated, expires {}",
-            DateTime::from_unix_duration(cached.expires).expect("date conversion")
-        );
+        if let Ok(date) = Asn1Time::from_unix(cached.expires.as_secs() as i64) {
+            log_debug!("OCSP cache updated, expires {}", date.to_string());
+        }
 
         cached.data.clone()
     }
@@ -106,7 +108,11 @@ impl OcspCache {
             .error_for_status()?
             .bytes()
             .await?;
-        let expires = verify_ocsp(&response, now + self.ocsp_ttl)?;
+        let expires = verify_ocsp(
+            &response,
+            self.ocsp_cert_id.as_ref().unwrap(),
+            now + self.ocsp_ttl,
+        )?;
         Ok(CachedOcspResponse {
             data: Some(response.to_vec()),
             expires,
@@ -114,33 +120,47 @@ impl OcspCache {
     }
 }
 
-fn verify_ocsp(response: &[u8], max_expires: Duration) -> anyhow::Result<Duration> {
+fn verify_ocsp(
+    response: &[u8],
+    cert_id: &OcspCertId,
+    max_expires: Duration,
+) -> anyhow::Result<Duration> {
     let ocsp = OcspResponse::from_der(response).context("parse ocsp response")?;
-    if ocsp.response_status != OcspResponseStatus::Successful || ocsp.response_bytes.is_none() {
-        bail!("bad response {:?}", ocsp.response_status);
+    let inner = ocsp
+        .basic()
+        .context(format!("bad response {:?}", ocsp.status()))?;
+
+    let single = inner
+        .find_status(cert_id)
+        .ok_or_else(|| anyhow!("invalid response content"))?;
+    if single.status != OcspCertStatus::GOOD {
+        bail!("invalid certificate status {:?}", single.status);
     }
 
-    let inner = BasicOcspResponse::from_der(ocsp.response_bytes.unwrap().response.as_bytes())?;
-    if inner.tbs_response_data.responses.len() != 1 {
-        bail!(
-            "invalid response length {}",
-            inner.tbs_response_data.responses.len()
-        );
-    }
-
-    let single = &inner.tbs_response_data.responses[0];
-    if single.cert_status != CertStatus::good() {
-        bail!("invalid certificate status {:?}", single.cert_status);
-    }
-
-    let mut expires = single
-        .next_update
-        .map_or(max_expires, |date| date.as_ref().to_unix_duration());
+    let mut expires = match single.next_update() {
+        Some(weird) => asn1_gtime_to_duration(weird),
+        None => Ok(max_expires),
+    }?;
     if expires > max_expires {
         expires = max_expires
     }
 
     Ok(expires)
+}
+
+pub fn asn1_gtime_to_duration(time: &Asn1GeneralizedTimeRef) -> anyhow::Result<Duration> {
+    let epoch = Asn1Time::from_unix(0)?;
+
+    // SAFETY: Asn1GeneralizedTime and Asn1Time use the same struct under the hood.
+    // Also, we just borrow the pointer, it still gets freed once Asn1GeneralizedTime drops.
+    let time_ref: &Asn1TimeRef = unsafe { Asn1TimeRef::from_ptr(time.as_ptr() as *mut _) };
+
+    let diff = epoch.diff(time_ref)?;
+    let total_secs = diff.days as i64 * 86_400 + diff.secs as i64;
+    if total_secs < 0 {
+        bail!("cannot convert time before the Unix epoch");
+    }
+    Ok(Duration::from_secs(total_secs as u64))
 }
 
 pub fn ocsp_cache() -> &'static OcspCache {

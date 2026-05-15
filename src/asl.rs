@@ -23,18 +23,19 @@
  */
 
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
 use anyhow::{Context, anyhow};
 use asl::{
     AslError, Environment, SESSION_OVERHEAD, decrypt_request, encrypt_response, finish_handshake,
     initiate_handshake,
 };
+use async_compat::CompatExt;
 use http::Method;
 use nginx_sys::{NGX_LOG_ERR, ngx_cycle};
 use ngx::core::Status;
 use ngx::http::{HTTPStatus, HttpModuleLocationConf, HttpModuleMainConf, Request};
 use ngx::{ngx_log_debug_http, ngx_log_error};
+use ngx_tickle::RequestSpawn;
 use reqwest::Url;
 
 use crate::conf::MainConfig;
@@ -44,7 +45,7 @@ use crate::request_body::read_request_body;
 use crate::request_ops::RequestOps;
 use crate::response::{Body, Response};
 use crate::session_cache::ShmSessionCache;
-use crate::{CLIENT, Module, ModuleCtx, SELF_URL_CV, spawn_compat};
+use crate::{CLIENT, Module, SELF_URL_CV};
 
 /// see also: https://github.com/http-rs/async-h1/blob/main/src/lib.rs#L100
 static MAX_HEADERS: usize = 128;
@@ -127,9 +128,7 @@ async fn handle_subrequest(
     if asl_config.env == Environment::Production
         && request.get_header_in("ZETA-ASL-nonPU-Tracing").is_some()
     {
-        return Err(AslError::BadRequest(anyhow!(
-            "ZETA-ASL-nonPU-Tracing in Production"
-        )));
+        return Err(AslError::IllegalTracing);
     }
 
     let session = SESSION_CACHE.continue_session(&cid).await?;
@@ -318,20 +317,21 @@ pub fn handler(request: &mut Request) -> Status {
         Some(true) => {
             ngx_log_debug_http!(request, "asl: enter");
 
-            let r_ptr = AtomicPtr::new(request.into());
-            let task = spawn_compat(async move {
-                let r_ptr = r_ptr.load(Ordering::Relaxed);
-                let request = unsafe { ngx::http::Request::from_ngx_http_request(r_ptr) };
+            if let Err(e) = request.spawn(async move |request| {
+                async {
+                    let response = asl_handler(request).await.unwrap_or_else(|e| {
+                        ngx_log_error!(NGX_LOG_ERR, request.log(), "asl: error — {e:?}");
+                        e.to_http_resposnse()
+                    });
 
-                let response = asl_handler(request).await.unwrap_or_else(|e| {
-                    ngx_log_error!(NGX_LOG_ERR, request.log(), "asl: error — {e:?}");
-                    e.to_http_resposnse()
-                });
-
-                response.send(request, Status::NGX_OK);
-            });
-
-            ModuleCtx::insert_asl_task(request, task);
+                    response.send(request, Status::NGX_OK);
+                }
+                .compat()
+                .await;
+            }) {
+                ngx_log_error!(NGX_LOG_ERR, request.log(), "asl: spawn error — {e:?}");
+                return Status::NGX_ERROR;
+            }
 
             Status::NGX_AGAIN
         }

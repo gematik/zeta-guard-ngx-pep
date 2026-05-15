@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # #%L
 # ngx_pep
 # %%
@@ -20,11 +21,11 @@
 # For additional notes and disclaimer from gematik and in case of changes by gematik find details in the "Readme" file.
 # #L%
 
-# syntax=docker/dockerfile:1
 ARG BASE_IMAGE_BUILD="rust:1.94-slim-bookworm"
-ARG NGINX_VERSION=1.29.5 # NOTE: keep in sync with .cargo/config.toml and .gitlab-ci.yml
+ARG NGINX_VERSION=1.29.8 # NOTE: keep in sync with .cargo/config.toml and .gitlab-ci.yml, and with nginx-ingress version in .gitlab-ci.yaml
 ARG BASE_IMAGE="nginxinc/nginx-unprivileged:$NGINX_VERSION-trixie-otel"
 ARG BASE_IMAGE_HSM_SIM="debian:bookworm"
+ARG BASE_IMAGE_INGRESS="nginx/nginx-ingress:5.4.1" # NOTE: keep in sync with .gitlab-ci.yml, contained nginx major.minor must match NGINX_VERSION
 
 FROM ${BASE_IMAGE_BUILD} AS build-env
 ARG AZDO_CRATES_MIRROR_URL=""
@@ -137,12 +138,25 @@ COPY .config /usr/src/ngx_pep/.config
 ARG NGINX_VERSION
 ENV NGINX_VERSION="$NGINX_VERSION"
 RUN \
+  --mount=type=cache,id=build-cache,target=build-cache,sharing=locked \
+  --mount=type=cache,id=cargo-home,target=/usr/local/cargo-home,sharing=locked \
 <<-'SH'
+
+  export CARGO_HOME=/usr/local/cargo-home
+
+  mkdir -p build-cache/{target,nginx-cache,nginx}
+  cp -a build-cache/target/. target
+  cp -a build-cache/nginx-cache/. .nginx-cache
+  cp -a build-cache/nginx/. .nginx
   # local build
 
   # don't try to run integration tests for local builds
   NEXTEST_FILTERSET="!kind(test)" \
     /usr/local/bin/cargo-build
+
+  cp -a target/. build-cache/target
+  cp -a .nginx-cache/. build-cache/nginx-cache
+  cp -a .nginx/. build-cache/nginx
 SH
 
 # gitlab-ci likes to build "locally", copy .so and book from context
@@ -196,15 +210,16 @@ COPY prefix/conf/tls.p256.pem /etc/nginx
 # COPY libasl/fixtures/signer_key.pem /etc/nginx
 # COPY libasl/fixtures/issuer_cert.pem /etc/nginx
 # COPY libasl/fixtures/roots.json /etc/nginx
-COPY misc/docker/openssl.cnf /usr/local/etc/openssl/openssl.cnf
 COPY target/release/libngx_pep.so /etc/nginx/modules/
-COPY target/release/libossl_hsm.so /usr/local/lib/ossl-modules/
 COPY book/out /usr/share/nginx/html/doc
-ENV OPENSSL_CONF=/usr/local/etc/openssl/openssl.cnf
+# debian: OPENSSLDIR: "/usr/lib/ssl"
+COPY misc/docker/openssl.cnf /usr/lib/ssl/openssl.cnf
+# debian: MODULESDIR: "/usr/lib/x86_64-linux-gnu/ossl-modules"
+COPY target/release/libossl_hsm.so /usr/lib/x86_64-linux-gnu/ossl-modules
 
 FROM ${BASE_IMAGE_HSM_SIM} AS ci-hsm-sim
 
-# likewise; copy hsm_sim and ca from gitlab build context
+# ci build; copy hsm_sim and ca from gitlab build context
 RUN apt-get update && \
   DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
     libssl-dev \
@@ -233,6 +248,23 @@ COPY hsm_sim/keys/ca.crt /etc/hsm_sim/keys/
 
 ENTRYPOINT ["hsm_sim"]
 CMD ["--listen", "0.0.0.0:50051", "--keys-dir", "/etc/hsm_sim/keys/"]
+
+# ci build; copy libossl_hsm.so from build context
+FROM ${BASE_IMAGE_INGRESS} AS ci-nginx-ingress
+
+# debian: OPENSSLDIR: "/usr/lib/ssl"
+COPY misc/docker/openssl.cnf /usr/lib/ssl/openssl.cnf
+# debian: MODULESDIR: "/usr/lib/x86_64-linux-gnu/ossl-modules"
+COPY target/release/libossl_hsm.so /usr/lib/x86_64-linux-gnu/ossl-modules/libossl_hsm.so
+
+# local, copy libossl_hsm.so from local-build stage
+FROM ${BASE_IMAGE_INGRESS} AS nginx-ingress
+
+# debian: OPENSSLDIR: "/usr/lib/ssl"
+COPY misc/docker/openssl.cnf /usr/lib/ssl/openssl.cnf
+# debian: MODULESDIR: "/usr/lib/x86_64-linux-gnu/ossl-modules"
+COPY --from=local-build /usr/src/ngx_pep/target/release/libossl_hsm.so \
+  /usr/lib/x86_64-linux-gnu/ossl-modules/libossl_hsm.so
 
 # default target, i.e. for interactive usage, copy book and so. from local-build stage
 FROM ${BASE_IMAGE}
@@ -285,8 +317,9 @@ COPY prefix/conf/tls.p256.pem /etc/nginx
 # COPY libasl/fixtures/signer_key.pem /etc/nginx
 # COPY libasl/fixtures/issuer_cert.pem /etc/nginx
 # COPY libasl/fixtures/roots.json /etc/nginx
-COPY misc/docker/openssl.cnf /usr/local/etc/openssl/openssl.cnf
 COPY --from=local-build /usr/src/ngx_pep/target/release/libngx_pep.so /etc/nginx/modules/
-COPY --from=local-build /usr/src/ngx_pep/target/release/libossl_hsm.so /usr/local/lib/ossl-modules/
 COPY --from=local-build /usr/src/ngx_pep/book/out /usr/share/nginx/html/doc
-ENV OPENSSL_CONF=/usr/local/etc/openssl/openssl.cnf
+# debian: OPENSSLDIR: "/usr/lib/ssl"
+COPY misc/docker/openssl.cnf /usr/lib/ssl/openssl.cnf
+# debian: MODULESDIR: "/usr/lib/x86_64-linux-gnu/ossl-modules"
+COPY --from=local-build /usr/src/ngx_pep/target/release/libossl_hsm.so /usr/lib/x86_64-linux-gnu/ossl-modules

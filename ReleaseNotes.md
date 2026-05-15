@@ -2,6 +2,65 @@
 
 # Release Notes ZETA PEP
 
+## Release 1.0.1
+
+### added
+- pep_forward_client_data config to set, default off. "zeta-client-data" upstream
+  header was always set previously (A_26492-02)
+
+### fixed
+- rare deadlock and u-a-f under load-test conditions (ngx-tickle 0.2.4)
+
+### changed
+- low-level performance optimizations regarding ASL session locks, client body reading,
+  tickle coaslescing (ngx-tickle)
+- increased max. ASL session cache size to 100MiB
+
+### removed
+- pipelining and keep-alive in the internal http client. This hurt performance because
+  it introduced locking overhead; it is faster to establish new connections in the
+  ASL→internal use-case, and JWK cache didn't need it
+
+## Release 1.0.0
+
+### added:
+- nginx-ingress build that has ossl_hsm and can use it to externalize TLS to an HSM
+- popp:
+  - validate actorId == access_token.sub
+  - quarter-based validity can now be configured, relative validity now also takes
+    duration strings like "10d"
+- hsm_sim:
+  - Enable brainpool curves, and remove p521. supported now:
+    - Nid::X9_62_PRIME256V1 (key id suffix .p256)
+    - Nid::SECP384R1 (.p384)
+    - Nid::BRAINPOOL_P256R1 (.bp256)
+    - Nid::BRAINPOOL_P384R1 (.bp384)
+    - Nid::BRAINPOOL_P512R1 (.bp512)
+- ossl_hsm:
+  - support all aforementioned curves
+- asl:
+  - switch to openssl in ASL key generation, to enable HSM signatures via ossl_hsm
+- jwk_cache:
+  - can do conditional requests when the JWKS server responds with etag or
+    last-modified, and respects cache-control max-age to postpone the next refresh
+  - will retry once when JWKS refresh fails before removing the JWKS from the cache
+
+### fixed
+- hsm_sim:
+  - shutdown hang with dead clients
+- ossl_hsm:
+  - reconnection issue on gRPC connection reset
+- popp:
+  - missing PoPP token (when required) now returns 400 Bad Request
+
+### changed:
+- dependency upgrades:
+  - nginx: 1.29.8
+  - ngx-tickle: 0.2.1
+- jwk_cache:
+  - now sets x-forwarded-for to the client IP when JWKS refreshes are triggered by
+    unknown kids, to enable ip-based rate-limiting in the remote server
+
 ## Release 0.5.1
 
 ### added:

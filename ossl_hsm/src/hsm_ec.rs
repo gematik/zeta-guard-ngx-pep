@@ -30,6 +30,7 @@
 use std::ffi::CStr;
 use std::sync::OnceLock;
 
+use openssl::hash::MessageDigest;
 use openssl_provider_forge::bindings::{
     CONST_OSSL_PARAM, OSSL_ALGORITHM, OSSL_CALLBACK, OSSL_DISPATCH, OSSL_FUNC_KEYMGMT_EXPORT,
     OSSL_FUNC_KEYMGMT_EXPORT_TYPES, OSSL_FUNC_KEYMGMT_FREE, OSSL_FUNC_KEYMGMT_GET_PARAMS,
@@ -62,20 +63,181 @@ use crate::grpc_client;
 // Types
 // ============================================================================
 
-/// Opaque handle - stores only the key identifier, NOT the actual key
+/// Public key material fetched from the HSM proxy on first use. We can't
+/// retrieve the private key, but the public key tells us the curve (via the
+/// EC group OID) and gives us the uncompressed point that OpenSSL needs for
+/// cert/key matching in `keymgmt_export`.
+pub struct KeyMaterial {
+    pub curve: Curve,
+    pub pub_uncompressed: Vec<u8>,
+}
+
+/// Opaque handle — stores only the key identifier, NOT the actual key.
+/// `material` is populated lazily on first call to [`KeyHandle::material`].
 pub struct KeyHandle {
     pub key_id: String,
+    material: OnceLock<KeyMaterial>,
 }
 
 impl KeyHandle {
     pub fn new(key_id: String) -> Self {
-        Self { key_id }
+        Self {
+            key_id,
+            material: OnceLock::new(),
+        }
+    }
+
+    /// Fetch the public key from the HSM proxy (once) and cache the curve plus
+    /// the uncompressed public key bytes. Subsequent calls hit the cache.
+    pub fn material(&self) -> Result<&KeyMaterial, String> {
+        if let Some(m) = self.material.get() {
+            return Ok(m);
+        }
+        let info = grpc_client::get_public_key(&self.key_id)?;
+        let pkey = openssl::pkey::PKey::public_key_from_pem(info.pem.as_bytes())
+            .map_err(|e| format!("parse PEM: {e}"))?;
+        let ec = pkey.ec_key().map_err(|e| format!("ec_key: {e}"))?;
+        let group = ec.group();
+        let curve = Curve::from_ec_group(group).ok_or_else(|| {
+            format!(
+                "unsupported EC curve for key '{}' (only P-256, P-384, brainpoolP{{256,384,512}}r1 supported)",
+                self.key_id
+            )
+        })?;
+        let mut bn_ctx =
+            openssl::bn::BigNumContext::new().map_err(|e| format!("BigNumContext::new: {e}"))?;
+        let pub_uncompressed = ec
+            .public_key()
+            .to_bytes(
+                group,
+                openssl::ec::PointConversionForm::UNCOMPRESSED,
+                &mut bn_ctx,
+            )
+            .map_err(|e| format!("public_key.to_bytes: {e}"))?;
+        // OnceLock::set: ignore the racy-loser case, the value is the same anyway.
+        let _ = self.material.set(KeyMaterial {
+            curve,
+            pub_uncompressed,
+        });
+        Ok(self.material.get().unwrap())
     }
 }
 
-/// Signature context - tracks state during signing operation
+/// Signature context — tracks state during a signing operation. Both fields
+/// are populated in `signature_digest_sign_init` from the bound key.
 pub struct SignCtx {
     key_id: String,
+    digest: Option<MessageDigest>,
+    curve: Option<Curve>,
+}
+
+/// The curve is determined from the EC group OID in the returned public key.
+///
+/// Supported curves per gemSpec_Krypt A_28868: P-256 and P-384 (MUSS),
+/// brainpoolP{256,384,512}r1 (KÖNNEN). P-521 is "andere" and SOLLEN NICHT,
+/// so it is not accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Curve {
+    P256,
+    P384,
+    BrainpoolP256,
+    BrainpoolP384,
+    BrainpoolP512,
+}
+
+impl Curve {
+    /// Identify the curve from an OpenSSL EC group (the group of the public
+    /// key the HSM proxy returned). Returns None for unsupported curves.
+    pub fn from_ec_group(group: &openssl::ec::EcGroupRef) -> Option<Self> {
+        match group.curve_name()? {
+            openssl::nid::Nid::X9_62_PRIME256V1 => Some(Self::P256),
+            openssl::nid::Nid::SECP384R1 => Some(Self::P384),
+            openssl::nid::Nid::BRAINPOOL_P256R1 => Some(Self::BrainpoolP256),
+            openssl::nid::Nid::BRAINPOOL_P384R1 => Some(Self::BrainpoolP384),
+            openssl::nid::Nid::BRAINPOOL_P512R1 => Some(Self::BrainpoolP512),
+            _ => None,
+        }
+    }
+
+    pub fn bits(self) -> u32 {
+        match self {
+            Self::P256 | Self::BrainpoolP256 => 256,
+            Self::P384 | Self::BrainpoolP384 => 384,
+            Self::BrainpoolP512 => 512,
+        }
+    }
+
+    pub fn security_bits(self) -> u32 {
+        match self {
+            Self::P256 | Self::BrainpoolP256 => 128,
+            Self::P384 | Self::BrainpoolP384 => 192,
+            Self::BrainpoolP512 => 256,
+        }
+    }
+
+    /// Max DER-encoded ECDSA signature length. ASN.1 SEQUENCE of two INTEGERs,
+    /// each up to ceil(bits/8)+1 bytes (sign-bit padding) plus tag/length overhead.
+    pub fn max_sig_der_len(self) -> usize {
+        match self {
+            Self::P256 | Self::BrainpoolP256 => 72,
+            Self::P384 | Self::BrainpoolP384 => 104,
+            Self::BrainpoolP512 => 137,
+        }
+    }
+
+    pub fn group_cstr(self) -> &'static CStr {
+        match self {
+            Self::P256 => c"prime256v1",
+            Self::P384 => c"secp384r1",
+            Self::BrainpoolP256 => c"brainpoolP256r1",
+            Self::BrainpoolP384 => c"brainpoolP384r1",
+            Self::BrainpoolP512 => c"brainpoolP512r1",
+        }
+    }
+
+    /// NUL-terminated bytes for OSSL_PARAM_UTF8_STRING exposure (OpenSSL expects
+    /// the pointed-at memory to outlive the param, so this returns a `&'static`).
+    pub fn group_name_bytes(self) -> &'static [u8] {
+        match self {
+            Self::P256 => b"prime256v1\0",
+            Self::P384 => b"secp384r1\0",
+            Self::BrainpoolP256 => b"brainpoolP256r1\0",
+            Self::BrainpoolP384 => b"brainpoolP384r1\0",
+            Self::BrainpoolP512 => b"brainpoolP512r1\0",
+        }
+    }
+
+    /// TLS 1.2/1.3 default digest for ECDSA with this curve. Pairs each curve
+    /// with the SHA-2 variant of matching strength (RFC 5639 §3 / TR-03111).
+    pub fn default_digest(self) -> MessageDigest {
+        match self {
+            Self::P256 | Self::BrainpoolP256 => MessageDigest::sha256(),
+            Self::P384 | Self::BrainpoolP384 => MessageDigest::sha384(),
+            Self::BrainpoolP512 => MessageDigest::sha512(),
+        }
+    }
+}
+
+/// Map an OpenSSL digest name (`mdname`) to a `MessageDigest`. Accepts the
+/// common spellings OpenSSL uses interchangeably ("SHA256", "SHA-256", "SHA2-256").
+fn digest_from_mdname(mdname: &CStr) -> Option<MessageDigest> {
+    match mdname.to_bytes() {
+        b"SHA256" | b"SHA-256" | b"SHA2-256" => Some(MessageDigest::sha256()),
+        b"SHA384" | b"SHA-384" | b"SHA2-384" => Some(MessageDigest::sha384()),
+        b"SHA512" | b"SHA-512" | b"SHA2-512" => Some(MessageDigest::sha512()),
+        _ => None,
+    }
+}
+
+/// Reverse of `digest_from_mdname`: return the canonical OpenSSL name (NUL-
+/// terminated for OSSL_PARAM_UTF8_STRING use) for a `MessageDigest`.
+fn digest_name(d: &MessageDigest) -> &'static CStr {
+    match d.type_() {
+        openssl::nid::Nid::SHA256 => c"SHA256",
+        openssl::nid::Nid::SHA384 => c"SHA384",
+        openssl::nid::Nid::SHA512 => c"SHA512",
+        _ => c"SHA256",
+    }
 }
 
 // ============================================================================
@@ -83,45 +245,34 @@ pub struct SignCtx {
 // ============================================================================
 
 unsafe extern "C" fn keymgmt_new(_provctx: *mut libc::c_void) -> *mut libc::c_void {
-    eprintln!("[ossl_hsm] keymgmt_new");
-    Box::into_raw(Box::new(KeyHandle {
-        key_id: String::new(),
-    })) as *mut _
+    Box::into_raw(Box::new(KeyHandle::new(String::new()))) as *mut _
 }
 
 unsafe extern "C" fn keymgmt_free(keydata: *mut libc::c_void) {
     if !keydata.is_null() {
-        let h = unsafe { Box::from_raw(keydata as *mut KeyHandle) };
-        eprintln!("[ossl_hsm] keymgmt_free key='{}'", h.key_id);
+        let _ = unsafe { Box::from_raw(keydata as *mut KeyHandle) };
     }
 }
 
 unsafe extern "C" fn keymgmt_has(
     keydata: *const libc::c_void,
-    selection: libc::c_int,
+    _selection: libc::c_int,
 ) -> libc::c_int {
     if keydata.is_null() {
         return 0;
     }
     let h = unsafe { &*(keydata as *const KeyHandle) };
-    let have = !h.key_id.is_empty();
-    let want_priv = (selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY as i32) != 0;
     // We must claim to have the private key even though it's remote,
     // otherwise OSSL_STORE_load rejects the key entirely.
     // The actual private key operations go through the signature dispatch.
-    eprintln!(
-        "[ossl_hsm] keymgmt_has key='{}' want_priv={} have={}",
-        h.key_id, want_priv, have
-    );
-    if have { 1 } else { 0 }
+    if !h.key_id.is_empty() { 1 } else { 0 }
 }
 
 unsafe extern "C" fn keymgmt_import(
     keydata: *mut libc::c_void,
-    selection: libc::c_int,
+    _selection: libc::c_int,
     params: *const OSSL_PARAM,
 ) -> libc::c_int {
-    eprintln!("[ossl_hsm] keymgmt_import called! selection={}", selection);
     if keydata.is_null() {
         eprintln!("[ossl_hsm] keymgmt_import: null keydata");
         return 0;
@@ -137,7 +288,6 @@ unsafe extern "C" fn keymgmt_import(
                 && let Ok(id) = std::str::from_utf8(data)
             {
                 h.key_id = id.trim_end_matches('\0').to_string();
-                eprintln!("[ossl_hsm] I was asked for key '{}'", h.key_id);
                 return 1;
             }
         }
@@ -146,11 +296,7 @@ unsafe extern "C" fn keymgmt_import(
     0
 }
 
-unsafe extern "C" fn keymgmt_import_types(selection: libc::c_int) -> *const OSSL_PARAM {
-    eprintln!(
-        "[ossl_hsm] keymgmt_import_types called! selection={}",
-        selection
-    );
+unsafe extern "C" fn keymgmt_import_types(_selection: libc::c_int) -> *const OSSL_PARAM {
     static PARAMS: &[CONST_OSSL_PARAM] = &[
         CONST_OSSL_PARAM {
             key: c"reference".as_ptr(),
@@ -176,25 +322,29 @@ unsafe extern "C" fn keymgmt_get_params(
         return 0;
     };
 
+    let h = unsafe { &*(keydata as *const KeyHandle) };
+    let curve = match h.material() {
+        Ok(m) => m.curve,
+        Err(e) => {
+            eprintln!("[ossl_hsm] keymgmt_get_params: {}", e);
+            return 0;
+        }
+    };
+
     for mut p in params {
         let Some(key) = p.get_key() else { continue };
-        eprintln!(
-            "[ossl_hsm] keymgmt_get_params: asked for '{}'",
-            key.to_string_lossy()
-        );
-
         match key.to_bytes() {
             b"bits" => {
-                let _ = p.set(256u32);
+                let _ = p.set(curve.bits());
             }
             b"security-bits" => {
-                let _ = p.set(128u32);
+                let _ = p.set(curve.security_bits());
             }
             b"max-size" => {
-                let _ = p.set(72u32);
+                let _ = p.set(curve.max_sig_der_len() as u32);
             }
             b"group" => {
-                let _ = p.set(c"prime256v1");
+                let _ = p.set(curve.group_cstr());
             }
             _ => {}
         }
@@ -254,100 +404,59 @@ unsafe extern "C" fn keymgmt_export(
     };
 
     let h = unsafe { &*(keydata as *const KeyHandle) };
-    eprintln!(
-        "[ossl_hsm] keymgmt_export key='{}' selection={}",
-        h.key_id, selection
-    );
 
     // If private key is requested, refuse — we can't export HSM key material.
     // OpenSSL should fall back to using the signature dispatch instead.
     let want_priv = (selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY as i32) != 0;
     if want_priv {
-        eprintln!("[ossl_hsm] keymgmt_export: private key requested, refusing (key is in HSM)");
         return 0;
     }
 
     // Only export if public key is requested
     let want_pub = (selection & OSSL_KEYMGMT_SELECT_PUBLIC_KEY as i32) != 0;
     if !want_pub {
-        eprintln!("[ossl_hsm] keymgmt_export: public key not requested, returning success");
         return 1;
     }
 
-    // Get public key from gRPC server
-    let pub_info = match grpc_client::get_public_key(&h.key_id) {
-        Ok(info) => info,
+    let material = match h.material() {
+        Ok(m) => m,
         Err(e) => {
-            eprintln!("[ossl_hsm] keymgmt_export: gRPC error: {}", e);
-            return 0;
-        }
-    };
-
-    // Parse the PEM to extract the EC public key point
-    let pkey = match openssl::pkey::PKey::public_key_from_pem(pub_info.pem.as_bytes()) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("[ossl_hsm] keymgmt_export: parse PEM: {}", e);
-            return 0;
-        }
-    };
-
-    let ec = match pkey.ec_key() {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("[ossl_hsm] keymgmt_export: ec_key: {}", e);
-            return 0;
-        }
-    };
-
-    // Get public key point in uncompressed form
-    let mut bn_ctx = openssl::bn::BigNumContext::new().unwrap();
-    let pub_key_bytes = match ec.public_key().to_bytes(
-        ec.group(),
-        openssl::ec::PointConversionForm::UNCOMPRESSED,
-        &mut bn_ctx,
-    ) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("[ossl_hsm] keymgmt_export: to_bytes: {}", e);
+            eprintln!("[ossl_hsm] keymgmt_export: {}", e);
             return 0;
         }
     };
 
     eprintln!(
-        "[ossl_hsm] keymgmt_export: public key {} bytes",
-        pub_key_bytes.len()
+        "[ossl_hsm] keymgmt_export: returning public key, key_id={}, curve={:?}, {} bytes",
+        &h.key_id,
+        material.curve,
+        material.pub_uncompressed.len()
     );
 
-    // Build params with group name and public key
-    static GROUP_NAME: &[u8] = b"prime256v1\0";
-
+    let group_name = material.curve.group_name_bytes();
     let params: [OSSL_PARAM; 3] = [
         OSSL_PARAM {
             key: c"group".as_ptr(),
             data_type: OSSL_PARAM_UTF8_STRING,
-            data: GROUP_NAME.as_ptr() as *mut _,
-            data_size: GROUP_NAME.len() - 1,
+            data: group_name.as_ptr() as *mut _,
+            data_size: group_name.len() - 1,
             return_size: 0,
         },
         OSSL_PARAM {
             key: c"pub".as_ptr(),
             data_type: OSSL_PARAM_OCTET_STRING,
-            data: pub_key_bytes.as_ptr() as *mut _,
-            data_size: pub_key_bytes.len(),
+            data: material.pub_uncompressed.as_ptr() as *mut _,
+            data_size: material.pub_uncompressed.len(),
             return_size: 0,
         },
         OSSL_PARAM::END,
     ];
 
-    let ret = cb.call(&params);
-    eprintln!("[ossl_hsm] keymgmt_export: callback returned {}", ret);
-    ret
+    cb.call(&params)
 }
 
 /// Advertise what we can export
-unsafe extern "C" fn keymgmt_export_types(selection: libc::c_int) -> *const OSSL_PARAM {
-    eprintln!("[ossl_hsm] keymgmt_export_types selection={}", selection);
+unsafe extern "C" fn keymgmt_export_types(_selection: libc::c_int) -> *const OSSL_PARAM {
     static PARAMS: &[CONST_OSSL_PARAM] = &[
         CONST_OSSL_PARAM {
             key: c"group".as_ptr(),
@@ -374,11 +483,6 @@ unsafe extern "C" fn keymgmt_export_types(selection: libc::c_int) -> *const OSSL
 unsafe extern "C" fn keymgmt_query_operation_name(
     operation_id: libc::c_int,
 ) -> *const libc::c_char {
-    eprintln!(
-        "[ossl_hsm] keymgmt_query_operation_name operation_id={}",
-        operation_id
-    );
-    // OSSL_OP_SIGNATURE = 12
     if operation_id == openssl_provider_forge::bindings::OSSL_OP_SIGNATURE as libc::c_int {
         return c"ECDSA".as_ptr();
     }
@@ -389,10 +493,8 @@ unsafe extern "C" fn keymgmt_query_operation_name(
 /// The reference is a pointer to a KeyHandle that was boxed by the store loader
 unsafe extern "C" fn keymgmt_load(
     reference: *const libc::c_void,
-    reference_sz: libc::size_t,
+    _reference_sz: libc::size_t,
 ) -> *mut libc::c_void {
-    eprintln!("[ossl_hsm] keymgmt_load: reference_sz={}", reference_sz);
-
     if reference.is_null() {
         eprintln!("[ossl_hsm] keymgmt_load: null reference");
         return std::ptr::null_mut();
@@ -403,7 +505,7 @@ unsafe extern "C" fn keymgmt_load(
     let key_handle = reference as *mut KeyHandle;
     unsafe {
         eprintln!(
-            "[ossl_hsm] keymgmt_load: returning KeyHandle for key '{}'",
+            "[ossl_hsm] keymgmt_load: returning KeyHandle for key_id={}",
             (*key_handle).key_id
         );
     }
@@ -419,15 +521,15 @@ unsafe extern "C" fn signature_newctx(
     _: *mut libc::c_void,
     _: *const libc::c_char,
 ) -> *mut libc::c_void {
-    eprintln!("[ossl_hsm] signature_newctx");
     Box::into_raw(Box::new(SignCtx {
         key_id: String::new(),
+        digest: None,
+        curve: None,
     })) as *mut _
 }
 
 unsafe extern "C" fn signature_freectx(ctx: *mut libc::c_void) {
     if !ctx.is_null() {
-        eprintln!("[ossl_hsm] signature_freectx");
         drop(unsafe { Box::from_raw(ctx as *mut SignCtx) });
     }
 }
@@ -438,26 +540,47 @@ unsafe extern "C" fn signature_digest_sign_init(
     provkey: *mut libc::c_void,
     _params: *const OSSL_PARAM,
 ) -> libc::c_int {
-    if ctx.is_null() {
+    if ctx.is_null() || provkey.is_null() {
         return 0;
     }
 
     let sig_ctx = unsafe { &mut *(ctx as *mut SignCtx) };
+    let key_handle = unsafe { &*(provkey as *const KeyHandle) };
 
-    // Capture the key reference from the KeyHandle
-    if !provkey.is_null() {
-        let key_handle = unsafe { &*(provkey as *const KeyHandle) };
-        sig_ctx.key_id = key_handle.key_id.clone();
-        eprintln!(
-            "[ossl_hsm] signature_digest_sign_init key_id='{}'",
-            sig_ctx.key_id
-        );
-    }
+    let curve = match key_handle.material() {
+        Ok(m) => m.curve,
+        Err(e) => {
+            eprintln!("[ossl_hsm] signature_digest_sign_init: {}", e);
+            return 0;
+        }
+    };
 
-    if !mdname.is_null() {
+    let digest = if mdname.is_null() {
+        curve.default_digest()
+    } else {
         let md = unsafe { CStr::from_ptr(mdname) };
-        eprintln!("[ossl_hsm] signature_digest_sign_init digest={:?}", md);
-    }
+        match digest_from_mdname(md) {
+            Some(d) => d,
+            None => {
+                eprintln!(
+                    "[ossl_hsm] signature_digest_sign_init: unknown digest {:?}",
+                    md
+                );
+                return 0;
+            }
+        }
+    };
+
+    sig_ctx.key_id = key_handle.key_id.clone();
+    sig_ctx.curve = Some(curve);
+    sig_ctx.digest = Some(digest);
+
+    eprintln!(
+        "[ossl_hsm] signature_digest_sign_init key_id={}, curve={:?}, digest={}",
+        &sig_ctx.key_id,
+        curve,
+        digest_name(&digest).to_str().unwrap(),
+    );
     1
 }
 
@@ -473,18 +596,21 @@ unsafe extern "C" fn signature_digest_sign(
         return 0;
     }
 
+    let sig_ctx = unsafe { &*(ctx as *const SignCtx) };
+    let (Some(curve), Some(md)) = (sig_ctx.curve, sig_ctx.digest) else {
+        eprintln!("[ossl_hsm] signature_digest_sign: not initialized");
+        return 0;
+    };
+
     // If sig is NULL, caller wants to know required buffer size
     if sig.is_null() {
-        unsafe { *siglen = 72 }; // Max P-256 ECDSA DER signature
+        unsafe { *siglen = curve.max_sig_der_len() };
         return 1;
     }
 
-    let sig_ctx = unsafe { &*(ctx as *const SignCtx) };
-    eprintln!("[ossl_hsm] I'm signing with key '{}'", sig_ctx.key_id);
-
     // Hash the data locally, then send the digest to the gRPC server
     let data = unsafe { std::slice::from_raw_parts(tbs, tbslen) };
-    let digest = match openssl::hash::hash(openssl::hash::MessageDigest::sha256(), data) {
+    let digest = match openssl::hash::hash(md, data) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("[ossl_hsm] hash: {}", e);
@@ -529,7 +655,13 @@ unsafe extern "C" fn signature_digest_sign(
         }
     };
 
-    eprintln!("[ossl_hsm] Signed via gRPC ({} bytes DER)", der.len());
+    eprintln!(
+        "[ossl_hsm] Signed via gRPC, key_id={}, curve={:?}, digest={}, {} bytes DER",
+        &sig_ctx.key_id,
+        curve,
+        digest_name(&md).to_str().unwrap(),
+        der.len()
+    );
     unsafe {
         std::ptr::copy_nonoverlapping(der.as_ptr(), sig, der.len());
         *siglen = der.len();
@@ -553,6 +685,10 @@ unsafe extern "C" fn signature_digest_verify_init(
         if !provkey.is_null() {
             let key_handle = &*(provkey as *const KeyHandle);
             sig_ctx.key_id = key_handle.key_id.clone();
+            eprintln!(
+                "[ossl_hsm] signature_digest_verify_init key_id={}",
+                &key_handle.key_id
+            );
         }
 
         if !mdname.is_null() {
@@ -578,22 +714,25 @@ unsafe extern "C" fn signature_digest_verify(
 
 /// Get signature context parameters
 unsafe extern "C" fn signature_get_ctx_params(
-    _ctx: *mut libc::c_void,
+    ctx: *mut libc::c_void,
     params: *mut OSSL_PARAM,
 ) -> libc::c_int {
     let Ok(params) = OSSLParam::try_from(params) else {
         return 1;
     };
 
+    let digest = if ctx.is_null() {
+        None
+    } else {
+        unsafe { &*(ctx as *const SignCtx) }.digest
+    };
+
     for mut p in params {
         let Some(key) = p.get_key() else { continue };
-        eprintln!(
-            "[ossl_hsm] signature_get_ctx_params: asked for '{}'",
-            key.to_string_lossy()
-        );
-
-        if key.to_bytes() == b"digest" {
-            let _ = p.set(c"SHA256");
+        if key.to_bytes() == b"digest"
+            && let Some(d) = digest
+        {
+            let _ = p.set(digest_name(&d));
         }
     }
     1
@@ -622,7 +761,6 @@ unsafe extern "C" fn signature_set_ctx_params(
     _ctx: *mut libc::c_void,
     params: *const OSSL_PARAM,
 ) -> libc::c_int {
-    // We accept digest parameter but always use SHA-256
     let Ok(params) = OSSLParam::try_from(params) else {
         return 1;
     };
@@ -630,7 +768,7 @@ unsafe extern "C" fn signature_set_ctx_params(
     for p in params {
         if let Some(key) = p.get_key() {
             eprintln!(
-                "[ossl_hsm] signature_set_ctx_params: '{}' set",
+                "[ossl_hsm] signature_set_ctx_params: param={}",
                 key.to_string_lossy()
             );
         }

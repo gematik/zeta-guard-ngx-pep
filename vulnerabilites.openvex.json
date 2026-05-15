@@ -2,7 +2,7 @@
   "@context": "https://openvex.dev/ns/v0.2.0",
   "@id": "https://openvex.dev/docs/public/vex-9f78659d69d5c3a33e770fcafa904ea9af0d85ac2d2679aa13c7b856f4553441",
   "author": "Unknown Author",
-  "version": 11,
+  "version": 12,
   "statements": [
     {
       "vulnerability": {
@@ -248,8 +248,194 @@
       "status_notes": "iconv wird tatsächlich nicht verwendet.",
       "justification": "vulnerable_code_not_in_execute_path",
       "timestamp": "2026-04-02T08:34:58.592613738Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-4878"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libcap2"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "TOCTOU race in cap_set_file(). libcap2 is pulled in transitively by the runtime image, but neither nginx, ngx_pep, ossl_hsm nor hsm_sim calls cap_set_file(); setcap/getcap are not invoked at runtime. The exploit additionally requires a local unprivileged attacker racing a concurrent setcap call — neither precondition exists in the container.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-04-21T00:00:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-27456"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/bsdutils"
+        },
+        {
+          "@id": "pkg:deb/debian/libblkid1"
+        },
+        {
+          "@id": "pkg:deb/debian/libmount1"
+        },
+        {
+          "@id": "pkg:deb/debian/libsmartcols1"
+        },
+        {
+          "@id": "pkg:deb/debian/login"
+        },
+        {
+          "@id": "pkg:deb/debian/mount"
+        }
+      ],
+      "status": "under_investigation",
+      "timestamp": "2026-04-28T10:31:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-4437"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc-bin"
+        },
+        {
+          "@id": "pkg:deb/debian/libc6"
+        }
+      ],
+      "status": "under_investigation",
+      "timestamp": "2026-04-28T10:31:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-4438"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc-bin"
+        },
+        {
+          "@id": "pkg:deb/debian/libc6"
+        }
+      ],
+      "status": "under_investigation",
+      "timestamp": "2026-04-28T10:31:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-5450"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc-bin"
+        },
+        {
+          "@id": "pkg:deb/debian/libc6"
+        }
+      ],
+      "status": "under_investigation",
+      "timestamp": "2026-04-28T10:31:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-5928"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc-bin"
+        },
+        {
+          "@id": "pkg:deb/debian/libc6"
+        }
+      ],
+      "status": "under_investigation",
+      "timestamp": "2026-04-28T10:31:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-34743"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/liblzma5"
+        }
+      ],
+      "status": "under_investigation",
+      "timestamp": "2026-04-28T10:31:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-29111"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libsystemd0"
+        }
+      ],
+      "status": "under_investigation",
+      "timestamp": "2026-04-28T10:31:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-40225"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libsystemd0"
+        }
+      ],
+      "status": "under_investigation",
+      "timestamp": "2026-04-28T10:31:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-40226"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libsystemd0"
+        }
+      ],
+      "status": "under_investigation",
+      "status_info": "Seit Version v250 ist nur noch das Sicherheitsziel Verfügbarkeit betroffen. Daher ist die Severity nur mit MEDIUM zu bewerten: https://nvd.nist.gov/vuln/detail/CVE-2026-29111. Die Bewertung von RedHat ist hier nicht zutreffend (https://access.redhat.com/security/cve/cve-2026-29111)",
+      "timestamp": "2026-04-28T10:31:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-69720"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libtinfo6"
+        }
+      ],
+      "status": "under_investigation",
+      "timestamp": "2026-04-28T10:31:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-5704"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/tar"
+        }
+      ],
+      "status": "under_investigation",
+      "timestamp": "2026-04-28T10:31:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-27171"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/zlib1g"
+        }
+      ],
+      "status": "under_investigation",
+      "timestamp": "2026-04-28T10:31:00Z"
     }
   ],
   "timestamp": "2026-02-13T12:54:56Z",
-  "last_updated": "2026-04-02T08:34:58Z"
+  "last_updated": "2026-04-28T10:31:00Z"
 }

@@ -376,7 +376,8 @@ impl NginxLease {
         let _ = timeout(Duration::from_secs(5), async move {
             futures::try_join!(nginx_ready, control_ready)
         })
-        .await?;
+        .await
+        .context("waiting for nginx and control port")?;
         Ok(())
     }
 

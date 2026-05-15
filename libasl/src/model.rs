@@ -323,6 +323,8 @@ pub enum AslError {
     // custom types, not specified
     #[error("key signature invalid")]
     VerificationError, // Prüfung der signierten öffentlichen Schlüssel fehlerhaft
+    #[error("illegal key tracing header")]
+    IllegalTracing, // Verwendung von ZETA-ASL-nonPU-Tracing in PU-Umgebung
     #[error("bad request: {0}")]
     BadRequest(#[source] anyhow::Error),
     #[error("internal error: {0}")]
@@ -342,6 +344,7 @@ impl AslError {
             AslError::UnknownKeyID => 403,
             AslError::UnknownCID => 403,
             AslError::VerificationError => 500,
+            AslError::IllegalTracing => 403,
             AslError::BadRequest(_) => 400,
             AslError::InternalError(_) => 500,
         }
@@ -359,6 +362,7 @@ impl AslError {
             AslError::UnknownKeyID => 8,
             AslError::UnknownCID => 9,
             AslError::VerificationError => 100,
+            AslError::IllegalTracing => 103,
             AslError::BadRequest(_) => 101,
             AslError::InternalError(_) => 102,
         }

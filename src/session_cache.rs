@@ -46,7 +46,7 @@ use crate::ngx_http_pep_module;
 use crate::ocsp_cache::OcspCache;
 use crate::{Module, log_debug};
 
-const SESSION_CACHE_SIZE: usize = 10 << 20;
+const SESSION_CACHE_SIZE: usize = 100 << 20;
 
 pub struct ShmHandshakeState<A: Allocator + Clone> {
     pub ss_e: [u8; 64],
@@ -255,15 +255,11 @@ impl ShmSessionCache {
         match result {
             Ok(Some(session)) => Ok(session),
             Ok(None) => {
-                tokio::task::spawn_blocking(move || {
-                    // read lock has been dropped, safe to acquire write lock
-                    let mut map = self.shared.map.write();
-                    let _ = map.remove(&key);
+                let mut map = self.shared.map.write();
+                let _ = map.remove(&key);
 
-                    log_debug!("continue_session: expire cid {key}");
-                    Err(anyhow!("expired — {key}"))
-                })
-                .await?
+                log_debug!("continue_session: expire cid {key}");
+                Err(anyhow!("expired — {key}"))
             }
             Err(e) => Err(e),
         }
@@ -345,24 +341,25 @@ extern "C" fn shared_zone_init(shm_zone: *mut ngx_shm_zone_t, _data: *mut c_void
                 main_conf.asl_ocsp.clone(),
                 main_conf.asl_ocsp_ttl,
             )
-            .inspect(|config| {
-                if config.is_default() {
+            .map(|config| {
+                if config.asl.is_default() {
                     println!("asl environment: disabled");
                 } else {
                     println!(
                         "asl environment: {:?} - CertData.{}",
-                        config.env,
-                        config.signed_keys.version()
+                        config.asl.env,
+                        config.asl.signed_keys.version()
                     );
-                    if let Some(url) = &config.ocsp_url {
-                        println!("asl ocsp: {} TTL {}", url, config.ocsp_ttl.as_secs());
+                    if let Some(url) = &config.ocsp.url {
+                        println!("asl ocsp: {} TTL {}", url, config.ocsp.ttl.as_secs());
                     } else {
                         println!("asl ocsp: off");
                     }
                 }
-                OcspCache::init(config);
+                OcspCache::init(config.ocsp);
+                config.asl
             })
-            .unwrap(),
+            .expect("asl init"),
         );
         let shared = Shared {
             map,

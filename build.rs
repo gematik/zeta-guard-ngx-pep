@@ -31,7 +31,7 @@ use std::{
     process::Stdio,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use schemars::schema::RootSchema;
 use schemars::visit::{Visitor, visit_schema_object};
 use serde::Serialize;
@@ -49,41 +49,60 @@ fn get_nginx_source_dir(build_dir: &Path) -> PathBuf {
 #[derive(Serialize)]
 struct ConfigFile {
     name: String,
+    pdp_host: String,
     libsuff: String,
     target: String,
+    // which module .so to load: "dev" (default features, target/module,
+    // built via `cargo module`) or "test" (`its` feature for the tarpc control
+    // socket, target/module-test, built by the nextest setup script). The
+    // symlinks live in prefix/modules/libngx_pep.{variant}.{target}.{libsuff}.
+    variant: String,
     multi_process: bool,
     error_log: String,
     access_log: String,
     port: u16,
     // IT: embedded echo server port for upstream tests
     echo_port: u16,
-    // pep_asl_ocsp value: "off" or "http://127.1.33.7:{port}"
+    no_travel: String,
+    // IT: set to mock server representing PDP's sid revocation service (no-travel blocks) —
+    // defaults to an URL derived from pdp_issuer otherwise
+    revocation_url: Option<String>,
+    // pep_asl_ocsp value: "off" or "http://127.0.0.1:{port}"
     ocsp_url: String,
     temp_prefix: String,
     // adds 'user root;' for CI (coverage), no effect when master is not root (e.g. locally)
     as_root: bool,
     // enable tls via ossl_hsm
     tls: bool,
+    // pep_require_popp
+    require_popp: String,
 }
 
 impl ConfigFile {
     fn new() -> Self {
+        println!("cargo:rerun-if-env-changed=IT_HOST");
         ConfigFile {
             name: "nginx".to_string(),
+            pdp_host: env::var("IT_HOST")
+                .unwrap_or("zeta-cd.westeurope.cloudapp.azure.com".to_string()),
             #[cfg(target_os = "macos")]
             libsuff: "dylib".to_string(),
             #[cfg(not(target_os = "macos"))]
             libsuff: "so".to_string(),
             target: "debug".to_string(),
+            variant: "dev".to_string(),
             multi_process: false, // set to false for easier debugging — test should use true
             error_log: "/dev/stdout".to_string(),
             access_log: "/dev/stdout main".to_string(),
             port: 8000,
             echo_port: 8100, // should be port + 100
+            no_travel: "on".to_string(),
+            revocation_url: None,
             ocsp_url: "off".to_string(),
             temp_prefix: "".to_string(),
             as_root: false,
             tls: false,
+            require_popp: "off".to_string(),
         }
     }
 
@@ -126,16 +145,20 @@ pub fn install_config() -> Result<()> {
     for port in 8003..=8006 {
         let mut test_config = ConfigFile::new();
         test_config.name = format!("test-{port}");
+        test_config.variant = "test".to_string();
         test_config.multi_process = true;
         // All test instances share a single log file for easier debugging
         test_config.error_log = "test.log".to_string();
         test_config.access_log = "test.log main".to_string();
         test_config.port = port;
         test_config.echo_port = port + 100; // e.g. 8003 → 8103
-        test_config.ocsp_url = format!("http://127.1.33.7:{}", port + 300);
+        test_config.no_travel = "on".to_string();
+        test_config.revocation_url = Some(format!("http://127.0.0.1:{}", port + 400));
+        test_config.ocsp_url = format!("http://127.0.0.1:{}", port + 300);
         test_config.temp_prefix = format!("{}/", test_config.name);
         test_config.as_root = true; // needed in CI to write out coverage data
         test_config.tls = true; // IT start an in-process hsm-sim and tests tls with it
+        test_config.require_popp = "off".to_string();
         test_config.write()?;
         let test_dir = Path::new("prefix").join(format!("test-{port}"));
         create_dir_all(&test_dir)?;
@@ -279,7 +302,6 @@ fn copy(source: &str, target: &str) -> Result<u64> {
     let source = Path::new(source);
     println!("cargo:rerun-if-changed={}", source.display());
     let target = Path::new(target);
-    println!("cargo:rerun-if-changed={}", target.display());
     fs::copy(source, target).context(format!("copy {} {}", source.display(), target.display()))
 }
 
@@ -303,14 +325,153 @@ fn copy_aslkeys() -> Result<()> {
     )?;
     copy("libasl/fixtures/roots.json", "prefix/conf/roots.json")?;
 
-    copy("misc/config/common.conf", "prefix/conf/common.conf")?;
-    copy("misc/config/asl.conf", "prefix/conf/asl.conf")?;
+    copy(
+        "misc/config/main_common.conf",
+        "prefix/conf/main_common.conf",
+    )?;
+    copy(
+        "misc/config/http_common.conf",
+        "prefix/conf/http_common.conf",
+    )?;
     copy(
         "misc/config/server_common.conf",
         "prefix/conf/server_common.conf",
     )?;
+    copy("misc/config/asl.conf", "prefix/conf/asl.conf")?;
+    copy(
+        "misc/config/proxy_headers.conf",
+        "prefix/conf/proxy_headers.conf",
+    )?;
 
     Ok(())
+}
+
+/// Generate Rust bindings for the (built-in) proxy module's per-location config struct.
+///
+/// We only emit `ngx_http_proxy_loc_conf_t` (+ its two proxy-local helper structs and the
+/// `ngx_http_proxy_module` symbol); every other field type is reused from `nginx_sys` via
+/// `allowlist_recursively(false)` + `use nginx_sys::*`. That keeps `ngx_hash_t` etc. identical
+/// to what `ngx_hash_find` expects, and — crucially — outsources the feature-macro-dependent
+/// layout of the embedded `ngx_http_upstream_conf_t` (which fixes the offset of `headers`) to
+/// nginx-sys, which derived it from this same configured source tree. We feed bindgen the exact
+/// include paths nginx-sys used (`DEP_NGINX_INCLUDE`), so `objs/ngx_auto_config.h` supplies the
+/// same `NGX_HTTP_*` defines. A layout/field change on an nginx bump surfaces as a compile error
+/// in `src/proxy_conf.rs`, not silent UB.
+fn generate_proxy_binding() -> Result<()> {
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+    let include =
+        env::var("DEP_NGINX_INCLUDE").context("DEP_NGINX_INCLUDE not exported by nginx-sys")?;
+
+    let mut clang_args: Vec<String> = env::split_paths(&include)
+        .map(|p| format!("-I{}", p.display()))
+        .collect();
+    // The header lives in src/http/modules; ALL_INCS already lists it, but be explicit.
+    let build_dir = PathBuf::from(env::var("DEP_NGINX_BUILD_DIR")?);
+    let modules = get_nginx_source_dir(&build_dir).join("src/http/modules");
+    clang_args.push(format!("-I{}", modules.display()));
+
+    let bindings = bindgen::Builder::default()
+        .header_contents("proxy_wrapper.h", "#include <ngx_http_proxy_module.h>\n")
+        .clang_args(&clang_args)
+        .allowlist_type("ngx_http_proxy_loc_conf_t")
+        .allowlist_type("ngx_http_proxy_headers_t")
+        .allowlist_type("ngx_http_proxy_vars_t")
+        .allowlist_var("ngx_http_proxy_module")
+        // do not regenerate the core ngx_* types — reuse nginx-sys' (identical, and correctly
+        // laid out for this build's feature macros). The including module (src/proxy_conf.rs)
+        // supplies `use nginx_sys::*;` so the unqualified field types resolve.
+        .allowlist_recursively(false)
+        .layout_tests(false)
+        .use_core()
+        .generate()
+        .map_err(|e| anyhow::anyhow!("bindgen ngx_http_proxy_module.h: {e}"))?;
+
+    bindings.write_to_file(out_dir.join("proxy_bindings.rs"))?;
+    println!(
+        "cargo:rerun-if-changed={}",
+        modules.join("ngx_http_proxy_module.h").display()
+    );
+    Ok(())
+}
+
+fn generate_openssl_cnf() -> Result<()> {
+    let target_dir = PathBuf::from(env::var("OUT_DIR")?)
+        .join("..")
+        .join("..")
+        .join("..")
+        .canonicalize()?;
+    #[cfg(target_os = "macos")]
+    let libsuff = "dylib";
+    #[cfg(not(target_os = "macos"))]
+    let libsuff = "so";
+    let text = format!(
+        "\
+        openssl_conf = openssl_init \n\
+        \n\
+        [openssl_init]\n\
+        providers = provider_sect\n\
+        \n\
+        [provider_sect]\n\
+        ossl_hsm = ossl_hsm_sect\n\
+        default = default_sect\n\
+        \n\
+        [ossl_hsm_sect]\n\
+        module = {}/libossl_hsm.{libsuff}\n\
+        activate = 1\n\
+        \n\
+        [default_sect]\n\
+        activate = 1\n\
+        ",
+        target_dir.display()
+    );
+    let target = target_dir.join("openssl.cnf");
+    fs::write(&target, &text)?;
+    Ok(())
+}
+
+fn run_xtask_check() -> Result<()> {
+    println!("cargo:rerun-if-env-changed=NGINX_VERSION");
+    println!("cargo:rerun-if-env-changed=NGX_CONFIGURE_ARGS");
+
+    // can't do cargo xtask configure automatically — when this is run, nginx-sys is already built
+    // instead, bail and instruct the user to run it
+    let status = Command::new("/usr/bin/env")
+        .arg("sh")
+        .arg("-c")
+        .arg("cargo xtask check")
+        // A CARGO_TARGET_DIR in our environment (e.g. the nextest setup script
+        // building into target/module, or a user-global setting) would be
+        // inherited by the nested cargo, which then blocks on the build-dir
+        // lock the outer cargo holds while running this build script —
+        // deadlock. xtask is its own workspace; let it use its own target dir.
+        .env_remove("CARGO_TARGET_DIR")
+        .status()?;
+    if !status.success() {
+        bail!("cargo xtask check failed. Run `cargo xtask configure` and try again")
+    }
+    Ok(())
+}
+
+/// Warn on the bare `cargo build`/`cargo check` signature: default features,
+/// debug profile, default target dir. That artifact is not loaded by any nginx
+/// config (the prefix/modules symlinks resolve into target/module-{dev,test}),
+/// and the invocation evicts the test build's fingerprints in target/ — the
+/// next `cargo nextest run` pays a full rebuild. Module builds (`cargo module`,
+/// `cargo module-test`), test/check with --workspace --all-targets, RA
+/// (all-features), and release builds all fall outside this signature.
+fn warn_bare_build() {
+    let bare_features =
+        env::var_os("CARGO_FEATURE_CLIENT").is_none() && env::var_os("CARGO_FEATURE_ITS").is_none();
+    let debug_profile = env::var("PROFILE").as_deref() == Ok("debug");
+    let default_target_dir = env::var("OUT_DIR")
+        .map(|d| d.contains("/target/debug/"))
+        .unwrap_or(false);
+    if bare_features && debug_profile && default_target_dir {
+        println!(
+            "cargo:warning=plain `cargo build`/`cargo check`: nginx does not load this artifact \
+             — use `cargo module` (dev .so) or `cargo nextest run` (tests)"
+        );
+    }
 }
 
 fn main() -> Result<()> {
@@ -321,10 +482,14 @@ fn main() -> Result<()> {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-undefined,dynamic_lookup");
     }
 
+    warn_bare_build();
+    run_xtask_check()?;
     make_install()?;
+    generate_proxy_binding()?;
     generate_schema()?;
     generate_book()?;
     copy_aslkeys()?;
+    generate_openssl_cnf()?;
 
     println!("cargo::rustc-check-cfg=cfg(coverage)");
     Ok(())

@@ -29,10 +29,10 @@ use std::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
 use std::ptr;
 
 use nginx_sys::{
-    ngx_chain_t, ngx_conf_t, ngx_connection_t, ngx_http_client_body_handler_pt,
-    ngx_http_compile_complex_value_t, ngx_http_complex_value_t, ngx_http_request_t, ngx_int_t,
-    ngx_pool_t, ngx_rbtree_node_t, ngx_rbtree_t, ngx_shm_zone_t, ngx_shmtx_t, ngx_slab_pool_t,
-    ngx_str_t,
+    ngx_chain_t, ngx_conf_t, ngx_connection_t, ngx_hash_t, ngx_http_client_body_handler_pt,
+    ngx_http_compile_complex_value_t, ngx_http_complex_value_t, ngx_http_output_header_filter_pt,
+    ngx_http_request_t, ngx_int_t, ngx_module_t, ngx_pool_t, ngx_rbtree_node_t, ngx_rbtree_t,
+    ngx_shm_zone_t, ngx_shmtx_t, ngx_slab_pool_t, ngx_str_t, ngx_uint_t,
 };
 
 #[unsafe(no_mangle)]
@@ -55,6 +55,9 @@ pub static mut ngx_event_actions: *mut c_void = std::ptr::null_mut();
 
 #[unsafe(no_mangle)]
 pub static mut ngx_process: c_int = 0;
+
+#[unsafe(no_mangle)]
+pub static mut ngx_worker: ngx_uint_t = 0;
 
 #[unsafe(no_mangle)]
 pub static mut ngx_thread_tid: c_int = 0;
@@ -239,3 +242,41 @@ pub unsafe extern "C" fn ngx_http_complex_value(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ngx_http_run_posted_requests(c: *mut ngx_connection_t) {}
+
+#[unsafe(no_mangle)]
+pub static mut ngx_http_top_header_filter: ngx_http_output_header_filter_pt = None;
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ngx_http_filter_finalize_request(
+    _r: *mut ngx_http_request_t,
+    _m: *mut ngx_module_t,
+    _error: ngx_int_t,
+) -> ngx_int_t {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ngx_http_clean_header(_r: *mut ngx_http_request_t) {}
+
+// referenced by src/proxy_conf.rs; only the real nginx binary provides these at module load
+#[unsafe(no_mangle)]
+pub static mut ngx_http_proxy_module: ngx_module_t = unsafe { core::mem::zeroed() };
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ngx_hash_find(
+    _hash: *mut ngx_hash_t,
+    _key: ngx_uint_t,
+    _name: *mut u8,
+    _len: usize,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ngx_http_add_variable(
+    _cf: *mut ngx_conf_t,
+    _name: *mut ngx_str_t,
+    _flags: ngx_uint_t,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}

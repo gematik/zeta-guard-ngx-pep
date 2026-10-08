@@ -1,6 +1,12 @@
 # vim: ft=nginx
 # NOTE: generated from misc/nginx.conf.tpl during `cargo build`
 # make sure to escape \{'s not meant for template expansion
+
+# cave: don't include main_modules here, we want to load a custom module below, and
+# don't need headers-more for dev/test.
+# include main_modules.conf;
+include main_common.conf;
+
 daemon off;
 
 {{- if multi_process}}
@@ -15,7 +21,7 @@ master_process off;
 user root;
 {{- endif}}
 
-load_module modules/{target}/libngx_pep.{libsuff};
+load_module modules/libngx_pep.{variant}.{target}.{libsuff};
 
 error_log {error_log};
 pid {temp_prefix}logs/nginx.pid;
@@ -25,7 +31,7 @@ events \{
 }
 
 http \{
-    include common.conf;
+    include http_common.conf;
 
     client_body_temp_path {temp_prefix}client_body_temp;
     proxy_temp_path {temp_prefix}proxy_temp;
@@ -36,13 +42,16 @@ http \{
 
     ### Global Config
 
-    # pep_pdp_issuer http://localhost:18080/realms/zeta-guard;
-    pep_pdp_issuer https://zeta-cd.westeurope.cloudapp.azure.com/auth/realms/zeta-guard;
-    # pep_pdp_issuer https://zeta-dev.westeurope.cloudapp.azure.com/auth/realms/zeta-guard;
-    # pep_pdp_issuer https://zeta-staging.spree.de/auth/realms/zeta-guard;
+    pep_pdp_issuer https://{pdp_host}/auth/realms/zeta-guard;
     ## server hosting PoPP entity statement at /.well-known/openid-federation
     ## optional if no locations use pep_require_popp
     pep_popp_issuer http://localhost:{port};
+    ## HOTFIX ANFTI2-922 / A_27558: `ZETA-User-Info.birthdate` is mandatory for DiPag, but
+    ## no PDP claim carries it yet. The PEP therefore emits a fixed date (1900-01-01) for
+    ## insurant tokens (professionOID 1.2.276.0.76.4.49; other client types get no
+    ## birthdate) that this directive overrides. Interim solution — drop it once the claim
+    ## exists.
+    # pep_user_info_birthdate 1900-01-01;
     # pep_http_client_connect_timeout 2; # s
     # pep_http_client_timeout 10; # s
     pep_http_client_accept_invalid_certs on;
@@ -63,7 +72,11 @@ http \{
     pep_asl_ocsp {ocsp_url};
     pep_asl_ocsp_ttl 1m;
     ## enable or disable no-travel enforcement (ip address consistency)
-    # pep_no_travel off;
+    pep_no_travel {no_travel};
+
+    {{- if revocation_url}}
+    pep_revocation_url {revocation_url};
+    {{- endif}}
 
     ### Location Config
 
@@ -72,10 +85,7 @@ http \{
     ## enable access phase handler to check access tokens, DPoP and, optionally, PoPP
     pep on;
     ## space separated list of required audiences
-    # pep_require_aud "http://localhost:18080";
-    pep_require_aud "https://zeta-cd.westeurope.cloudapp.azure.com";
-    # pep_require_aud "https://zeta-dev.westeurope.cloudapp.azure.com";
-    # pep_require_aud "https://zeta-staging.spree.de";
+    pep_require_aud "https://{pdp_host}";
 
     ## space separated list of required scopes
     # pep_require_scope "openid profile email";
@@ -85,7 +95,7 @@ http \{
     ## implied dpop validity in s: iat + pep_dpop_validity + pep_leeway
     # pep_dpop_validity 300;
     ## validate PoPP header and pass along decoded claims as ZETA-PoPP-Token-Content
-    # pep_require_popp off;
+    pep_require_popp {require_popp};
     ## validity period of popp tokens, either quarter (default) or a fixed duration.
     ## quarter: within the current quarter (see gemSpec_ZETA — A_26477), e.g.:
     ##   pep_popp_validity quarter;
@@ -99,6 +109,8 @@ http \{
     # pep_forward_client_data off;
 
     server \{
+        include server_common.conf;
+
         listen {port};
         {{- if tls}}
         listen 2{port} ssl;
@@ -109,11 +121,11 @@ http \{
         ssl_certificate_key "store:hsm:tls.p256";
         {{- endif}}
 
-        include server_common.conf;
 
         server_name localhost;
 
         location /proxy/ \{
+            include proxy_headers.conf;
             proxy_http_version 1.1;
             proxy_pass "http://localhost:8001/";
         }
@@ -154,25 +166,37 @@ http \{
 
         ## see tests/common/echo.rs
         location /echo/ \{
+          include proxy_headers.conf;
           proxy_http_version 1.1;
-          proxy_pass "http://127.1.33.7:{echo_port}/";
+          proxy_pass "http://127.0.0.1:{echo_port}/";
 
           location /echo/ready/ \{
             pep off;
-            proxy_pass "http://127.1.33.7:{echo_port}/ready/";
+            proxy_pass "http://127.0.0.1:{echo_port}/ready/";
           }
 
           location /echo/ws/ \{
-            proxy_pass "http://127.1.33.7:{echo_port}/ws/";
+            # this location declares its own proxy_set_header, which (non-additively) drops the
+            # inherited proxy_headers.conf — so re-include it here, or the PEP returns 500.
+            include proxy_headers.conf;
+            proxy_pass "http://127.0.0.1:{echo_port}/ws/";
 
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection $connection_upgrade;
           }
         }
         location /echo-with-popp/ \{
-          proxy_pass "http://127.1.33.7:{echo_port}/";
+          include proxy_headers.conf;
+          proxy_pass "http://127.0.0.1:{echo_port}/";
           pep_require_popp on;
           pep_forward_client_data on;
+        }
+        ## DELIBERATELY misconfigured: a pep-protected proxy_pass location that forgot to
+        ## `include proxy_headers.conf;`. The PEP must reject requests here with 500
+        ## (ProxyHeadersMissing) rather than forward credentials unstripped. See the
+        ## proxy_headers_enforcement integration test.
+        location /echo-no-headers/ \{
+          proxy_pass "http://127.0.0.1:{echo_port}/";
         }
     }
 }

@@ -31,7 +31,7 @@ use asn1_rs::*;
 /// }
 #[derive(Debug, DerSequence)]
 pub struct AdmissionSyntax<'a> {
-    #[tag_explicit(0)]
+    #[tag_explicit(4)]
     #[optional]
     pub _admission_authority: Option<Any<'a>>,
 
@@ -96,7 +96,7 @@ pub struct ProfessionInfo<'a> {
     pub registration_number: Option<Any<'a>>,
 
     #[optional]
-    pub _add_profession_info: Option<&'a [u8]>, // ignored
+    pub _add_profession_info: Option<Any<'a>>, // ignored
 }
 
 impl ProfessionInfo<'_> {

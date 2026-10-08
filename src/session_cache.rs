@@ -39,12 +39,12 @@ use ngx::core::{NgxString, SlabPool, Status};
 use ngx::http::HttpModuleMainConf;
 use ngx::ngx_string;
 use ngx::sync::RwLock;
+use tracing::{debug, info, instrument};
 
-use crate::asl_keys::{asl_file_path, create_asl_config};
+use crate::Module;
+use crate::asl_keys::{AslConfig, asl_file_path, create_asl_config};
 use crate::conf::MainConfig;
 use crate::ngx_http_pep_module;
-use crate::ocsp_cache::OcspCache;
-use crate::{Module, log_debug};
 
 const SESSION_CACHE_SIZE: usize = 100 << 20;
 
@@ -135,7 +135,7 @@ pub struct ShmSessionCache {
 
 impl ShmSessionCache {
     pub fn new(shm_zone: &mut ngx_shm_zone_t) -> Result<Self> {
-        let pool = unsafe { SlabPool::from_shm_zone(shm_zone) }.context("shm_zone")?;
+        let pool = unsafe { SlabPool::from_shm_zone(shm_zone) }.context("session_cache_zone")?;
 
         let shared = unsafe {
             pool.as_ref()
@@ -179,6 +179,7 @@ impl ShmSessionCache {
         }
     }
 
+    #[instrument(skip(self))]
     fn cleanup_expired(&'static self) {
         let mut map = self.shared.map.write();
         let now = utc_now();
@@ -191,7 +192,7 @@ impl ShmSessionCache {
                         if shm_session_state.expires > now {
                             None
                         } else {
-                            log_debug!("cleanup_expired: expire cid {}", k);
+                            debug!(cid = %k, "expire");
                             Some(k.clone())
                         }
                     }
@@ -233,6 +234,7 @@ impl ShmSessionCache {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn continue_session(&'static self, cid: &str) -> Result<SessionState> {
         self.maybe_cleanup_expired_sessions();
         let key = NgxString::try_from_bytes_in(cid, self.pool.clone())?;
@@ -258,22 +260,29 @@ impl ShmSessionCache {
                 let mut map = self.shared.map.write();
                 let _ = map.remove(&key);
 
-                log_debug!("continue_session: expire cid {key}");
+                debug!(cid = %key, "expire");
                 Err(anyhow!("expired — {key}"))
             }
             Err(e) => Err(e),
         }
     }
 
+    /// Number of entries (handshakes + established sessions) in the shared
+    /// cache. Called from the metrics PeriodicReader thread: the shm rwlock is
+    /// atomics-based and thread-agnostic, so a brief read lock from off the
+    /// event loop is safe.
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn session_count(&'static self) -> u64 {
+        self.shared.map.read().iter().count() as u64
+    }
+
     #[cfg(feature = "its")]
     pub fn set_always_expire(&'static self, value: bool) {
-        log_debug!("TEST: set_always_expire {value}");
         self.shared.always_expire.store(value, Ordering::Relaxed);
     }
 
     #[cfg(feature = "its")]
     pub async fn expire_cid(&'static self, cid: &str) -> Result<()> {
-        log_debug!("TEST: expire_cid {cid}");
         let key = NgxString::try_from_bytes_in(cid, self.pool.clone())?;
 
         let mut map = self.shared.map.write();
@@ -290,25 +299,46 @@ impl ShmSessionCache {
     }
 }
 
-pub fn init(cf: *mut ngx_conf_t) -> ngx_int_t {
-    let main_conf: &mut MainConfig = unsafe { Module::main_conf_mut(&*cf).expect("main_conf") };
-    let Some(shm_zone) = (unsafe {
-        ngx_shared_memory_add(
+/// Build the ASL and OCSP configuration from the module config, resolving the
+/// key/cert file names against the nginx conf prefix.
+///
+/// Called twice with the same inputs: once in the master to seed the shared
+/// zone with the ASL half, and once per worker for the process-local OCSP cache
+/// (whose lock and cached response must not be inherited across `fork`).
+pub(crate) fn asl_config(main_conf: &MainConfig) -> Result<AslConfig> {
+    let asl_conf_dir = Path::new(NGX_PREFIX.to_str().expect("NGX_PREFIX"))
+        .join(NGX_CONF_PREFIX.to_str().expect("NGX_CONF_PREFIX"));
+    create_asl_config(
+        main_conf.asl_testing,
+        asl_file_path(&asl_conf_dir, &main_conf.asl_signer_cert),
+        asl_file_path(&asl_conf_dir, &main_conf.asl_signer_key),
+        asl_file_path(&asl_conf_dir, &main_conf.asl_ca_cert),
+        asl_file_path(&asl_conf_dir, &main_conf.asl_roots_json),
+        main_conf.asl_root_ca.clone(),
+        main_conf.asl_ocsp.clone(),
+        main_conf.asl_ocsp_ttl,
+    )
+}
+
+pub(crate) fn init(cf: *mut ngx_conf_t) -> ngx_int_t {
+    unsafe {
+        let main_conf: &mut MainConfig = Module::main_conf_mut(&*cf).expect("main_conf");
+        let Some(shm_zone) = ngx_shared_memory_add(
             cf,
             &mut ngx_string!("session_cache"),
             SESSION_CACHE_SIZE,
             ptr::addr_of_mut!(ngx_http_pep_module).cast(),
         )
-        .as_mut()
-    }) else {
-        return Status::NGX_ERROR.0;
-    };
+        .as_mut() else {
+            return Status::NGX_ERROR.0;
+        };
 
-    shm_zone.init = Some(shared_zone_init);
-    shm_zone.data = ptr::from_mut(main_conf).cast();
-    main_conf.shm_zone = shm_zone;
+        shm_zone.init = Some(shared_zone_init);
+        shm_zone.data = ptr::from_mut(main_conf).cast();
+        main_conf.session_cache_zone = shm_zone;
 
-    Status::NGX_OK.0
+        Status::NGX_OK.0
+    }
 }
 
 extern "C" fn shared_zone_init(shm_zone: *mut ngx_shm_zone_t, _data: *mut c_void) -> ngx_int_t {
@@ -328,39 +358,24 @@ extern "C" fn shared_zone_init(shm_zone: *mut ngx_shm_zone_t, _data: *mut c_void
     if pool.as_mut().data.is_null() {
         let map: RwLock<Map> = RwLock::new(RbTreeMap::try_new_in(pool.clone()).expect("RbTreeMap"));
 
-        let asl_conf_dir = Path::new(NGX_PREFIX.to_str().expect("NGX_PREFIX"))
-            .join(NGX_CONF_PREFIX.to_str().expect("NGX_CONF_PREFIX"));
-        let config = MaybeUninit::new(
-            create_asl_config(
-                main_conf.asl_testing,
-                asl_file_path(&asl_conf_dir, &main_conf.asl_signer_cert),
-                asl_file_path(&asl_conf_dir, &main_conf.asl_signer_key),
-                asl_file_path(&asl_conf_dir, &main_conf.asl_ca_cert),
-                asl_file_path(&asl_conf_dir, &main_conf.asl_roots_json),
-                main_conf.asl_root_ca.clone(),
-                main_conf.asl_ocsp.clone(),
-                main_conf.asl_ocsp_ttl,
-            )
-            .map(|config| {
-                if config.asl.is_default() {
-                    println!("asl environment: disabled");
-                } else {
-                    println!(
-                        "asl environment: {:?} - CertData.{}",
-                        config.asl.env,
-                        config.asl.signed_keys.version()
-                    );
-                    if let Some(url) = &config.ocsp.url {
-                        println!("asl ocsp: {} TTL {}", url, config.ocsp.ttl.as_secs());
-                    } else {
-                        println!("asl ocsp: off");
-                    }
-                }
-                OcspCache::init(config.ocsp);
-                config.asl
-            })
-            .expect("asl init"),
-        );
+        let asl_config = asl_config(main_conf).expect("asl init");
+        if asl_config.asl.is_default() {
+            info!("asl environment: disabled");
+        } else {
+            info!(
+                env = ?asl_config.asl.env,
+                cert_data_version = %asl_config.asl.signed_keys.version(),
+                "asl environment"
+            );
+            if let Some(url) = &asl_config.ocsp.url {
+                info!(%url, ttl_secs = asl_config.ocsp.ttl.as_secs(), "asl ocsp");
+            } else {
+                info!("asl ocsp: off");
+            }
+        }
+        // Only the ASL part is shared; the OCSP cache is process-local and is
+        // built per worker (see `ngx_http_pep_init_worker`).
+        let config = MaybeUninit::new(asl_config.asl);
         let shared = Shared {
             map,
             config,

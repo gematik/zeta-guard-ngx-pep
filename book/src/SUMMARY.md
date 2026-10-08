@@ -8,4 +8,7 @@
   - [PoPPInvalidActor](errors/PoPPInvalidActor.md)
   - [PoPPMissing](errors/PoPPMissing.md)
   - [ImpossibleTravel](errors/ImpossibleTravel.md)
+  - [RevokedSession](errors/RevokedSession.md)
+  - [Proxy](errors/Proxy.md)
+  - [ProxyHeadersMissing](errors/ProxyHeadersMissing.md)
   - [Internal](errors/Internal.md)

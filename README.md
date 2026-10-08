@@ -60,8 +60,8 @@ can override it.
 `prefix` is set as nginx' prefix, so most paths are relative to that directory,
 e.g.:
 - nginx will look in ./prefix/conf/nginx.conf instead of /etc/nginx.conf
-- "load_module modules/debug/libngx_pep.so;" will load ./prefix/modules/debug/libngx_pep.so
-  (which is a symlink that points to the libnx_pep.so built by "cargo build")
+- "load_module modules/libngx_pep.dev.debug.so;" will load ./prefix/modules/libngx_pep.dev.debug.so
+  (which is a symlink that points to the libngx_pep.so built by "cargo module")
 - temp files are written to ./prefix/*_temp/
 - etc.
 
@@ -82,6 +82,16 @@ After installation, go to Settings → Direnv Settings and enable both:
 - „Automatically … before every run/debug.”
 
 `.envrc` loads `.envrc.local` if present (developer-specific, .gitignore'd)
+
+## cargo module — alias to build development module
+
+> [!IMPORTANT]
+> `cargo build` on its own will not build a new development module anymore (i.e. the one
+> that gets loaded with no-argument `./prefix/sbin/nginx`). The different builds (
+> `module` — default features, `module-test` with `its` feature and optional lcov) had
+> to be split up due to constant build invalidation.
+> To build a dev module and start nginx, you have to use `cargo module && ./prefix/sbin/nginx`
+> now (`cargo build` only does a compile-check, and will print a warning).
 
 ## integration tests, purl, cargo-nextest
 
@@ -107,21 +117,21 @@ Some usage examples:
 
 To run the integration tests, the following environment variables must be set:
 
-To use the "purl" utility, the following environment variables must be set:
-
 |env               |example                                                                         |
 |---               |---                                                                             |
+|IT_HOST           |zeta-cd.westeurope.cloudapp.azure.com                                           |
 |IT_AUTH           |https://zeta-cd.westeurope.cloudapp.azure.com/auth                              |
 |IT_P12            |../smb-keystore.p12                                                             |
 |IT_P12_PASS       |ichangedit                                                                      |
 
 For easier usage of the `purl` tool, these can also be defined:
 
-|env           |example                                            |
-|---           |---                                                |
-|PURL_AUTH     |https://zeta-cd.westeurope.cloudapp.azure.com/auth |
-|PURL_P12      |../smb-keystore.p12                                |
-|PURL_P12_PASS |ichangedit                                         |
+|env            |example                                            |
+|---            |---                                                |
+|PURL_HOST      |zeta-cd.westeurope.cloudapp.azure.com              |
+|PURL_AUTH      |https://zeta-cd.westeurope.cloudapp.azure.com/auth |
+|PURL_P12       |../smb-keystore.p12                                |
+|PURL_P12_PASS  |ichangedit                                         |
 
 
 Note that `PURL_AUTH` only determines the environment to register the client and
@@ -150,25 +160,34 @@ running the tests locally. So the following warning can be ignored:
 
 ## local docker build
 
-The image can be build locally with:
+The docker builds are defined in `./docker-bake.hcl`. The default group will build all
+runtime images (except load-dispenser, see below) as ":latest", and load them into the
+local docker daemon by default:
 
-```sh
-docker buildx build -t ngx_pep:local .
+```shell
+docker bake
+# only build pep, e.g.
+docker bake pep
+# …will build ngx_pep:latest
+
+# bake variables can be overriden with env
+TAGS=local,another docker bake pep
+# will tag ngx_pep:local and ngx_pep:another
 ```
 
-And run with, e.g.:
+Run PEP locally with, e.g.:
 
 ```sh
 docker run --tty --interactive --rm \
   --publish 8080:8080 \
-    ngx_pep:local
+    ngx_pep:latest
 ```
 
 NOTE: nginx still needs to be configured (`pep_pdp_issuer`, `pep_require_aud`,
 Fachdienst URLs, ASL keys, etc. …).
 See `./misc/docker/nginx.conf` for the config file template.
 
-To test TLS via HSM Simulator (see below), comment in these lines:
+To test TLS via HSM Simulator (see below), uncomment these lines:
 
 ```nginx.conf
 http {
@@ -195,7 +214,7 @@ docker run --tty --interactive --rm \
   --publish 8080:8080 \
   --publish 8443:8443 \
   --env HSM_PROXY_ADDR=http://10.0.2.2:50051 \
-    ngx_pep:local
+    ngx_pep:latest
 ```
 
 `http://10.0.2.2:50051` must be reachable from within the container. For rootless
@@ -207,7 +226,7 @@ See [the hsm-sim README.md](./hsm_sim/README.md) for usage details.
 To build the hsm_sim image locally:
 
 ```sh
-docker buildx build -t hsm_sim:local --target hsm-sim .
+docker bake hsm-sim .
 ```
 
 Then, you can use that instead of local `cargo run` to start the simulator, but you must
@@ -216,7 +235,7 @@ provide arguments:
 ```sh
 docker run --tty --interactive --rm \
   --publish 50051:50051 \
-  hsm_sim:local \
+  hsm_sim:latest \
   --listen 0.0.0.0:50051 \
   --keys-dir /etc/hsm_sim/keys
 
@@ -225,7 +244,18 @@ docker run --tty --interactive --rm \
   --publish 8080:8080 \
   --publish 8443:8443 \
   --env HSM_PROXY_ADDR=http://10.0.2.2:50051 \
-    ngx_pep:local
+    ngx_pep:latest
+```
+
+### load-dispenser build
+
+To build the load-dispenser (loadtest driver) locally, you have to provide a tree with
+b64-encoded SMC-B keystores to use as `./keystores`. This can be a symlink, for example
+to a `zeta-test-certificates` checkout:
+
+```sh
+ln -s ../zeta-test-certificates/keystores .
+docker bake load-dispenser
 ```
 
 ## HSM Simulator certificates in nginx
@@ -249,10 +279,11 @@ grpcurl -plaintext -d '{"key_id": "tls.p256"}' \
 
 ## nginx-ingress with ossl_hsm support
 
-To build a `nginx/nginx-ingress` container with installed ossl_hsm provider, you can use:
+To build a `nginx/nginx-ingress` container with installed ossl_hsm provider and the
+headers-more module, you can use:
 
 ```sh
-docker buildx build -t nginx-ingress:local --target nginx-ingress .
+docker bake nginx-ingress
 ```
 
 You can then use the `store:hsm:<keyid>` syntax as `ssl_certificate_key`. The ingress

@@ -22,30 +22,34 @@
  * #L%
  */
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, Result, anyhow};
 use asl::{
     AslError, Environment, SESSION_OVERHEAD, decrypt_request, encrypt_response, finish_handshake,
     initiate_handshake,
 };
 use async_compat::CompatExt;
 use http::Method;
-use nginx_sys::{NGX_LOG_ERR, ngx_cycle};
+use nginx_sys::ngx_cycle;
 use ngx::core::Status;
 use ngx::http::{HTTPStatus, HttpModuleLocationConf, HttpModuleMainConf, Request};
-use ngx::{ngx_log_debug_http, ngx_log_error};
 use ngx_tickle::RequestSpawn;
 use reqwest::Url;
+use tracing::{Instrument, debug, error, instrument};
 
+use crate::capec::{asl_capec, zeta_capec};
 use crate::conf::MainConfig;
 use crate::error::{ToHttpResponse, ZetaAslResult};
+use crate::headers::pep_forwarded_element;
 use crate::ocsp_cache::ocsp_cache;
+use crate::otel::{request_span, traced_outbound, traced_request};
 use crate::request_body::read_request_body;
 use crate::request_ops::RequestOps;
 use crate::response::{Body, Response};
 use crate::session_cache::ShmSessionCache;
-use crate::{CLIENT, Module, SELF_URL_CV};
+use crate::{CLIENT, Module, ModuleCtx, SELF_URL_CV};
 
 /// see also: https://github.com/http-rs/async-h1/blob/main/src/lib.rs#L100
 static MAX_HEADERS: usize = 128;
@@ -53,7 +57,7 @@ static MAX_HEADERS: usize = 128;
 pub(crate) static SESSION_CACHE: LazyLock<ShmSessionCache> = LazyLock::new(|| {
     let main_conf: &mut MainConfig =
         unsafe { Module::main_conf_mut(&*ngx_cycle).expect("main_conf") };
-    ShmSessionCache::new(unsafe { main_conf.shm_zone.as_mut().expect("as_mut") })
+    ShmSessionCache::new(unsafe { main_conf.session_cache_zone.as_mut().expect("as_mut") })
         .expect("ShmSessionCache")
 });
 
@@ -66,8 +70,9 @@ static UNACCEPTABLE: LazyLock<Response> = LazyLock::new(|| {
     )
 });
 
+#[instrument(skip(request), fields(body=body.len()), err)]
 async fn handle_m1(request: &mut Request, body: &[u8]) -> ZetaAslResult<Response> {
-    ngx_log_debug_http!(request, "asl: M1 read, {}b", body.len());
+    ModuleCtx::set_is_asl(request, "handle_m1");
 
     if !request.acceptable("application/cbor")? {
         return Ok(UNACCEPTABLE.clone());
@@ -82,8 +87,8 @@ async fn handle_m1(request: &mut Request, body: &[u8]) -> ZetaAslResult<Response
     )?;
     let cid: String = SESSION_CACHE.init_handshake(handshake_state).await?;
 
-    ngx_log_debug_http!(request, "asl: new cid {}, M2 {}b", cid, m2.len());
     request.ensure_header_out("ZETA-ASL-CID", &cid)?;
+    debug!(cid, "new cid=\"{cid}\"");
 
     Ok(Response::new_with_body(
         HTTPStatus::OK,
@@ -92,8 +97,9 @@ async fn handle_m1(request: &mut Request, body: &[u8]) -> ZetaAslResult<Response
     ))
 }
 
+#[instrument(skip(request), fields(body=body.len()), err)]
 async fn handle_m3(request: &mut Request, cid: String, body: &[u8]) -> ZetaAslResult<Response> {
-    ngx_log_debug_http!(request, "asl: M3 read, {}b", body.len());
+    ModuleCtx::set_is_asl(request, "handle_m3");
 
     if !request.acceptable("application/cbor")? {
         return Ok(UNACCEPTABLE.clone());
@@ -112,12 +118,24 @@ async fn handle_m3(request: &mut Request, cid: String, body: &[u8]) -> ZetaAslRe
     ))
 }
 
+// join path to given base URL
+// contrary to [`Url::join`], this function errors if given an absolute URL
+fn join_path(base: Url, rel: &str) -> Result<Url> {
+    let combined = base.join(rel).context("parse error")?;
+    let relative = base
+        .make_relative(&combined)
+        .context(format!("{combined} is not relative to {base}"))?;
+    base.join(&relative)
+        .context(format!("can't join {relative} to {base}"))
+}
+
+#[instrument(skip(request), fields(body=body.len()), err)]
 async fn handle_subrequest(
     request: &mut Request,
     cid: String,
     body: &[u8],
 ) -> ZetaAslResult<Response> {
-    ngx_log_debug_http!(request, "asl: data read, {}b", body.len());
+    ModuleCtx::set_is_asl(request, "handle_subrequest");
 
     if !request.acceptable("application/octet-stream")? {
         return Ok(UNACCEPTABLE.clone());
@@ -167,34 +185,46 @@ async fn handle_subrequest(
         .context("SELF_URL_CV as_ref")?
         .to_str()
         .context("SELF_URL_CV: invalid utf-8")?;
-    let url = Url::parse(url)
-        .context(format!("unparseable url: {url}"))?
-        .join(path)
-        .context(format!("invalid path: {path}"))?;
-    let mut subrequest = client.request(method, url);
+    let url = join_path(Url::parse(url).context("unparseable base url")?, path)
+        .map_err(|err| AslError::BadRequest(anyhow!("error resolving request target: {err}")))?;
+
+    let (mut subrequest, span) = traced_outbound!(client, method, url, "inner_request");
 
     for header in inner_request.headers.iter() {
         match header.name.to_lowercase().as_str() {
             "forwarded" | "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host"
             | "x-forwarded-port" => {}
+            // A_25669-01: never forward client-supplied ZETA-* headers that the PEP controls; the
+            // PEP is their sole source.
+            "zeta-user-info"
+            | "zeta-client-data"
+            | "zeta-popp-token-content"
+            | "zeta-api-version" => {}
+            // Strip any traceparent/tracestate the client baked into the
+            // encrypted inner request — we want our handle_subrequest span to
+            // be the parent on the loopback hop, not whatever the client set.
+            "traceparent" | "tracestate" => {}
             _ => subrequest = subrequest.header(header.name, header.value),
         };
     }
 
-    let (scheme, host, port) = request.eigenurl_parts()?;
-    let forwarded = match port {
-        Some(port) => format!("host={host}:{port};proto={scheme}"),
-        None => format!("host={host};proto={scheme}"),
+    // A_28439: emit this PEP's RFC 7239 Forwarded element.
+    let forwarded = {
+        let (scheme, host, port) = request.eigenurl_parts()?;
+        let authority = match port {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+        let client_ip = request.get_client_ip().map(str::to_string);
+        pep_forwarded_element(scheme, &authority, client_ip.as_deref())
     };
 
     subrequest = subrequest.header("forwarded", forwarded);
+    subrequest = subrequest.body(body);
 
-    let subresponse = subrequest
-        .body(body)
-        .send()
+    let (status, headers, bytes) = traced_request(subrequest, span)
         .await
-        .context("unable to send inner request")?;
-    let status = subresponse.status();
+        .context("inner request failed")?;
 
     let mut response_bytes = ngx::collections::Vec::new_in(request.pool());
     let status_code = status.as_u16();
@@ -203,7 +233,7 @@ async fn handle_subrequest(
     // status
     response_bytes.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status_code, reason).as_bytes());
     // headers
-    for (name, value) in subresponse.headers().iter() {
+    for (name, value) in headers.iter() {
         // bytes; not necessarily utf-8
         response_bytes.extend_from_slice(name.as_str().as_bytes());
         response_bytes.extend_from_slice(b": ");
@@ -214,12 +244,7 @@ async fn handle_subrequest(
     response_bytes.extend_from_slice(b"\r\n");
 
     // body
-    response_bytes.extend_from_slice(
-        &subresponse
-            .bytes()
-            .await
-            .context("unable to construct inner response")?,
-    );
+    response_bytes.extend_from_slice(&bytes);
 
     let enc_len = response_bytes.len() + SESSION_OVERHEAD;
     let enc_ptr = request.pool().calloc(enc_len) as *mut u8;
@@ -239,12 +264,12 @@ async fn handle_subrequest(
         status: HTTPStatus::OK,
         content_type: Some("application/octet-stream".to_string()),
         body: unsafe { Body::from_pool(enc_ptr, enc_len) },
+        extra_headers: HashMap::new(),
     })
 }
 
+#[instrument(skip(request), err)]
 fn handle_cert_data(request: &mut Request, path: String) -> ZetaAslResult<Response> {
-    ngx_log_debug_http!(request, "asl: Requested {}", path);
-
     if request.method() != "GET" {
         return Ok(Response::new(HTTPStatus::NOT_ALLOWED));
     }
@@ -260,9 +285,11 @@ fn handle_cert_data(request: &mut Request, path: String) -> ZetaAslResult<Respon
         status: HTTPStatus::OK,
         content_type: Some("application/cbor".to_string()),
         body: Body::Heap(cert_data),
+        extra_headers: HashMap::new(),
     })
 }
 
+#[instrument(skip(request), err)]
 async fn asl_handler(request: &mut Request) -> ZetaAslResult<Response> {
     let path = request.path().to_string();
     let path = path.strip_suffix("/").unwrap_or(&path);
@@ -277,11 +304,7 @@ async fn asl_handler(request: &mut Request) -> ZetaAslResult<Response> {
     let body = match read_request_body(request).await? {
         Ok(body) => body,
         Err(status) => {
-            ngx_log_debug_http!(
-                request,
-                "asl: passing ngx_http_read_client_request_body status: {}",
-                status.0
-            );
+            error!(status=%status.0, "client body read failed");
             return Ok(Response::new(status));
         }
     };
@@ -313,28 +336,80 @@ async fn asl_handler(request: &mut Request) -> ZetaAslResult<Response> {
 pub fn handler(request: &mut Request) -> Status {
     let config = Module::location_conf(request).expect("location_config");
 
-    match config.asl {
-        Some(true) => {
-            ngx_log_debug_http!(request, "asl: enter");
+    if config.asl != Some(true) {
+        return Status::NGX_DECLINED;
+    }
 
-            if let Err(e) = request.spawn(async move |request| {
-                async {
-                    let response = asl_handler(request).await.unwrap_or_else(|e| {
-                        ngx_log_error!(NGX_LOG_ERR, request.log(), "asl: error — {e:?}");
-                        e.to_http_resposnse()
-                    });
-
-                    response.send(request, Status::NGX_OK);
-                }
-                .compat()
-                .await;
-            }) {
-                ngx_log_error!(NGX_LOG_ERR, request.log(), "asl: spawn error — {e:?}");
-                return Status::NGX_ERROR;
-            }
-
-            Status::NGX_AGAIN
+    // Content phase: when the access phase opened an upstream span for this
+    // request, nest under it — that unifies pep- and asl-side spans into one
+    // trace even without nginx-otel or an inbound traceparent. Otherwise
+    // resolve the inbound parent as usual (request_span! also picks kind).
+    let span = match ModuleCtx::upstream_otel_context(request) {
+        Some(parent) => {
+            let _attached = opentelemetry::Context::attach(parent);
+            tracing::info_span!("asl::request", otel.kind = "internal",)
         }
-        _ => Status::NGX_DECLINED,
+        None => request_span!("asl::request", request),
+    };
+
+    if let Err(err) = request.spawn(async move |request| {
+        async move {
+            let response = asl_handler(request)
+                .await
+                .inspect_err(|err| {
+                    if let Some(capec) = asl_capec(&err) {
+                        let capec_id = capec.id();
+                        let capec_name = capec.name();
+                        let detail = tracing::field::display(&err);
+                        let origin = "pep";
+                        let clientIP = request.get_client_ip();
+                        error!(
+                            attackDetection.capecId=%capec_id,
+                            attackDetection.capecName=%capec_name,
+                            attackDetection.detail=detail,
+                            attackDetection.origin=origin,
+                            attackDetection.clientIP=clientIP,
+                            "possible attack detected: {err}"
+                        );
+                    }
+                })
+                .unwrap_or_else(|err| err.to_http_resposnse());
+
+            response.finalize(request, Status::NGX_OK);
+        }
+        .compat()
+        .instrument(span)
+        .await;
+    }) {
+        error!(%err, "spawn error");
+        return Status::NGX_ERROR;
+    }
+
+    Status::NGX_AGAIN
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use reqwest::Url;
+
+    use crate::asl::join_path;
+
+    #[test]
+    fn join_path_only_relative() -> Result<()> {
+        let base: Url = Url::parse("http://localhost:8003")?;
+        assert!(
+            join_path(base.clone(), "rel").is_ok_and(|r| r.as_str() == "http://localhost:8003/rel")
+        );
+        assert!(
+            join_path(base.clone(), "/abs")
+                .is_ok_and(|r| r.as_str() == "http://localhost:8003/abs")
+        );
+        assert!(join_path(base.clone(), "https://example.com").is_err());
+        assert!(join_path(base.clone(), "//example.com").is_err());
+        assert!(join_path(base.clone(), "\\\\unc\\le").is_err());
+        assert!(join_path(base.clone(), "file://localhost:8003/file").is_err());
+
+        Ok(())
     }
 }

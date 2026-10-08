@@ -24,7 +24,7 @@
 
 use std::env;
 use std::fs::{self, File, Permissions};
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::prelude::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -33,7 +33,11 @@ use flate2::read::GzDecoder;
 use tar::Archive;
 
 const NGINX_DOWNLOAD_URL: &str = "https://nginx.org/download";
-const KEYSERVER: &str = "hkps://keyserver.ubuntu.com";
+// HTTPS endpoints for fetching PGP keys — avoids dirmngr/HKP protocol issues on macOS
+const KEY_FETCH_URLS: &[&str] = &[
+    "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x",
+    "https://keys.openpgp.org/vks/v1/by-fingerprint/",
+];
 
 // see ngx-rust/nginx-src/src/download.rs
 const NGINX_SIGNING_KEYS: &[&str] = &[
@@ -57,11 +61,15 @@ fn project_root() -> PathBuf {
 fn main() -> ExitCode {
     match env::args().nth(1).as_deref() {
         Some("configure") => configure(),
+        Some("check") => check(),
         _ => {
             eprintln!("Usage: cargo xtask <command>");
             eprintln!();
             eprintln!("Commands:");
             eprintln!("  configure    Download (if needed) and configure nginx");
+            eprintln!(
+                "  check        Check if .nginx is in spec (NGINX_VERSION, NGX_CONFIGURE_ARGS)"
+            );
             ExitCode::FAILURE
         }
     }
@@ -89,11 +97,50 @@ fn verify_gpg(tarball: &Path, signature: &Path) -> bool {
         panic!("gpg not found, can't verify signature");
     }
 
+    // Fetch keys via HTTPS to avoid dirmngr/HKP protocol issues (e.g. on macOS)
+    let keys_file = gpg_home.join("nginx-keys.asc");
+    let mut all_keys = String::new();
+    for fingerprint in NGINX_SIGNING_KEYS {
+        let fetched = KEY_FETCH_URLS.iter().any(|base_url| {
+            let url = format!("{base_url}{fingerprint}");
+            eprintln!("  fetching key {fingerprint} from {base_url}...");
+            match ureq::get(&url).call() {
+                Ok(resp) => {
+                    let mut body = String::new();
+                    if resp
+                        .into_body()
+                        .into_reader()
+                        .read_to_string(&mut body)
+                        .is_ok()
+                        && body.contains("BEGIN PGP")
+                    {
+                        all_keys.push_str(&body);
+                        all_keys.push('\n');
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  warning: {e}");
+                    false
+                }
+            }
+        });
+        if !fetched {
+            eprintln!("  warning: could not fetch key {fingerprint} from any source");
+        }
+    }
+    if all_keys.is_empty() {
+        panic!("failed to fetch any GPG keys");
+    }
+    fs::write(&keys_file, &all_keys).expect("write keys file");
+
     let import = Command::new("gpg")
         .args(["--homedir"])
         .arg(&gpg_home)
-        .args(["--keyserver", KEYSERVER, "--recv-keys"])
-        .args(NGINX_SIGNING_KEYS)
+        .args(["--import"])
+        .arg(&keys_file)
         .stderr(Stdio::inherit())
         .stdout(Stdio::inherit())
         .status();
@@ -196,6 +243,59 @@ fn find_configure(source_dir: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+fn check_version(source_version: &Path, wanted: &str) -> bool {
+    if !source_version.exists() {
+        return false;
+    }
+    match fs::read_to_string(source_version) {
+        Ok(source_version) => {
+            if wanted != source_version {
+                eprintln!("Version mismatch: want={wanted}, got={source_version}");
+                false
+            } else {
+                true
+            }
+        }
+        Err(e) => {
+            eprintln!("Couldn't read {}: {e:?}", source_version.display());
+            false
+        }
+    }
+}
+
+fn check_stamp(stamp_file: &Path, wanted: &str) -> bool {
+    stamp_file.is_file() && fs::read_to_string(stamp_file).is_ok_and(|s| s == wanted)
+}
+
+fn configure_args(prefix: &Path) -> Vec<String> {
+    let mut args = vec![
+        "--with-compat".to_string(),
+        "--with-http_realip_module".to_string(),
+        "--with-http_ssl_module".to_string(),
+        "--with-http_v2_module".to_string(),
+        "--with-stream".to_string(),
+        "--with-stream_realip_module".to_string(),
+        "--with-stream_ssl_module".to_string(),
+        "--with-threads".to_string(),
+        "--with-debug".to_string(),
+        format!("--prefix={}", prefix.display()),
+    ];
+
+    let cflags = pkg_config("--cflags", &["openssl", "zlib", "libpcre2-32"]).expect("cflags");
+
+    let arg = format!("--with-cc-opt={cflags}");
+    args.push(arg);
+
+    let libs = pkg_config("--libs", &["openssl", "zlib", "libpcre2-32"]).expect("libs");
+    let arg = format!("--with-ld-opt={libs}");
+    args.push(arg);
+
+    if let Ok(extra) = env::var("NGX_CONFIGURE_ARGS") {
+        args.extend(extra.split_whitespace().map(String::from));
+    }
+    args
+}
+
 fn configure() -> ExitCode {
     let root = project_root();
     let source_dir = env::var("NGINX_SOURCE_DIR")
@@ -204,18 +304,10 @@ fn configure() -> ExitCode {
 
     let version = env::var("NGINX_VERSION").expect("NGINX_VERSION");
     let source_version = source_dir.join(".version");
-    if source_dir.exists() && source_version.exists() {
-        let source_version = fs::read_to_string(&source_version).expect(".version");
-        if source_version != version {
-            eprintln!(
-                "Version change {} → {}, remove {}",
-                source_version,
-                version,
-                source_dir.display()
-            );
-            let _ = fs::remove_dir_all(&source_dir);
-        }
-    };
+    if !check_version(&source_version, &version) {
+        eprintln!("Removing {}", source_dir.display());
+        let _ = fs::remove_dir_all(&source_dir);
+    }
 
     // Download if source tree is not present
     if find_configure(&source_dir).is_none() {
@@ -243,37 +335,11 @@ fn configure() -> ExitCode {
     let prefix = root.join("prefix");
     fs::create_dir_all(&prefix).expect("create prefix directory");
     let prefix = prefix.canonicalize().expect("canonicalize prefix");
-
-    let mut args = vec![
-        "--with-compat".to_string(),
-        "--with-http_realip_module".to_string(),
-        "--with-http_ssl_module".to_string(),
-        "--with-http_v2_module".to_string(),
-        "--with-stream".to_string(),
-        "--with-stream_realip_module".to_string(),
-        "--with-stream_ssl_module".to_string(),
-        "--with-threads".to_string(),
-        "--with-debug".to_string(),
-        format!("--prefix={}", prefix.display()),
-    ];
-
-    let cflags = pkg_config("--cflags", &["openssl", "zlib", "libpcre2-32"]).expect("cflags");
-
-    let arg = format!("--with-cc-opt={cflags}");
-    args.push(arg);
-
-    let libs = pkg_config("--libs", &["openssl", "zlib", "libpcre2-32"]).expect("libs");
-    let arg = format!("--with-ld-opt={libs}");
-    args.push(arg);
-
-    if let Ok(extra) = env::var("NGX_CONFIGURE_ARGS") {
-        args.extend(extra.split_whitespace().map(String::from));
-    }
-
+    let args = configure_args(&prefix);
     // Check if configure already ran with the same args
     let stamp_file = source_dir.join("objs/.configure-stamp");
     let stamp = args.join("\n");
-    if stamp_file.is_file() && fs::read_to_string(&stamp_file).is_ok_and(|s| s == stamp) {
+    if check_stamp(&stamp_file, &stamp) {
         eprintln!(
             "configure args unchanged, skipping (delete {} to force)",
             stamp_file.display()
@@ -310,4 +376,33 @@ fn configure() -> ExitCode {
         eprintln!("configure failed: {status}");
         ExitCode::FAILURE
     }
+}
+
+fn check() -> ExitCode {
+    let root = project_root();
+    let source_dir = env::var("NGINX_SOURCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join(".nginx"));
+
+    let version = env::var("NGINX_VERSION").expect("NGINX_VERSION");
+    let source_version = source_dir.join(".version");
+    if !check_version(&source_version, &version) {
+        eprintln!("version check failed");
+        return ExitCode::FAILURE;
+    }
+
+    let prefix = root.join("prefix");
+    if !prefix.exists() {
+        eprintln!("prefix absent");
+        return ExitCode::FAILURE;
+    }
+    let prefix = prefix.canonicalize().expect("canonical prefix");
+    let args = configure_args(&prefix);
+    let stamp_file = source_dir.join("objs/.configure-stamp");
+    let stamp = args.join("\n");
+    if !check_stamp(&stamp_file, &stamp) {
+        eprintln!("configure stamp mismatch");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }

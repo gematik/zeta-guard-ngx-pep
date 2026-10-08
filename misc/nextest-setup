@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# nextest setup script (.config/nextest.toml [scripts.setup.build-nginx-module]):
+# build the its-featured module .so and ossl_hsm before integration tests run.
+set -euo pipefail
+
+rm -f prefix/test.log
+printf "Building nginx module and ossl_hsm...\n\n"
+
+# Instrumentation comes via RUSTC_WRAPPER (cargo-llvm-cov), which cargo does
+# not fingerprint — flipping cov mode alone never triggers a rebuild, and
+# target/module-test is outside `cargo llvm-cov clean`'s reach. Track the mode
+# and clean on change. Only module-test though: nextest has already built and
+# listed its test binaries when this script runs, so cleaning any package in
+# the default target dir deletes binaries nextest is about to exec.
+mode=${CARGO_LLVM_COV:+cov}
+stamp=target/module-test/.build-mode
+if [[ "$(cat "$stamp" 2>/dev/null)" != "$mode" ]]; then
+	cargo clean -p ngx_pep --target-dir target/module-test
+fi
+
+LLVM_PROFILE_FILE=/dev/null cargo module-test
+LLVM_PROFILE_FILE=/dev/null cargo build -p ossl_hsm
+printf '%s' "$mode" >"$stamp"
+
+# `cargo llvm-cov report` collects -object files by walking target/debug only;
+# without the loaded .so visible there, the integration tests' profraws match
+# no object and are silently dropped.
+if [[ -n ${CARGO_LLVM_COV:-} ]]; then
+	mkdir -p target/debug/module-test
+	ln -f target/module-test/debug/libngx_pep.so target/debug/module-test/
+fi

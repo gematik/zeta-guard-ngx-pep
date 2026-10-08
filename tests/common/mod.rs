@@ -35,8 +35,10 @@ use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
 use http::StatusCode;
+use ngx_pep::client::token_dispenser::{PoPPKey, SmcBKey, TokenDispenser, Tokens};
 use ngx_pep::its::TestControlClient;
-use reqwest::{Client, ClientBuilder, Url};
+use reqwest::Url;
+use reqwest::cookie::Jar;
 use rstest::fixture;
 use tokio::process::Command;
 use tokio::runtime::Handle;
@@ -45,15 +47,15 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_serde::formats::Json;
 
-use ngx_pep::client::{
-    ClientRegistration, create_smcb_token, exchange_access_token, get_nonce, register_client,
-};
+use ngx_pep::client::{ClientRegistration, register_client};
 
 use crate::common::echo::echo_server;
 use crate::common::ocsp::ocsp_responder;
+use crate::common::revocation::revocation_server;
 
 pub mod echo;
 pub mod ocsp;
+pub mod revocation;
 
 #[allow(dead_code, clippy::all)]
 pub mod typify {
@@ -105,22 +107,31 @@ pub fn reserve_port(prefix: &Path, range: RangeInclusive<u16>) -> Result<PortLoc
         match (
             TcpListener::bind(("127.0.0.1", port)),
             // embedded echo server to test upstream
-            TcpListener::bind(("127.1.33.7", port + 100)),
+            TcpListener::bind(("127.0.0.1", port + 100)),
             // hsm_sim for this nginx
-            TcpListener::bind(("127.1.33.7", port + 200)),
+            TcpListener::bind(("127.0.0.1", port + 200)),
             // ocsp responder
-            TcpListener::bind(("127.1.33.7", port + 300)),
+            TcpListener::bind(("127.0.0.1", port + 300)),
+            // pdp revocation mock
+            TcpListener::bind(("127.0.0.1", port + 400)),
         ) {
-            (Ok(listener_nginx), Ok(listener_echo), Ok(listener_hsm_sim), Ok(listener_ocsp)) => {
+            (
+                Ok(listener_nginx),
+                Ok(listener_echo),
+                Ok(listener_hsm_sim),
+                Ok(listener_ocsp),
+                Ok(listener_revocation),
+            ) => {
                 // ports are bindable, drop sockets so nginx and echo server can bind on it
                 drop(listener_nginx);
                 drop(listener_echo);
                 drop(listener_hsm_sim);
                 drop(listener_ocsp);
+                drop(listener_revocation);
                 return Ok(lock);
             }
             _ => {
-                // either or both ports blocked by some other process, drop flock and try next
+                // any port blocked by some other process, drop flock and try next
                 drop(lock);
                 continue;
             }
@@ -137,6 +148,7 @@ struct State {
     port_lock: PortLock,
     hsm_sim: Option<JoinHandle<()>>,
     ocsp_responder: Option<JoinHandle<()>>,
+    revocation_mock: Option<JoinHandle<()>>,
 }
 
 struct NginxManager {
@@ -171,6 +183,7 @@ fn manager() -> Manager {
                     port_lock,
                     hsm_sim: None,
                     ocsp_responder: None,
+                    revocation_mock: None,
                 }),
                 leases: AtomicUsize::new(0),
                 pid: AtomicI32::new(0),
@@ -190,7 +203,7 @@ impl Manager {
         }
 
         let port = state.port_lock.port;
-        let hsm_sim_addr = format!("127.1.33.7:{}", port + 200);
+        let hsm_sim_addr = format!("127.0.0.1:{}", port + 200);
         let hsm_sim_url = format!("http://{hsm_sim_addr}");
 
         let hsm_sim_addr_clone = hsm_sim_addr.clone();
@@ -229,7 +242,7 @@ impl Manager {
             handle.abort();
         }
 
-        let ocsp_addr = format!("127.1.33.7:{ocsp_port}");
+        let ocsp_addr = format!("127.0.0.1:{ocsp_port}");
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if tokio::net::TcpStream::connect(&ocsp_addr).await.is_ok() {
@@ -240,6 +253,34 @@ impl Manager {
         })
         .await
         .context("ocsp responder did not become ready")?;
+
+        // Start PDP revocation mock
+        let revocation_port = port + 400;
+        let revocation_task = tokio::spawn(async move {
+            revocation_server(revocation_port)
+                .await
+                .expect("revocation_server")
+        });
+
+        let old_revocation = state.revocation_mock.replace(revocation_task);
+        if let Some(handle) = old_revocation {
+            handle.abort();
+        }
+
+        let revocation_addr = format!("127.0.0.1:{revocation_port}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if tokio::net::TcpStream::connect(&revocation_addr)
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("revocation mock did not become ready")?;
 
         let mut cmd = Command::new(state.prefix.join("sbin/nginx"));
         cmd.args(["-c", &format!("conf/test-{port}.conf")]);
@@ -348,11 +389,16 @@ impl NginxLease {
 
     pub async fn hsm_sim_url(&self) -> Result<String> {
         let port = self.mgr.0.state.lock().await.port_lock.port;
-        Ok(format!("http://127.1.33.7:{}", port + 200))
+        Ok(format!("http://127.0.0.1:{}", port + 200))
+    }
+
+    pub async fn revocation_url(&self) -> Result<String> {
+        let port = self.mgr.0.state.lock().await.port_lock.port;
+        Ok(format!("http://127.0.0.1:{}", port + 400))
     }
 
     pub async fn wait_ready(&self) -> Result<()> {
-        // not to be confused with echo-server /ready; this is tested on-demand, in start_echo_server
+        // not to be confused with echo-server /ready; that is tested on-demand, in start_echo_server
         let nginx_ready = async move {
             let url = self.url().await?.join("ready/")?;
             loop {
@@ -418,8 +464,7 @@ impl NginxLease {
     pub async fn start_echo_server(&self) -> JoinHandle<()> {
         let port = self.mgr.0.state.lock().await.port_lock.port + 100; // eg 8003 + 100 → 8103
         let task = tokio::spawn(async move { echo_server(port).await.expect("echo_server") });
-        let echo_ready =
-            Url::parse(&format!("http://127.1.33.7:{port}/ready/")).expect("ready url");
+        let echo_ready = Url::parse(&format!("http://127.0.0.1:{port}/ready/")).expect("ready url");
 
         timeout(Duration::from_secs(5), async move {
             loop {
@@ -455,20 +500,16 @@ pub async fn nginx() -> NginxLease {
 }
 
 pub struct TestContext {
-    pub client: Client,
-    pub auth_url: Url,
+    pub jar: Arc<Jar>,
+    pub registration: ClientRegistration,
+    pub smcb_key: SmcBKey,
     pub token_url: Url,
     pub nonce_url: Url,
-    pub registration: ClientRegistration,
+    pub popp_key: PoPPKey,
 }
 
 impl TestContext {
     async fn get() -> Result<Self> {
-        let client = ClientBuilder::new()
-            .use_rustls_tls()
-            .danger_accept_invalid_certs(true)
-            .build()?;
-
         let auth_url = env::var("IT_AUTH")?;
         let auth_url: Url = if auth_url.ends_with("/") {
             auth_url
@@ -479,58 +520,46 @@ impl TestContext {
 
         let registration_url =
             auth_url.join("realms/zeta-guard/clients-registrations/openid-connect/")?;
-        let token_url = auth_url.join("realms/zeta-guard/protocol/openid-connect/token/")?;
+
+        let token_url = auth_url.join("realms/zeta-guard/protocol/openid-connect/token")?;
         let nonce_url = auth_url.join("realms/zeta-guard/zeta-guard-nonce")?;
-        let registration = register_client(registration_url.clone(), &client).await?;
-        Ok(TestContext {
-            client,
-            auth_url,
-            token_url,
-            nonce_url,
-            registration,
-        })
-    }
+        let jar = Arc::new(Jar::default());
+        let registration = register_client(registration_url.clone(), &jar).await?;
 
-    pub fn it_p12(&self) -> PathBuf {
-        env::var("IT_P12").expect("IT_P12").into()
-    }
-
-    pub fn it_p12_pass(&self) -> String {
-        env::var("IT_P12_PASS").expect("IT_P12_PASS")
-    }
-
-    pub async fn access_token(&self) -> Result<String> {
-        let nonce = get_nonce(self.nonce_url.clone(), &self.client).await?;
-
-        let smcb = create_smcb_token(
-            &self.it_p12(),
-            &self.it_p12_pass(),
-            self.auth_url.clone(),
-            nonce.clone(),
-            &self.registration,
+        let smcb_key =
+            SmcBKey::from_path(Path::new(&env::var("IT_P12")?), &env::var("IT_P12_PASS")?).await?;
+        let popp_key = PoPPKey::from_path(
+            Path::new(&env::var("IT_POPP_P12")?),
+            &env::var("IT_POPP_P12_PASS")?,
+            &env::var("IT_POPP_P12_ALIAS")?,
         )
         .await?;
 
-        exchange_access_token(
+        Ok(TestContext {
+            jar,
+            token_url,
+            nonce_url,
+            registration,
+            smcb_key,
+            popp_key,
+        })
+    }
+
+    pub async fn token_dispenser(&self) -> Result<TokenDispenser> {
+        let token_dispenser = TokenDispenser::new(
+            self.jar.clone(),
+            self.registration.clone(),
+            self.smcb_key.clone(),
+            env::var("IT_HOST")?,
+            self.nonce_url.clone(),
             self.token_url.clone(),
-            nonce,
-            &self.registration,
-            &smcb,
-            &self.client,
-        )
-        .await
+            self.popp_key.clone(),
+        );
+        Ok(token_dispenser)
     }
-
-    pub fn popp_p12(&self) -> Result<PathBuf> {
-        Ok(PathBuf::from(env::var("IT_POPP_P12").expect("IT_POPP_P12")))
-    }
-
-    pub fn popp_p12_pass(&self) -> Result<String> {
-        Ok(env::var("IT_POPP_P12_PASS").expect("IT_POPP_P12_PASS"))
-    }
-
-    pub fn popp_p12_alias(&self) -> Result<String> {
-        Ok(env::var("IT_POPP_P12_ALIAS").expect("IT_POPP_P12_ALIAS"))
+    pub async fn tokens(&self) -> Result<Tokens> {
+        let token_dispenser = self.token_dispenser().await?;
+        token_dispenser.tokens().await
     }
 }
 

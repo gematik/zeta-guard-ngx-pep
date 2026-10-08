@@ -37,10 +37,12 @@ use openssl::ocsp::{OcspCertId, OcspRequest};
 use openssl::pkey::{PKey, Private, Public};
 use openssl::sign::Signer;
 use openssl::x509::{X509, X509NameRef};
+use tracing::warn;
 
 use crate::ossl_store;
 
 #[derive(Default)]
+#[cfg_attr(test, allow(dead_code))]
 pub struct OcspConfig {
     pub url: Option<String>,
     pub ttl: Duration,
@@ -57,7 +59,7 @@ pub struct AslConfig {
 use crate::conf::OcspMode;
 
 fn load_file(name: &str) -> Result<Vec<u8>> {
-    fs::read(name).context(format!("failed to load asl keys {:?}", &name))
+    fs::read(name).context(format!("failed to load asl keys {:?}", name))
 }
 
 fn parse_certificate(name: &str) -> Result<X509> {
@@ -94,7 +96,7 @@ fn load_private_key(name: &str, pubkey: &EcKey<Public>) -> Result<PKey<Private>>
 fn get_cn(name: &X509NameRef) -> Option<String> {
     name.entries_by_nid(Nid::COMMONNAME)
         .next()
-        .and_then(|cn| Some(cn.data().as_utf8().ok()?.to_string()))
+        .and_then(|cn| cn.data().to_string().ok())
 }
 
 fn get_cert_info(der: &[u8]) -> Option<(String, String)> {
@@ -117,6 +119,16 @@ fn expires_soon(cert: &X509) -> bool {
     Asn1Time::days_from_now(7)
         .map(|soon| cert.not_after().lt(&soon))
         .unwrap_or(false)
+}
+
+/// `not_after` of the ASL signer certificate as epoch seconds, captured in
+/// `create_asl_config` for the expiry gauge. Unset when ASL is not configured.
+pub static SIGNER_NOT_AFTER_EPOCH: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+fn not_after_epoch(cert: &X509) -> Option<i64> {
+    let epoch_zero = Asn1Time::from_unix(0).ok()?;
+    let diff = epoch_zero.diff(cert.not_after()).ok()?;
+    Some(i64::from(diff.days) * 86_400 + i64::from(diff.secs))
 }
 
 fn ecdsa_sign(signer_pk: &PKey<Private>, data: &[u8]) -> Result<Vec<u8>> {
@@ -176,10 +188,13 @@ pub fn create_asl_config(
     let ca_der = ca.to_der()?;
 
     if expires_soon(&signer) {
-        println!(
-            "WARNING, ASL signer certificate expires soon: {}",
-            signer.not_after()
-        );
+        let not_after = signer.not_after().to_string();
+        warn!(%not_after, "ASL signer certificate expires soon");
+    }
+    // Capture not_after for the expiry gauge. This runs in shared_zone_init in
+    // the master, pre-fork; workers inherit the value through fork.
+    if let Some(epoch) = not_after_epoch(&signer) {
+        let _ = SIGNER_NOT_AFTER_EPOCH.set(epoch);
     }
 
     let roots_bytes = load_file(&roots_file.unwrap())?;

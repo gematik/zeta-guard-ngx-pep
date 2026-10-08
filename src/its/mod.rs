@@ -25,39 +25,90 @@
 use std::path::Path;
 use std::process;
 
+use asl::utc_now;
 use futures::StreamExt;
 use tarpc::ServerError;
 use tarpc::context::Context;
 use tarpc::server::{self, Channel};
 use tokio_serde::formats::Json;
+use tracing::info;
 
 use crate::asl::SESSION_CACHE;
-use crate::{log_debug, spawn_compat};
+use crate::block_list::Block;
+use crate::pep::BLOCK_LIST;
+use crate::spawn_compat;
 
 #[tarpc::service]
 pub trait TestControl {
-    async fn set_always_expire(value: bool) -> std::result::Result<(), ServerError>;
+    // ASL session manipulation
+    async fn set_always_expire_cid(value: bool) -> std::result::Result<(), ServerError>;
     async fn expire_cid(cid: String) -> std::result::Result<(), ServerError>;
+    // blocklist manipulation
+    async fn set_always_expire_sid(value: bool) -> std::result::Result<(), ServerError>;
+    async fn unblock_sid(sid: String) -> std::result::Result<(), ServerError>;
+    async fn block_sid(sid: String, secs: u64) -> std::result::Result<(), ServerError>;
+    async fn has_sid(sid: String) -> std::result::Result<bool, ServerError>;
 }
 
 #[derive(Clone)]
 struct TestControlServer;
 
 impl TestControl for TestControlServer {
-    async fn set_always_expire(
+    async fn set_always_expire_cid(
         self,
         _: Context,
         value: bool,
     ) -> std::result::Result<(), ServerError> {
+        info!("its: set_always_expire_cid({value})");
         SESSION_CACHE.set_always_expire(value);
         Ok(())
     }
 
     async fn expire_cid(self, _: Context, cid: String) -> std::result::Result<(), ServerError> {
+        info!("its: expire_cid({cid})");
         SESSION_CACHE
             .expire_cid(&cid)
             .await
             .map_err(|e| ServerError::new(std::io::ErrorKind::Other, e.to_string()))
+    }
+
+    async fn set_always_expire_sid(
+        self,
+        _: Context,
+        value: bool,
+    ) -> std::result::Result<(), ServerError> {
+        info!("its: set_always_expire_sid({value})");
+        BLOCK_LIST.set_always_expire(value);
+        Ok(())
+    }
+
+    async fn block_sid(self, _: Context, sid: String, secs: u64) -> Result<(), ServerError> {
+        info!("its: block_sid({sid}, {secs})");
+        let now = utc_now();
+        BLOCK_LIST
+            .apply(&Block {
+                when: now,
+                until: now + secs,
+                what: sid,
+            })
+            .map_err(|e| ServerError::new(std::io::ErrorKind::Other, e.to_string()))
+    }
+
+    async fn unblock_sid(self, _: Context, sid: String) -> std::result::Result<(), ServerError> {
+        info!("its: unblock_sid({sid})");
+        BLOCK_LIST
+            .unblock_sid(&sid)
+            .await
+            .map_err(|e| ServerError::new(std::io::ErrorKind::Other, e.to_string()))
+    }
+
+    async fn has_sid(self, _: Context, sid: String) -> std::result::Result<bool, ServerError> {
+        let result = BLOCK_LIST
+            .has_sid(&sid)
+            .await
+            .map_err(|e| ServerError::new(std::io::ErrorKind::Other, e.to_string()))?;
+        info!("its: has_id({sid}): {result}");
+        Ok(result)
     }
 }
 
@@ -65,7 +116,7 @@ pub fn start(control_path: &Path) {
     let sock = control_path.join(format!("{}.sock", process::id()));
 
     spawn_compat(async move {
-        log_debug!("its: binding {}", sock.display());
+        info!(sock = %sock.display(), "its: binding");
 
         // Try to bind — if another worker already owns the socket, silently skip.
         let listener = std::os::unix::net::UnixListener::bind(&sock)

@@ -191,7 +191,7 @@ fn derive_ec_key(key_id: &str, nid: Nid, scalar_len: usize) -> Result<EcKey<Priv
     // Compute public key = scalar * generator
     let mut pub_point = EcPoint::new(&group).context("EcPoint")?;
     pub_point
-        .mul_generator(&group, &scalar, &ctx)
+        .mul_generator2(&group, &scalar, &mut ctx)
         .context("mul_generator")?;
 
     let ec_key =

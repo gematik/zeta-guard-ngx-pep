@@ -22,22 +22,76 @@ stages:
   - test
   - deploy
   - publish
+  - sign
 
 include:
-  - component: "$CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-scanning@v0.4.2"
+  - component: "$CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-scanning@v1.2.1"
     inputs:
-      analyzer-image: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/aquasec/trivy:0.69.3@sha256:7228e304ae0f610a1fad937baa463598cadac0c2ac4027cc68f3a8b997115689"
+      job-name: "container-scanning-ngx_pep"
       cs-image: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
       git-strategy: fetch
       severity: HIGH,CRITICAL
       job-stage: test
-      openvex-file: "vulnerabilites.openvex.json"
+      trivyignore-file: "trivy/.ngx_pep.trivyignore"
+      openvex-file: ".vex/ngx_pep-vulnerabilites.openvex.json"
+  - component: "$CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-scanning@v1.2.1"
+    inputs:
+      job-name: "container-scanning-ngx_ingress"
+      cs-image: "$CI_REGISTRY_IMAGE/nginx-ingress:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+      git-strategy: fetch
+      severity: HIGH,CRITICAL
+      job-stage: test
+      trivyignore-file: "trivy/.ngx_ingress.trivyignore"
+      openvex-file: ".vex/ngx_ingress-vulnerabilites.openvex.json"
+
+  - component: $CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-signing@v1.2.0
+    inputs:
+      image-to-sign: "$TAGGED_IMAGE_INGRESS"
+      job-name: container-signing-ingress
+      job-dependencies: [ tag_image ]
+      job-stage: sign
+    # Keep in sync with tag_image's rules
+    rules:
+      - if: $CI_PIPELINE_SOURCE == "schedule"
+        when: never
+      - if: $CI_COMMIT_TAG
+      - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      - when: never
+
+  - component: $CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-signing@v1.2.0
+    inputs:
+      image-to-sign: "$TAGGED_IMAGE_HSM_SIM"
+      job-name: container-signing-hsm-sim
+      job-dependencies: [ tag_image ]
+      job-stage: sign
+    # Keep in sync with tag_image's rules
+    rules:
+      - if: $CI_PIPELINE_SOURCE == "schedule"
+        when: never
+      - if: $CI_COMMIT_TAG
+      - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      - when: never
+
+  - component: $CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-signing@v1.2.0
+    inputs:
+      image-to-sign: "$TAGGED_IMAGE"
+      job-name: container-signing-pep
+      job-dependencies: [ tag_image ]
+      job-stage: sign
+    # Keep in sync with tag_image's rules
+    rules:
+      - if: $CI_PIPELINE_SOURCE == "schedule"
+        when: never
+      - if: $CI_COMMIT_TAG
+      - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      - when: never
 
 default:
-  image: $CI_REGISTRY/zeta/devops/ci-images/docker:24.0.5-zeta-0
+  # Don't bump beyond 29.0 before we got the fix for https://gitlab.com/gitlab-org/gitlab/-/work_items/581900
+  image: $CI_REGISTRY/zeta/devops/ci-images/docker:29.0.4-zeta-0
   tags: [ zeta ]
   services:
-    - name: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/docker:25.0.5-dind
+    - name: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/docker:29.0.4-dind
       alias: docker
       variables:
         HEALTHCHECK_TCP_PORT: "2376"
@@ -45,18 +99,16 @@ default:
 variables:
   DOCKER_BUILDKIT: "1"
   BUILDX_BUILDER: "ci-builder"
+  BUILDX_NO_DEFAULT_ATTESTATIONS: "1"
   DOCKER_HOST: tcp://docker:2376
   DOCKER_TLS_CERTDIR: /certs
   DOCKER_CERT_PATH: $DOCKER_TLS_CERTDIR/client
   DOCKER_TLS_VERIFY: "1"
-  BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.94-slim-bookworm
-  NGINX_VERSION: "1.29.8" # NOTE: keep in sync with .cargo/config.toml and Dockerfile, and with nginx-ingress version (major.minor)
-  BASE_IMAGE: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginxinc/nginx-unprivileged:$NGINX_VERSION-trixie-otel"
-  BASE_IMAGE_INGRESS: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx/nginx-ingress:5.4.1" # NOTE: keep in sync with Dockerfile, contained nginx major.minor must match NGINX_VERSION
-  BASE_IMAGE_HSM_SIM: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/debian:bookworm"
-  IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
-  IMAGE_INGRESS: $CI_REGISTRY_IMAGE/nginx-ingress:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
-  IMAGE_HSM_SIM: $CI_REGISTRY_IMAGE/hsm_sim:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+  EXT_IMAGE_PREFIX: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/
+  TAGS: $CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA,$CI_COMMIT_REF_SLUG-latest
+  CACHE: true
+  SCCACHE: true
+  ARTIFACTS: true
 
 before_script:
   - docker context create docker
@@ -76,124 +128,95 @@ before_script:
       sleep 1
     done
 
-build-env:
+base:
   stage: build
-  variables:
   rules:
     # don't rebuild for nightly build, keep scanning the last-built image
     - if: '$CI_PIPELINE_SOURCE != "schedule"'
       when: always
   script:
     - |
-      docker buildx build \
-        --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1 \
-        --build-arg BASE_IMAGE_BUILD="$BASE_IMAGE_BUILD" \
-        --build-arg AZDO_CRATES_MIRROR_URL="$AZDO_CRATES_MIRROR_URL" \
-        --cache-from type=registry,ref="$CI_REGISTRY_IMAGE:buildcache" \
-        --cache-to type=registry,ref="$CI_REGISTRY_IMAGE:buildcache,mode=max,compression=zstd" \
-        --secret id=azdo_pat,env=AZDO_CRATES_PAT \
-        --target build-env \
-        --tag "$IMAGE-build-env" \
+      printf "Build base…\n"
+      . build.env
+      docker bake \
         --push \
-        "$@" \
-        .
+        base
 
-build:
+build:pep-build:
   stage: build
-  image: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA-build-env
-  needs:
-    - job: build-env
   rules:
     # don't rebuild for nightly build, keep scanning the last-built image
     - if: '$CI_PIPELINE_SOURCE != "schedule"'
-      when: always
-  cache:
-    - key: build-$CI_COMMIT_REF_SLUG
-      fallback_keys:
-        - build-$CI_DEFAULT_BRANCH
-        - build-default
-      paths:
-        - "${CI_PROJECT_DIR}/target"
-        - "${CI_PROJECT_DIR}/.cargo-home"
-        - "${CI_PROJECT_DIR}/.nginx"
-        - "${CI_PROJECT_DIR}/.nginx-cache"
+      when: on_success
+  needs:
+  - job: base
   variables:
-    IT_AUTH: https://zeta-cd.westeurope.cloudapp.azure.com/auth
+    REF_BUILD_ENV: docker-image://$CI_REGISTRY_IMAGE/build-env:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
   script:
     - |
-      export CARGO_HOME="${CI_PROJECT_DIR}/.cargo-home"
-      mkdir -p "$CARGO_HOME"
-
-      MIRROR=${AZDO_CRATES_MIRROR_URL:-} \
-        TOKEN=${AZDO_CRATES_PAT:-} \
-        . /usr/local/bin/cargo-env
-
-      IT_P12=$(mktemp)
+      IT_P12=$(mktemp -p "$PWD")
       export IT_P12
       base64 -d "$IT_P12_B64" > "$IT_P12"
 
-      IT_POPP_P12=$(mktemp)
-      export IT_POPP_P12
-      base64 -d "$IT_POPP_P12_B64" > "$IT_POPP_P12"
+      mkdir -p ./artifacts
 
-      misc/cargo-build
-
-      printf "!! build image %s\n\n" "$IMAGE"
-
-      docker buildx build \
-        --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1 \
-        --build-arg BASE_IMAGE_BUILD="$BASE_IMAGE_BUILD" \
-        --build-arg BASE_IMAGE="$BASE_IMAGE" \
-        --build-arg BASE_IMAGE_HSM_SIM="$BASE_IMAGE_HSM_SIM" \
-        --build-arg BASE_IMAGE_INGRESS="$BASE_IMAGE_INGRESS" \
-        --target ci \
-        --tag "$IMAGE" \
+      . build.env
+      docker bake \
         --push \
-        "$@" \
-        .
-
-      printf "!! build image %s\n\n" "$IMAGE_HSM_SIM"
-
-      docker buildx build \
-        --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1 \
-        --build-arg BASE_IMAGE_BUILD="$BASE_IMAGE_BUILD" \
-        --build-arg BASE_IMAGE="$BASE_IMAGE" \
-        --build-arg BASE_IMAGE_HSM_SIM="$BASE_IMAGE_HSM_SIM" \
-        --build-arg BASE_IMAGE_INGRESS="$BASE_IMAGE_INGRESS" \
-        --target ci-hsm-sim \
-        --tag "$IMAGE_HSM_SIM" \
-        --push \
-        "$@" \
-        .
-
-      printf "!! build image %s\n\n" "$IMAGE_INGRESS"
-
-      docker buildx build \
-        --build-arg BUILDKIT_SYNTAX="$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX"/docker/dockerfile:1 \
-        --build-arg BASE_IMAGE_BUILD="$BASE_IMAGE_BUILD" \
-        --build-arg BASE_IMAGE="$BASE_IMAGE" \
-        --build-arg BASE_IMAGE_HSM_SIM="$BASE_IMAGE_HSM_SIM" \
-        --build-arg BASE_IMAGE_INGRESS="$BASE_IMAGE_INGRESS" \
-        --target ci-nginx-ingress \
-        --tag "$IMAGE_INGRESS" \
-        --push \
-        "$@" \
-        .
+        pep-build 
 
   artifacts:
     when: always
     paths:
-      - target/release/libngx_pep.so
-      - target/release/hsm_sim
-      - target/release/libossl_hsm.so
-      - clippy.json
-      - coverage.lcov
-      - .pkg-version
-      - ngx_pep.cdx.json
-      - prefix/test.log
+      - ./artifacts
+
+build:aux-build:
+  stage: build
+  rules:
+    # don't rebuild for nightly build, keep scanning the last-built image
+    - if: '$CI_PIPELINE_SOURCE != "schedule"'
+      when: on_success
+  needs:
+  - job: base
+  variables:
+    REF_BUILD_ENV: docker-image://$CI_REGISTRY_IMAGE/build-env:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+    ARTIFACTS: true
+  script:
+    - |
+      . build.env
+      docker bake \
+        --push \
+        aux-build
+
+package:
+  stage: build
+  rules:
+    # don't rebuild for nightly build, keep scanning the last-built image
+    - if: '$CI_PIPELINE_SOURCE != "schedule"'
+      when: on_success
+  needs:
+  - job: build:pep-build
+  - job: build:aux-build
+  variables:
+    REF_PEP_BASE: docker-image://$CI_REGISTRY_IMAGE/pep-base:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+    REF_NGINX_INGRESS_BASE: docker-image://$CI_REGISTRY_IMAGE/nginx-ingress-base:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+    REF_PEP_BUILD: docker-image://$CI_REGISTRY_IMAGE/pep-build:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+    REF_HEADERS_MORE: docker-image://$CI_REGISTRY_IMAGE/headers-more:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+
+  script:
+    - |
+      printf "!! cloning zeta-test-certificates (load_dispenser)\n\n"
+      git clone --depth=1 https://gitlab-ci-token:$CI_JOB_TOKEN@$CI_SERVER_FQDN/zeta/testing/zeta-test-certificates.git
+      ln -sf zeta-test-certificates/keystores keystores
+
+      . build.env
+      docker bake \
+        --push \
+        package \
+        load-dispenser
 
 sonarqube:
-  stage: test
+  stage: build
   # see https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/languages/rust
   before_script: [ ]
   cache:
@@ -201,9 +224,9 @@ sonarqube:
       paths:
         - "${CI_PROJECT_DIR}/.sonar/cache"
   image:
-    name: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA-build-env
+    name: $CI_REGISTRY_IMAGE/build-env:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
   needs:
-    - job: build
+    - job: build:pep-build
       artifacts: true
   script:
     - >-
@@ -238,7 +261,9 @@ trigger_helm:
     - when: never
   trigger:
     project: zeta/devops/zeta-guard-helm
-    branch: main
+    # release branch: smoke-test against the release chart, not main — main's chart
+    # renders pep_pdp_url, which images from this branch deliberately do not support
+    branch: releases/1.3.x
     strategy: depend
   variables:
     PEPPROXY_IMAGE_TAG: "$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA" # e.g. main-cafebabe
@@ -260,23 +285,37 @@ tag_image:
       when: on_success
     - when: never
   needs:
-    - job: build
+    - job: package
       optional: true # resolved before rules are evaluated, which fails when schedule
     - job: trigger_helm
       optional: true
+  variables:
+    SOURCE_TAG: $CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+    IMAGE_PEP: $CI_REGISTRY_IMAGE
+    IMAGE_NGINX_INGRESS: $CI_REGISTRY_IMAGE/nginx-ingress
+    IMAGE_HSM_SIM: $CI_REGISTRY_IMAGE/hsm_sim
+    IMAGE_LOAD_DISPENSER: $CI_REGISTRY_IMAGE/load-dispenser
   script:
     - |
-      docker pull "$IMAGE"
-      docker tag "$IMAGE" "$CI_REGISTRY_IMAGE:$TARGET_TAG"
-      docker push "$CI_REGISTRY_IMAGE:$TARGET_TAG"
+      for image in "$IMAGE_PEP" "$IMAGE_NGINX_INGRESS" "$IMAGE_HSM_SIM" "$IMAGE_LOAD_DISPENSER"; do
+        src="$image:$SOURCE_TAG"
+        tgt="$image:$TARGET_TAG"
+        printf "\n%s → %s\n\n" "$src" "$tgt"
+        docker pull "$src"
+        docker tag "$src" "$tgt"
+        docker push "$tgt"
+      done
 
-      docker pull "$IMAGE_HSM_SIM"
-      docker tag "$IMAGE_HSM_SIM" "$CI_REGISTRY_IMAGE/hsm_sim:$TARGET_TAG"
-      docker push "$CI_REGISTRY_IMAGE/hsm_sim:$TARGET_TAG"
-
-      docker pull "$IMAGE_INGRESS"
-      docker tag "$IMAGE_INGRESS" "$CI_REGISTRY_IMAGE/nginx-ingress:$TARGET_TAG"
-      docker push "$CI_REGISTRY_IMAGE/nginx-ingress:$TARGET_TAG"
+      # expose the tagged image refs to the container-signing jobs
+      {
+        echo "TAGGED_IMAGE=$IMAGE_PEP:$TARGET_TAG"
+        echo "TAGGED_IMAGE_INGRESS=$IMAGE_NGINX_INGRESS:$TARGET_TAG"
+        echo "TAGGED_IMAGE_HSM_SIM=$IMAGE_HSM_SIM:$TARGET_TAG"
+        echo "TAGGED_IMAGE_LOAD_DISPENSER=$IMAGE_LOAD_DISPENSER:$TARGET_TAG"
+      } > tag_image.env
+  artifacts:
+    reports:
+      dotenv: tag_image.env
 
 publish_artifacts:
   stage: publish
@@ -295,9 +334,11 @@ publish_artifacts:
       when: on_success
     - when: never
   needs:
-    - job: build
+    - job: package
       artifacts: true
-    - job: container-scanning
+    - job: container-scanning-ngx_pep
+      artifacts: true
+    - job: container-scanning-ngx_ingress
       artifacts: true
   script:
     - git clone https://zeta-sdk:${REPORTING_TOKEN}@tas-devtools-gitlab.spree.de/zeta/reporting.git
@@ -334,7 +375,7 @@ publish_to_dependencytrack:
       when: on_success
     - when: never
   needs:
-    - job: build
+    - job: build:pep-build
       artifacts: true
   before_script: []
   script:
@@ -345,4 +386,4 @@ publish_to_dependencytrack:
       -F "projectName=ngx_pep"
       -F "projectVersion=${VERSION}"
       -F "autoCreate=true"
-      -F "bom=@ngx_pep.cdx.json"
+      -F "bom=@./artifacts/ngx_pep.cdx.json"

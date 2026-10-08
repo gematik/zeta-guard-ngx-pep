@@ -22,11 +22,12 @@
  * #L%
  */
 
-use super::model::*;
-use super::util::*;
 use libcrux_kem as kem;
 use libcrux_ml_kem::mlkem768;
-use rand::Rng;
+use rand::prelude::RngExt;
+
+use super::model::*;
+use super::util::*;
 
 pub struct HandshakeState {
     env: Environment,

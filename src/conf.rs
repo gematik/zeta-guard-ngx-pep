@@ -22,7 +22,8 @@
  * #L%
  */
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
+use chrono::NaiveDate;
 use http::Uri;
 use nginx_sys::{
     NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF,
@@ -33,6 +34,7 @@ use ngx::{
     http::{HttpModuleLocationConf, HttpModuleMainConf, Merge, MergeConfigError},
     ngx_string,
 };
+use reqwest::Url;
 use std::collections::HashSet;
 use std::ptr;
 use std::{
@@ -45,6 +47,10 @@ use ngx::ngx_conf_log_error;
 use crate::Module;
 
 // simple macro to avoid boilerplate for conf command definition
+//
+// The handler's error is logged prefixed with the directive name, taken from the function
+// identifier via `stringify!` — it matches the name registered in `NGX_HTTP_PEP_COMMANDS`
+// below. Handlers therefore must NOT repeat their own name in the error they return.
 macro_rules! conf_handler {
     ( $name: ident, $type: ident, $handler: expr ) => {
         extern "C" fn $name(
@@ -58,7 +64,12 @@ macro_rules! conf_handler {
             let val = match args[1].to_str() {
                 Ok(s) => s,
                 Err(_) => {
-                    ngx_conf_log_error!(NGX_LOG_EMERG, cf, "`$name` argument is not utf-8 encoded");
+                    ngx_conf_log_error!(
+                        NGX_LOG_EMERG,
+                        cf,
+                        "`{}`: argument is not utf-8 encoded",
+                        stringify!($name)
+                    );
                     return ngx::core::NGX_CONF_ERROR;
                 }
             };
@@ -66,7 +77,7 @@ macro_rules! conf_handler {
             match result {
                 Ok(s) => s,
                 Err(e) => {
-                    ngx_conf_log_error!(NGX_LOG_EMERG, cf, "`$name`: {e}");
+                    ngx_conf_log_error!(NGX_LOG_EMERG, cf, "`{}`: {e}", stringify!($name));
                     ngx::core::NGX_CONF_ERROR
                 }
             }
@@ -103,6 +114,17 @@ macro_rules! loc_command {
     };
 }
 
+/// HOTFIX ANFTI2-922 / A_27558: the authorization server does not issue a `birthdate` claim
+/// yet, but DiPag rejects requests whose `ZETA-User-Info` lacks the field. Until the real fix
+/// lands (claim from the sectoral IDP, forwarded by the authorization server) the PEP fills in
+/// this fixed value for insurant tokens (professionOID 1.2.276.0.76.4.49; other client types
+/// get no birthdate); `pep_user_info_birthdate` overrides it per environment.
+///
+/// `1900-01-01` is deliberate: a valid ISO 8601 date every upstream can parse, yet obviously a
+/// placeholder that can never be mistaken for a real insurant's date of birth.
+pub const HOTFIX_USER_INFO_BIRTHDATE: NaiveDate =
+    NaiveDate::from_ymd_opt(1900, 1, 1).expect("valid hotfix birthdate");
+
 #[derive(Debug, Clone, Default)]
 pub enum OcspMode {
     Disable,
@@ -116,7 +138,11 @@ pub enum OcspMode {
 #[cfg_attr(test, allow(unused))]
 pub struct MainConfig {
     pub pdp_issuer: Option<String>,
+    pub revocation_url: Option<Url>,
     pub popp_issuer: Option<String>,
+    /// HOTFIX ANFTI2-922: value emitted as `ZETA-User-Info.birthdate`. Defaults to
+    /// [`HOTFIX_USER_INFO_BIRTHDATE`], overridable via `pep_user_info_birthdate`.
+    pub user_info_birthdate: NaiveDate,
     pub jwks_refresh_interval: Duration,
     pub http_client_connect_timeout: Duration,
     pub http_client_timeout: Duration,
@@ -130,14 +156,17 @@ pub struct MainConfig {
     pub asl_root_ca: Option<String>,
     pub asl_ocsp: OcspMode,
     pub asl_ocsp_ttl: Duration,
-    pub shm_zone: *mut ngx_shm_zone_t,
+    pub session_cache_zone: *mut ngx_shm_zone_t,
+    pub block_list_zone: *mut ngx_shm_zone_t,
 }
 
 impl Default for MainConfig {
     fn default() -> Self {
         Self {
             pdp_issuer: None,
+            revocation_url: None,
             popp_issuer: None,
+            user_info_birthdate: HOTFIX_USER_INFO_BIRTHDATE,
             jwks_refresh_interval: Duration::from_secs(300), // NOTE: not exposed as directive r.n.
             http_client_connect_timeout: Duration::from_secs(2),
             http_client_timeout: Duration::from_secs(10),
@@ -151,7 +180,8 @@ impl Default for MainConfig {
             asl_root_ca: None,
             asl_ocsp: Default::default(),
             asl_ocsp_ttl: Duration::from_hours(24), // A_24624-01 #1
-            shm_zone: ptr::null_mut(),
+            session_cache_zone: ptr::null_mut(),
+            block_list_zone: ptr::null_mut(),
         }
     }
 }
@@ -173,7 +203,7 @@ conf_handler!(
     pep_http_client_connect_timeout,
     MainConfig,
     |conf: &mut MainConfig, val: &str| -> anyhow::Result<*mut c_char> {
-        let val = Duration::from_secs(val.parse()?);
+        let val = parse_secs(val)?;
         conf.http_client_connect_timeout = val;
 
         Ok(ngx::core::NGX_CONF_OK)
@@ -184,7 +214,7 @@ conf_handler!(
     pep_http_client_timeout,
     MainConfig,
     |conf: &mut MainConfig, val: &str| -> anyhow::Result<*mut c_char> {
-        let val = Duration::from_secs(val.parse()?);
+        let val = parse_secs(val)?;
         conf.http_client_timeout = val;
 
         Ok(ngx::core::NGX_CONF_OK)
@@ -200,7 +230,7 @@ conf_handler!(
         } else if val.eq_ignore_ascii_case("off") {
             conf.http_client_accept_invalid_certs = false;
         } else {
-            anyhow::bail!("Unable to parse http_client_accept_invalid_certs: {val}")
+            anyhow::bail!("expected `on` or `off`, got {val:?}")
         }
 
         Ok(ngx::core::NGX_CONF_OK)
@@ -213,9 +243,27 @@ conf_handler!(pep_pdp_issuer, MainConfig, |conf: &mut MainConfig,
     *mut c_char,
 > {
     if val.trim().is_empty() {
-        anyhow::bail!("pep_pdp_issuer empty");
+        anyhow::bail!("empty value");
     }
     conf.pdp_issuer = Some(val.to_string());
+
+    Ok(ngx::core::NGX_CONF_OK)
+});
+
+
+conf_handler!(pep_revocation_url, MainConfig, |conf: &mut MainConfig,
+                                               val: &str|
+ -> anyhow::Result<
+    *mut c_char,
+> {
+    if val.trim().is_empty() {
+        anyhow::bail!("empty value");
+    }
+    conf.revocation_url = Some(
+        val.trim()
+            .parse()
+            .with_context(|| format!("invalid URL {val:?}"))?,
+    );
 
     Ok(ngx::core::NGX_CONF_OK)
 });
@@ -226,28 +274,55 @@ conf_handler!(pep_popp_issuer, MainConfig, |conf: &mut MainConfig,
     *mut c_char,
 > {
     if val.trim().is_empty() {
-        anyhow::bail!("pep_popp_issuer empty");
+        anyhow::bail!("empty value");
     }
     conf.popp_issuer = Some(val.to_string());
 
     Ok(ngx::core::NGX_CONF_OK)
 });
 
+// HOTFIX ANFTI2-922 / A_27558: see [`HOTFIX_USER_INFO_BIRTHDATE`]. Parsed at configuration
+// time, so a malformed date aborts the nginx start instead of surfacing per request.
+conf_handler!(
+    pep_user_info_birthdate,
+    MainConfig,
+    |conf: &mut MainConfig, val: &str| -> anyhow::Result<*mut c_char> {
+        let val = non_empty(val)?;
+        conf.user_info_birthdate = val
+            .parse()
+            .with_context(|| format!("invalid date {val:?}, expected YYYY-MM-DD"))?;
+
+        Ok(ngx::core::NGX_CONF_OK)
+    }
+);
+
 #[inline(always)]
-fn non_empty(name: &str, val: &str) -> anyhow::Result<String> {
+fn non_empty(val: &str) -> anyhow::Result<String> {
     let res = val.trim();
     if res.is_empty() {
-        Err(anyhow!("{name} empty"))
+        Err(anyhow!("empty value"))
     } else {
         Ok(res.to_string())
     }
 }
 
+// parse a plain seconds value, as used by the timeout and validity directives. The directive
+// name is added by `conf_handler!`, so the message must not repeat it.
+#[inline(always)]
+fn parse_secs(val: &str) -> anyhow::Result<Duration> {
+    let secs = val
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid seconds value {val:?}"))?;
+
+    Ok(Duration::from_secs(secs))
+}
+
 // parse a duration spec of the form 1d, 2h, 30m or 45s; assumes given unit if no suffix
-fn parse_duration(name: &str, def: char, val: &str) -> anyhow::Result<Duration> {
+fn parse_duration(def: char, val: &str) -> anyhow::Result<Duration> {
     let spec = val.trim();
     if spec.is_empty() {
-        return Err(anyhow!("{name} empty"));
+        return Err(anyhow!("empty value"));
     }
 
     let last_char = spec.chars().last().unwrap();
@@ -259,14 +334,14 @@ fn parse_duration(name: &str, def: char, val: &str) -> anyhow::Result<Duration> 
 
     let amount: u64 = amount_str
         .parse()
-        .map_err(|_| anyhow!("invalid number in {name}: {val}"))?;
+        .map_err(|_| anyhow!("invalid number in duration {val:?}"))?;
 
     let duration = match unit {
         'd' => Duration::from_hours(amount * 24),
         'h' => Duration::from_hours(amount),
         'm' => Duration::from_mins(amount),
         's' => Duration::from_secs(amount),
-        _ => return Err(anyhow!("invalid unit in {name}: {val}")),
+        _ => return Err(anyhow!("invalid unit in duration {val:?}")),
     };
 
     Ok(duration)
@@ -277,7 +352,7 @@ conf_handler!(pep_asl_signer_cert, MainConfig, |conf: &mut MainConfig,
  -> anyhow::Result<
     *mut c_char,
 > {
-    conf.asl_signer_cert = Some(non_empty("pep_asl_signer_cert", val)?);
+    conf.asl_signer_cert = Some(non_empty(val)?);
     Ok(ngx::core::NGX_CONF_OK)
 });
 
@@ -286,7 +361,7 @@ conf_handler!(pep_asl_signer_key, MainConfig, |conf: &mut MainConfig,
  -> anyhow::Result<
     *mut c_char,
 > {
-    conf.asl_signer_key = Some(non_empty("pep_asl_signer_key", val)?);
+    conf.asl_signer_key = Some(non_empty(val)?);
     Ok(ngx::core::NGX_CONF_OK)
 });
 
@@ -295,7 +370,7 @@ conf_handler!(pep_asl_ca_cert, MainConfig, |conf: &mut MainConfig,
  -> anyhow::Result<
     *mut c_char,
 > {
-    conf.asl_ca_cert = Some(non_empty("pep_asl_ca_cert", val)?);
+    conf.asl_ca_cert = Some(non_empty(val)?);
     Ok(ngx::core::NGX_CONF_OK)
 });
 
@@ -304,7 +379,7 @@ conf_handler!(pep_asl_roots_json, MainConfig, |conf: &mut MainConfig,
  -> anyhow::Result<
     *mut c_char,
 > {
-    conf.asl_roots_json = Some(non_empty("pep_asl_roots_json", val)?);
+    conf.asl_roots_json = Some(non_empty(val)?);
     Ok(ngx::core::NGX_CONF_OK)
 });
 
@@ -313,7 +388,7 @@ conf_handler!(pep_asl_root_ca, MainConfig, |conf: &mut MainConfig,
  -> anyhow::Result<
     *mut c_char,
 > {
-    conf.asl_root_ca = Some(non_empty("pep_asl_root_ca", val)?);
+    conf.asl_root_ca = Some(non_empty(val)?);
     Ok(ngx::core::NGX_CONF_OK)
 });
 
@@ -322,11 +397,15 @@ conf_handler!(pep_asl_ocsp, MainConfig, |conf: &mut MainConfig,
  -> anyhow::Result<
     *mut c_char,
 > {
-    let asl_ocsp = non_empty("pep_asl_ocsp", val)?;
+    let asl_ocsp = non_empty(val)?;
     let asl_ocsp = match asl_ocsp.to_ascii_lowercase().as_str() {
         "off" => OcspMode::Disable,
         "cert" => OcspMode::Cert,
-        _ => OcspMode::Override(asl_ocsp.parse().expect("unparseable pep_asl_ocsp")),
+        // A bad value used to panic here, taking the whole nginx start with it; return the
+        // error instead so `conf_handler!` reports it as a regular [emerg].
+        _ => OcspMode::Override(asl_ocsp.parse().with_context(|| {
+            format!("invalid value {val:?}, expected `off`, `cert` or a responder URL")
+        })?),
     };
     conf.asl_ocsp = asl_ocsp;
 
@@ -338,7 +417,7 @@ conf_handler!(pep_asl_ocsp_ttl, MainConfig, |conf: &mut MainConfig,
  -> anyhow::Result<
     *mut c_char,
 > {
-    conf.asl_ocsp_ttl = parse_duration("pep_asl_ocsp_ttl", 'm', val)?;
+    conf.asl_ocsp_ttl = parse_duration('m', val)?;
     Ok(ngx::core::NGX_CONF_OK)
 });
 
@@ -352,7 +431,7 @@ conf_handler!(pep_asl_testing, MainConfig, |conf: &mut MainConfig,
     } else if val.eq_ignore_ascii_case("off") {
         conf.asl_testing = false;
     } else {
-        anyhow::bail!("Unable to parse asl_testing: {val}")
+        anyhow::bail!("expected `on` or `off`, got {val:?}")
     }
 
     Ok(ngx::core::NGX_CONF_OK)
@@ -368,7 +447,7 @@ conf_handler!(pep_no_travel, MainConfig, |conf: &mut MainConfig,
     } else if val.eq_ignore_ascii_case("off") {
         conf.no_travel = false;
     } else {
-        anyhow::bail!("Unable to parse no_travel: {val}")
+        anyhow::bail!("expected `on` or `off`, got {val:?}")
     }
     Ok(ngx::core::NGX_CONF_OK)
 });
@@ -426,7 +505,7 @@ impl LocationConfig {
 }
 
 /// Last Unix epoch second of the UTC calendar quarter containing `epoch`.
-fn end_of_quarter_utc(epoch: i64) -> i64 {
+pub fn end_of_quarter_utc(epoch: i64) -> i64 {
     let t: libc::time_t = epoch as _;
     let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
     let tm = unsafe {
@@ -498,7 +577,7 @@ conf_handler!(pep, LocationConfig, |conf: &mut LocationConfig,
     } else if val.eq_ignore_ascii_case("off") {
         conf.pep = Some(false);
     } else {
-        anyhow::bail!("Unable to parse pep: {val}")
+        anyhow::bail!("expected `on` or `off`, got {val:?}")
     }
 
     Ok(ngx::core::NGX_CONF_OK)
@@ -512,7 +591,7 @@ conf_handler!(asl, LocationConfig, |conf: &mut LocationConfig,
     } else if val.eq_ignore_ascii_case("off") {
         conf.asl = Some(false);
     } else {
-        anyhow::bail!("Unable to parse asl: {val}")
+        anyhow::bail!("expected `on` or `off`, got {val:?}")
     }
 
     Ok(ngx::core::NGX_CONF_OK)
@@ -547,7 +626,7 @@ conf_handler!(pep_leeway, LocationConfig, |conf: &mut LocationConfig,
  -> anyhow::Result<
     *mut c_char,
 > {
-    let val = Duration::from_secs(val.parse()?);
+    let val = parse_secs(val)?;
 
     conf.leeway = Some(val);
 
@@ -558,7 +637,7 @@ conf_handler!(
     pep_dpop_validity,
     LocationConfig,
     |conf: &mut LocationConfig, val: &str| -> anyhow::Result<*mut c_char> {
-        let val = Duration::from_secs(val.parse()?);
+        let val = parse_secs(val)?;
 
         conf.dpop_validity = Some(val);
 
@@ -575,7 +654,7 @@ conf_handler!(
         } else if val.eq_ignore_ascii_case("off") {
             conf.require_popp = Some(false);
         } else {
-            anyhow::bail!("Unable to parse pep_require_popp: {val}")
+            anyhow::bail!("expected `on` or `off`, got {val:?}")
         }
 
         Ok(ngx::core::NGX_CONF_OK)
@@ -589,7 +668,7 @@ conf_handler!(
         let validity = if val.eq_ignore_ascii_case("quarter") {
             PoppValidity::Quarter
         } else {
-            PoppValidity::Fixed(parse_duration("pep_popp_validity", 's', val)?)
+            PoppValidity::Fixed(parse_duration('s', val)?)
         };
         conf.popp_validity = Some(validity);
 
@@ -606,16 +685,18 @@ conf_handler!(
         } else if val.eq_ignore_ascii_case("off") {
             conf.forward_client_data = Some(false);
         } else {
-            anyhow::bail!("Unable to parse pep_forward_client_data: {val}")
+            anyhow::bail!("expected `on` or `off`, got {val:?}")
         }
 
         Ok(ngx::core::NGX_CONF_OK)
     }
 );
 
-pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 24] = [
+pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 26] = [
     main_command!("pep_pdp_issuer", pep_pdp_issuer),
+    main_command!("pep_revocation_url", pep_revocation_url),
     main_command!("pep_popp_issuer", pep_popp_issuer),
+    main_command!("pep_user_info_birthdate", pep_user_info_birthdate),
     main_command!(
         "pep_http_client_connect_timeout",
         pep_http_client_connect_timeout
@@ -787,5 +868,60 @@ mod tests {
         assert_eq!(child.aud, None);
         assert_eq!(child.scope, Some(some_scope));
         assert_eq!(child.leeway, Some(some_duration));
+    }
+
+    /// HOTFIX ANFTI2-922: without `pep_user_info_birthdate` the PEP must still emit a
+    /// `birthdate`, so the default has to be the hotfix date — not something empty.
+    #[test]
+    fn main_config_defaults_to_hotfix_birthdate() {
+        use crate::conf::{HOTFIX_USER_INFO_BIRTHDATE, MainConfig};
+
+        assert_eq!(
+            MainConfig::default().user_info_birthdate,
+            HOTFIX_USER_INFO_BIRTHDATE
+        );
+        assert_eq!(HOTFIX_USER_INFO_BIRTHDATE.to_string(), "1900-01-01");
+    }
+
+    /// `conf_handler!` prefixes every handler error with the directive name, so the helpers
+    /// must not name a directive themselves — otherwise the log line repeats it.
+    #[test]
+    fn helper_errors_do_not_name_the_directive() {
+        use crate::conf::{non_empty, parse_duration, parse_secs};
+
+        let errors = [
+            non_empty("  ").unwrap_err(),
+            parse_secs("abc").unwrap_err(),
+            parse_duration('s', "").unwrap_err(),
+            parse_duration('s', "5x").unwrap_err(),
+            parse_duration('s', "xs").unwrap_err(),
+        ];
+
+        for err in errors {
+            let msg = format!("{err:#}");
+            assert!(
+                !msg.contains("pep_"),
+                "helper error must not repeat the directive name: {msg}"
+            );
+            assert!(!msg.is_empty());
+        }
+    }
+
+    /// The directive parses with `NaiveDate`'s `FromStr`, i.e. ISO 8601 only. Pinned here so
+    /// the documented `YYYY-MM-DD` contract can't drift silently.
+    #[test]
+    fn user_info_birthdate_accepts_iso_dates_only() {
+        use chrono::NaiveDate;
+
+        assert_eq!(
+            "1980-07-15".parse::<NaiveDate>().ok(),
+            NaiveDate::from_ymd_opt(1980, 7, 15)
+        );
+        for bad in ["01.01.1900", "1900-13-01", "not-a-date", ""] {
+            assert!(
+                bad.parse::<NaiveDate>().is_err(),
+                "pep_user_info_birthdate must reject {bad:?}"
+            );
+        }
     }
 }

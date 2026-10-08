@@ -10,6 +10,11 @@ No `dpop` header or the DPoP proof token was invalid.
 - HTTP method of request does not match `htm`
 - [normalized](#normalization) HTTP target URI to does not match normalized `htu`
 
+The embedded `jwk` is expected to carry only the mandatory public-key members (for EC:
+`kty`, `crv`, `x`, `y`). The optional `alg`, `kid` and `use` members are neither required
+nor rejected: a missing `jwk` `alg` is accepted (the proof's protected-header `alg` already
+pins `ES256`), while an explicit `jwk` `alg` other than `ES256` is rejected.
+
 ## normalization scheme {#normalization}
 The request determines its “eigen-URL”, i.e. what would have been the original client
 request URI. The host and scheme are determined by looking at the following headers, in

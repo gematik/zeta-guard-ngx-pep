@@ -6,9 +6,9 @@
 
 if [[ -z ${CARGO_LLVM_COV:-} ]]; then
   _OLD_RUSTFLAGS="${RUSTFLAGS:-}"
+  _OLD_RUSTC_WRAPPER="${RUSTC_WRAPPER:-}"
   # shellcheck disable=SC1090
-  . <(cargo llvm-cov show-env --export-prefix)
-  cargo llvm-cov clean --workspace
+  . <(cargo llvm-cov show-env --export-prefix --remap-path-prefix)
 
   cov-env-deactivate() {
     if [[ -n ${_OLD_RUSTFLAGS:-} ]]; then
@@ -16,12 +16,38 @@ if [[ -z ${CARGO_LLVM_COV:-} ]]; then
     else
       unset RUSTFLAGS
     fi
+    if [[ -n ${_OLD_RUSTC_WRAPPER:-} ]]; then
+      export RUSTC_WRAPPER=$_OLD_RUSTC_WRAPPER
+    else
+      unset RUSTC_WRAPPER
+    fi
     unset LLVM_PROFILE_FILE
     unset CARGO_LLVM_COV_SHOW_ENV
     unset CARGO_LLVM_COV_TARGET_DIR
     unset CARGO_LLVM_COV_BUILD_DIR
     unset CARGO_LLVM_COV
+    unset __CARGO_LLVM_COV_RUSTC_WRAPPER
+    unset __CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS
+    unset __CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES
+    unset __CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING
   }
+
+  # cargo only writes CACHEDIR.TAG when it creates the target dir itself; a
+  # pre-existing dir (buildkit cache mount) never gets one, and cargo >= 1.97
+  # refuses `clean -p` without it.
+  if [[ ! -e ${CARGO_TARGET_DIR:-target}/CACHEDIR.TAG ]]; then
+    mkdir -p "${CARGO_TARGET_DIR:-target}"
+    printf 'Signature: 8a477f597d28d172789f06886806bc55\n' \
+      >"${CARGO_TARGET_DIR:-target}/CACHEDIR.TAG"
+  fi
+
+  # RUSTC_WRAPPER is not fingerprinted by cargo; without this clean, stale
+  # uninstrumented artifacts get reused and silently poison the report.
+  if ! cargo llvm-cov clean --workspace; then
+    printf 'cov-env: `cargo llvm-cov clean` failed — deactivating, coverage would be unreliable\n' >&2
+    cov-env-deactivate
+    return 1
+  fi
 
   hash -r 2>/dev/null || :
 fi

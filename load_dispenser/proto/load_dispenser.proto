@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package load_dispenser;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+
+service LoadDispenser {
+  // Starts the load test. Fails with FAILED_PRECONDITION if a test is already active.
+  rpc Start(google.protobuf.Empty) returns (google.protobuf.Empty);
+  // Stops an active test. No-op if none is running.
+  rpc Abort(google.protobuf.Empty) returns (google.protobuf.Empty);
+  // Returns one of "STOPPED", "SETUP", "RUNNING", "ABORTED", "FAILED".
+  // STOPPED covers natural ends (never started, completed, runtime limit
+  // reached); ABORTED means the last run was ended via Abort.
+  // FAILED means the last run died on an error (see the pod log).
+  rpc Status(google.protobuf.Empty) returns (StatusReply);
+  // Returns the effective config (defaults + load-dispenser ENV overrides + last SetConfig values)
+  rpc GetConfig(google.protobuf.Empty) returns (google.protobuf.Struct);
+  // Set config overrides. Can be partial. Only the last SetConfig values are used,
+  // overriding defaults and ENV. Returns the new effective config.
+  // See https://tas-devtools-gitlab.spree.de/zeta/zeta-guard/ngx_pep/-/blob/main/load_dispenser/src/main.rs
+  // for possible keys.
+  rpc SetConfig(google.protobuf.Struct) returns (google.protobuf.Struct);
+}
+
+message StatusReply {
+  string status = 1;
+}

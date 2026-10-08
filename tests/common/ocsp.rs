@@ -176,8 +176,8 @@ async fn handle_request(
 /// Returns when the listener shuts down (i.e., when the spawned task is aborted).
 pub async fn ocsp_responder(port: u16, conf_dir: &Path) -> Result<()> {
     let state = Arc::new(OcspState::load(conf_dir)?);
-    let listener = TcpListener::bind(("127.1.33.7", port)).await?;
-    eprintln!("[ocsp-responder] listening on 127.1.33.7:{port}");
+    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    eprintln!("[ocsp-responder] listening on 127.0.0.1:{port}");
 
     loop {
         let (stream, _) = listener.accept().await?;

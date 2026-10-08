@@ -24,7 +24,6 @@ name = "ngx_pep"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [workspace]
 members = [
@@ -33,14 +32,14 @@ members = [
   "libasl",
   "hsm_sim",
   "ossl_hsm",
+  "load_dispenser",
 ]
 exclude = ["xtask"]
 
 [workspace.package]
-version = "1.0.1"
+version = "1.3.3"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.94.0"
 
 [features]
 default = []
@@ -60,6 +59,7 @@ client = [
   "dep:hyper-util",
   "tokio/rt-multi-thread",
   "tokio/process",
+  "reqwest/form",
 ]
 # for integration tests
 its = [
@@ -76,15 +76,20 @@ futures = "0.3"
 jsonwebtoken = { version = "10.2", features = ["rust_crypto"] }
 nginx-sys = { version = "0.5", default-features = false }
 ngx = { version = "0.5", features = ["async"] } # async: only needed for nginx sleep, spawn from ngx-tickle
-ngx-tickle = { version = "=0.2.4" }
-reqwest = { version = "0.12", default-features = false, features = [
-  "rustls-tls",
-  "blocking",
+ngx-tickle = { version = "=0.3.0" }
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
   "json",
   "http2",
+  "cookies",
+  "stream",
 ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# HOTFIX ANFTI2-922: `format: date` in zeta-user-info.yaml makes typify generate
+# `chrono::NaiveDate`. Only `std` (FromStr/Display) and `serde` are needed; no clock.
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+bytes = "1"
 serde_cbor = "0.11"
 thiserror = "2.0"
 asl = { path = "./libasl" }
@@ -95,7 +100,7 @@ sha2 = "0.10"
 httparse = "1.10"
 http = "1.4"
 fastrand = "2.3"
-openssl = "0.10"
+openssl = "^0.10.78"
 openssl-sys = "0.9"
 foreign-types = "0.3" # keep in sync with openssl!
 x509-cert = { version = "0.2", optional = true }
@@ -112,24 +117,33 @@ hyper-util = { version = "0.1", features = ["full"], optional = true}
 strum = { version = "0.28", features = ["derive"] }
 tarpc = { version = "0.37", features = ["tokio1", "serde-transport", "unix", "serde1"], optional = true }
 tokio-serde = { version = "0.9", features = ["json"], optional = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.33" # version not in sync with otel sdk components, 0.33 is otel 0.32, see release notes (https://github.com/tokio-rs/tracing-opentelemetry/releases/tag/v0.33.0)
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
+opentelemetry-appender-tracing = { version = "0.32" }
 
 [dev-dependencies]
-mockall = "0.14"
+mockall = "0.15"
 rstest = "0.26"
 serial_test = "3"
 ambassador = "0.5"
 ngx_pep = { path = ".", features = ["client", "its"] }
 tarpc = { version = "0.37", features = ["tokio1", "serde-transport", "unix", "serde1"] }
 tokio-serde = { version = "0.9", features = ["json"] }
+tokio-stream = { version = "0.1", features = ["sync"]}
 hsm_sim = { path = "./hsm_sim/" }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
-const-oid = "0.9"
+const-oid = { version = "0.9", features = [ "db" ] }
 
 [build-dependencies]
 cc = { version = "1.0", optional = true }
 anyhow = "1.0"
+bindgen = "0.72" # keep in sync with nginx-sys' bindgen to avoid a second build of it
 tinytemplate = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml_ng = "0.10"
@@ -145,5 +159,12 @@ crate-type = ["cdylib", "rlib"]
 name = "it"
 required-features = ["client"]
 
+# workspace crates: full DWARF
 [profile.release]
 debug = true
+# deps: no debuginfo, "*" doesn't apply to workspace members
+[profile.release.package."*"]
+debug = false
+# build scripts/proc macros: no debuginfo
+[profile.release.build-override]
+debug = false

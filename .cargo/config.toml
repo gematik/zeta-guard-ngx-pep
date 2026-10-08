@@ -1,6 +1,18 @@
 [alias]
 xtask = "run --manifest-path xtask/Cargo.toml --"
+# Module builds use dedicated target dirs — one per feature set — because
+# differing feature selections in a shared dir evict each other's fingerprints
+# and rerun build.rs (nginx make install, bindgen, mdbook) every time.
+#
+# `module`: prod-shaped .so (default features) that prefix/conf/nginx.conf
+# loads. Dev loop: `cargo module && prefix/sbin/nginx` (`--release` works too).
+module = "build -p ngx_pep --target-dir target/module"
+clean-module = "clean -p ngx_pep --target-dir target/module"
+# `module-test`: .so with the `its` feature (tarpc control socket, cache
+# manipulation hooks) that the test-*.conf instances load. Built by the
+# nextest setup script; keep the invocations identical.
+module-test = "build -p ngx_pep --features its --target-dir target/module-test"
 
 [env]
 NGINX_SOURCE_DIR = { value = ".nginx", relative = true }
-NGINX_VERSION = "1.29.8" # NOTE: keep in sync with .gitlab-ci.yml and Dockerfile, and with nginx-ingress version (major.minor) in .gitlab-ci.yaml
+OPENSSL_CONF = { value = "target/debug/openssl.cnf", relative = true }

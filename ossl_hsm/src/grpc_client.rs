@@ -162,6 +162,13 @@ where
         let current_pid = std::process::id();
         let need_reconnect = state.rt.as_ref().is_none_or(|rt| rt.pid != current_pid);
         if need_reconnect {
+            // After fork(), kqueue/epoll fds inherited from the parent are invalid in the
+            // child. Dropping the old tokio Runtime would panic trying to wake the I/O
+            // driver (EBADF). Leaking it is safe: the worker eventually exits and the fd
+            // is reclaimed by the OS.
+            if state.rt.as_ref().is_some_and(|rt| rt.pid != current_pid) {
+                std::mem::forget(state.rt.take());
+            }
             match RuntimeState::connect(state.uri.clone()) {
                 Ok(rt) => {
                     state.rt = Some(rt);

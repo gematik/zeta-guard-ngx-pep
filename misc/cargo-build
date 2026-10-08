@@ -4,88 +4,69 @@ set -e
 set -u
 set -o pipefail
 
-printf "!! cargo fetch\n\n"
-cargo fetch --locked
-
-common_args=(
-	--frozen
-	# exclude "devel"
-	--no-default-features
-)
-
 export RUST_BACKTRACE=1
 
-printf "!! configure nginx\n\n"
-cargo xtask configure
-
-printf "!! generate openssl.cnf for ossl_hsm\n\n"
-export OPENSSL_CONF="$PWD/ossl_hsm/openssl.cnf"
-cat >"$OPENSSL_CONF" <<-EOF
-	openssl_conf = openssl_init
-
-	[openssl_init]
-	providers = provider_sect
-
-	[provider_sect]
-	ossl_hsm = ossl_hsm_sect
-	default = default_sect
-
-	[ossl_hsm_sect]
-	module = $PWD/target/debug/libossl_hsm.so
-	activate = 1
-
-	[default_sect]
-	activate = 1
-EOF
-
-printf "!! tests\n\n"
 tests() {
-	set +e
 	(
+		set +e
+		printf "!! tests\n\n"
 		shopt -s nullglob
 		# shellcheck disable=SC1091
 		. /usr/local/share/cov-env
 
-		# test.log might contain output from previous runs (cache)
-		printf "" >prefix/test.log
-
 		cargo nextest run --workspace ${NEXTEST_FILTERSET:+--filterset "$NEXTEST_FILTERSET"}
 		local result=$?
 
-		if [[ -f prefix/test.log ]]; then
+		if [[ -f prefix/test.log ]] && [[ $result -ne 0 ]]; then
 			cat prefix/test.log || :
 		fi
 
 		# n.b.: --no-run is deprecated, but report doesn't support --workspace…
-		cargo llvm-cov --no-run --workspace
-		cargo llvm-cov --no-run --workspace --lcov --output-path coverage.lcov || :
+		cargo llvm-cov --no-run --workspace --remap-path-prefix
+		cargo llvm-cov --no-run --workspace --remap-path-prefix --lcov --output-path coverage.lcov || :
 		cargo llvm-cov clean --workspace || :
 		exit $result
 	)
-	result=$?
-	set -e
-	return $result
+	return $?
 }
 
-set -e
-tests
-test_result=$?
-set +e
+if [[ ${SKIP_TESTS:-0} -ne 1 ]]; then
+	set +e
+	tests
+	test_result=$?
+	printf "!! test result: %s\n\n" "$test_result"
+	set -e
+else
+	test_result=0
+fi
 
 printf "!! build nginx module\n\n"
-cargo build "${common_args[@]}" --release --lib
+cargo clean-module --release
 
-printf "!! build hsm_sim\n\n"
-cargo build "${common_args[@]}" --release -p hsm_sim
+# -Zsbom: embed the SBOM from cargo's unit graph (exact) instead of `cargo
+# metadata`, which lists dev-dep-activated optional deps (tarpc, client stack)
+# as runtime although they are never linked.
+# RUSTC_BOOTSTRAP=1 to allow -Z usage (config [env] can't satisfy cargo's own -Z gate)
+RUSTC_BOOTSTRAP=1 cargo auditable build \
+	--release -p ngx_pep --target-dir target/module \
+	-Zsbom --config build.sbom=true
 
-printf "!! build ossl_hsm\n\n"
-cargo build "${common_args[@]}" --release -p ossl_hsm
+for pkg in ossl_hsm hsm_sim load_dispenser; do
+	printf "!! build %q\n\n" "$pkg"
+	# cargo-auditable injects at link time via RUSTC_WORKSPACE_WRAPPER, which cargo
+	# does not fingerprint — a cached fresh artifact silently skips the wrapper.
+	# Clean only the workspace members (dep cache stays warm) to guarantee relink.
+	cargo clean --release -p "$pkg"
+	RUSTC_BOOTSTRAP=1 cargo auditable build \
+		--release -p "$pkg" \
+		-Zsbom --config build.sbom=true
+done
 
 printf "!! clippy\n\n"
-cargo clippy "${common_args[@]}" --release --workspace
+cargo clippy --workspace
 
 printf "!! clippy json\n\n"
-cargo clippy "${common_args[@]}" --release --workspace --message-format json >clippy.json
+cargo clippy --workspace --message-format json >clippy.json
 
 printf "!! write .pkg-version\n\n"
 cargo metadata --format-version 1 | jq -r '.packages | map(select(.name == "ngx_pep")) | .[0].version' \
@@ -97,4 +78,4 @@ cargo cyclonedx -f json -a
 printf "!! mdbook\n\n"
 mdbook build book
 
-exit $test_result
+exit "$test_result"

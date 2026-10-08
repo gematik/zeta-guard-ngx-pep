@@ -27,7 +27,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use http::header::{AUTHORIZATION, HOST, UPGRADE};
+use http::header::{AUTHORIZATION, FORWARDED, HOST, UPGRADE};
 use http::{HeaderValue, Uri};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
@@ -37,6 +37,7 @@ use hyper::service::service_fn;
 use hyper::upgrade::Upgraded;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use ngx_pep::client::token_dispenser::Tokens;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, lookup_host};
@@ -85,7 +86,7 @@ async fn echo_ws_client_io(upgraded: Upgraded, msg: u8) -> Result<u8> {
 }
 
 // handshake → exchange msg → close
-pub async fn ws_request(uri: Uri, auth: &str, dpop: &str, msg: u8) -> Result<u8> {
+pub async fn ws_request(tokens: Tokens, uri: Uri, msg: u8) -> Result<u8> {
     let host = uri.host().context("host")?;
     let port = uri.port_u16().context("port")?;
     let hostport = format!("{host}:{port}");
@@ -94,9 +95,13 @@ pub async fn ws_request(uri: Uri, auth: &str, dpop: &str, msg: u8) -> Result<u8>
     let req = Request::builder()
         .header(HOST, &hostport)
         .uri(paq)
+        .header(
+            FORWARDED,
+            format!("for=\"{}\"", tokens.access_token_data.claims.ip_address),
+        )
         .header(UPGRADE, "echo")
-        .header(AUTHORIZATION, format!("DPoP {auth}"))
-        .header("dpop", dpop)
+        .header(AUTHORIZATION, format!("DPoP {}", tokens.access_token))
+        .header("dpop", tokens.valid_dpop_proof("GET", &uri.to_string())?)
         .body(Empty::<Bytes>::new())?;
 
     let addr = lookup_host(&hostport)
@@ -145,6 +150,17 @@ async fn echo_service(
             let response = serde_json::to_string_pretty(&response)?;
             Ok(Response::new(full(response)))
         }
+        // Used by the integration test for the zeta-cause: proxy interceptor. The body and
+        // status are intentionally non-error-shaped so the test can verify that pep did not
+        // pass the upstream response through.
+        (&Method::GET, "/proxy_error") => {
+            let mut response = Response::new(full("SECRET_UPSTREAM_BODY"));
+            *response.status_mut() = StatusCode::OK;
+            response
+                .headers_mut()
+                .insert("zeta-cause", HeaderValue::from_static("proxy"));
+            Ok(response)
+        }
         (&Method::GET, "/ws/") => {
             tokio::task::spawn(async move {
                 match hyper::upgrade::on(&mut req).await {
@@ -185,7 +201,7 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
 }
 
 pub async fn echo_server(port: u16) -> Result<()> {
-    let addr = SocketAddr::from(([127, 1, 33, 7], port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
     let listener = TcpListener::bind(addr).await?;
 
@@ -194,7 +210,7 @@ pub async fn echo_server(port: u16) -> Result<()> {
 
         let io = TokioIo::new(stream);
 
-        tokio::task::spawn(async move {
+        tokio::spawn(async move {
             let conn = http1::Builder::new()
                 .serve_connection(io, service_fn(echo_service))
                 .with_upgrades();

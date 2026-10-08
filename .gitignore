@@ -7,6 +7,12 @@
 
 .idea
 
+/.local/
+
+# symlinks for load-dispenser
+/keystores
+/popp-token-Server-Sim-nist-komp61.p12
+
 .jenkins
 .githubignore
 

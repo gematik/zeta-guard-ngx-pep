@@ -1,0 +1,1107 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://openvex.dev/docs/public/vex-9f78659d69d5c3a33e770fcafa904ea9af0d85ac2d2679aa13c7b856f4553441",
+  "author": "Unknown Author",
+  "version": 18,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "CVE-2023-2953"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libldap-2.5-0"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T15:05:53.610558694Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-6020"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpam-modules"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T15:57:28.186692447Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-65018"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T15:59:04.732183729Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-66293"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T15:59:22.853556725Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-22695"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T15:59:38.589755781Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-22801"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T15:59:52.312576843Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2023-45853"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/zlib1g"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:00:29.243743083Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-68973"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/gpgv"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-64720"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16t64"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-65018"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16t64"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-66293"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16t64"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-22695"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16t64"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-22801"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16t64"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-25646"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpng16-16t64"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-61144"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libtiff6"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-68431"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libheif-plugin-dav1d"
+        },
+        {
+          "@id": "pkg:deb/debian/libheif-plugin-libde265"
+        },
+        {
+          "@id": "pkg:deb/debian/libheif1"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-4105"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libsystemd0"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Trifft nur zu, wenn auch systemd-machined installiert ist, was hier nicht zutrifft. Siehe https://github.com/systemd/systemd/security/advisories/GHSA-4h6x-r8vx-3862",
+      "justification": "vulnerable_code_not_present",
+      "timestamp": "2026-02-23T16:02:07.699281286Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-4046"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc-bin"
+        },
+        {
+          "@id": "pkg:deb/debian/libc6"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "iconv wird tatsächlich nicht verwendet.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-04-02T08:34:58.592613738Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-4878"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libcap2"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "TOCTOU race in cap_set_file(). libcap2 is pulled in transitively by the runtime image, but neither nginx, ngx_pep, ossl_hsm nor hsm_sim calls cap_set_file(); setcap/getcap are not invoked at runtime. The exploit additionally requires a local unprivileged attacker racing a concurrent setcap call — neither precondition exists in the container.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-04-21T00:00:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-5958"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/sed"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "sed wird von keinem im PEP ausgeführten Prozess verwendet.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-27456"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/bsdutils"
+        },
+        {
+          "@id": "pkg:deb/debian/libblkid1"
+        },
+        {
+          "@id": "pkg:deb/debian/libmount1"
+        },
+        {
+          "@id": "pkg:deb/debian/libsmartcols1"
+        },
+        {
+          "@id": "pkg:deb/debian/login"
+        },
+        {
+          "@id": "pkg:deb/debian/mount"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Es gibt keinen Eintrag in /etc/fstab. Daher kann der Angreifer die Schwachstelle nicht ausnutzen (s. https://nvd.nist.gov/vuln/detail/CVE-2026-27456). Ein Angreifer bräuchte zusätzlich Zugriff auf eine Shell/Terminal.",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-34743"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/liblzma5"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "liblzma wird von keinem im PEP ausgeführten Prozess verwendet.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-29111"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libsystemd0"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "systemd läuft im Container nicht als PID 1.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-40225"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libsystemd0"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "systemd läuft im Container nicht als PID 1.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-40226"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libsystemd0"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "systemd läuft im Container nicht als PID 1.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-69720"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libtinfo6"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft infocomp, was im PEP nicht vorhanden ist.",
+      "justification": "vulnerable_code_not_present",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-5704"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/tar"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Tar wird von keinem im PEP ausgeführten Prozess verwendet. Für das Ausnutzen der Schwachstelle bräuchte ein Angreifer Zugriff auf eine Shell/Terminal.",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-27171"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/zlib1g"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die betroffenen funktionen crc32_combine64 und crc32_combine_gen64 werden in keinem im PEP ausgeführten Prozess verwendet.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-4437"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc6"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die betroffenen Funktionen gethostbyaddr und gethostbyaddr_r werden in keiner Nginx-Binary oder Nginx-Modul geladen. Durchsucht wurden '/usr/sbin/nginx' '/usr/lib/nginx/modules/' '/etc/nginx/modules/'. Keine Systembibliothek lädt ein der betroffenen Funktionen von libc6. Verifiziert mithilfe von von nm -D, ldd und grep -aF.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-21T15:09:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-4438"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc6"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die betroffenen Funktionen gethostbyaddr und gethostbyaddr_r werden in keiner Nginx-Binary oder Nginx-Modul geladen. Durchsucht wurden '/usr/sbin/nginx' '/usr/lib/nginx/modules/' '/etc/nginx/modules/'. Keine Systembibliothek lädt ein der betroffenen Funktionen von libc6. Verifiziert mithilfe von von nm -D, ldd und grep -aF.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-21T15:09:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-5435"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc6"
+        },
+        {
+          "@id": "pkg:deb/debian/libc-bin"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die betroffenen Funktionen ns_printrrf, ns_printrr und fp_nquery werden in keiner Nginx-Binary oder Nginx-Modul geladen. Durchsucht wurden '/usr/sbin/nginx' '/usr/lib/nginx/modules/' '/etc/nginx/modules/'. Keine Systembibliothek lädt ein der betroffenen Funktionen von libc6. Verifiziert mithilfe von von nm -D, ldd und grep -aF.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-21T15:09:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-5450"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc6"
+        },
+        {
+          "@id": "pkg:deb/debian/libc-bin"
+        }
+      ],
+      "status": "affected",
+      "status_notes": "Eine Funktion der scanf-Familie wird in diversen Executables und Libraries importiert. Dabei ist unklar, ob %mc verwendet wird. Dies ist notwendig, um die Schwachstellen ausnutzen zu können. Es kann daher nicht ausgeschlossen werden, dass eine der Executables oder Libraries betroffen ist. Für das Ausnutzen der Schwachstelle müsste der Angreifer den Input kontrollieren und die Executable aufrufen oder die betroffene Libary-Funktion triggern. Das einzige nginx-bezogene Finding von scanf ist in /usr/lib/nginx/modules/ngx_otel_module.so. Dort wird sscanf() verwendet, allerdings nicht mit %mc. Die Schwachstelle wird von der NVD als Critical eingestuft (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H). Doch Red Hat bietet eine gut begründete Analyse (https://access.redhat.com/security/cve/cve-2026-5450), durch die diese Schwachstelle eine Kritikalität einen CVSS3.1-Score von 5 (Medium) erhält (CVSS:3.1/AV:L/AC:H/PR:L/UI:R/S:U/C:N/I:L/A:H).",
+      "timestamp": "2026-05-21T15:09:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-5928"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc6"
+        },
+        {
+          "@id": "pkg:deb/debian/libc-bin"
+        }
+      ],
+      "status": "affected",
+      "status_notes": "Die Funktion ungetwc wird von libstdc++ geladen, welche wiederum vom /usr/lib/nginx/modules/ngx_otel_module.so geladen wird. Ob es einen Pfad von den importierten Funktion aus libstdc++ zur betroffenen Funktion ungetwc gibt, ist unklar. Daher kann daher nicht ausgeschlossen werden, dass die Schwachstelle theoretisch ausnutzbar ist. Die Schwachstelle wird von der NVD als High eingestuft (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H). Doch Red Hat bietet eine Analyse (https://access.redhat.com/security/cve/cve-2026-5450), durch die diese Schwachstelle eine Kritikalität einen CVSS3.1-Score von 5 (Medium) erhält (CVSS:3.1/AV:L/AC:H/PR:L/UI:R/S:U/C:L/I:N/A:H).",
+      "timestamp": "2026-05-21T15:09:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-6238"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc-bin"
+        },
+        {
+          "@id": "pkg:deb/debian/libc6"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die betroffenen Funktionen ns_printrrf, ns_printrr und fp_nquery werden in keiner Nginx-Binary oder Nginx-Modul geladen. Durchsucht wurden '/usr/sbin/nginx' '/usr/lib/nginx/modules/' '/etc/nginx/modules/'. Keine Systembibliothek lädt ein der betroffenen Funktionen von libc6. Verifiziert mithilfe von von nm -D, ldd und grep -aF.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-21T15:09:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-42250"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libbz2-1.0"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Das Tool bzip2recover, in dem die Schwachstelle besteht, wird nicht im Image nicht verwendet. Für einen erfolgreichen Angriff müsste ein Angreifer bzip2recover auf eine von ihm kontrollierte Datei aufrufen können. Ein Angreifer bräuchte Zugriff auf eine Shell/Terminal.",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-05-21T15:09:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-3184"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/bsdutils"
+        },
+        {
+          "@id": "pkg:deb/debian/libblkid1"
+        },
+        {
+          "@id": "pkg:deb/debian/libmount1"
+        },
+        {
+          "@id": "pkg:deb/debian/libsmartcols1"
+        },
+        {
+          "@id": "pkg:deb/debian/login"
+        },
+        {
+          "@id": "pkg:deb/debian/mount"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Es ist nur das Tool login betroffen. Diese Schwachstelle wurde von Red Hat mit dem CVSS3.1-Score 3.7 (Low) bewertet (CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:L/A:N).",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-21T15:09:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-54411"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libpam-modules"
+        },
+        {
+          "@id": "pkg:deb/debian/libpam-modules-bin"
+        },
+        {
+          "@id": "pkg:deb/debian/libpam-runtime"
+        },
+        {
+          "@id": "pkg:deb/debian/libpam0g"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Laut https://access.redhat.com/security/cve/cve-2026-54411 muss pam_userdb, damit die Schwachstelle ausnutzbar ist. pam_userdb ist nicht konfiguriert, da es gibt keine Einträge in den Konfigurationsdateien mit 'pam_userdb.so' unter '/etc/pam.d'.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-17T12:19:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "GHSA-hc3c-63hc-2r9f"
+      },
+      "products": [
+        {
+          "@id": "pkg:cargo/libcrux-chacha20poly1305"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft ausschließlich die Funktionen libcrux_chacha20poly1305::encrypt und libcrux_chacha20poly1305::xchacha20_poly1305::encrypt. AES-GCM ist nicht betroffen. Im PEP wird libcrux-chacha20poly1305 ausschließlich transitiv über libcrux-aead eingesetzt, und libcrux-aead wird nur von asl (libasl) verwendet. asl nutzt durchgängig Aead::AesGcm256 (libasl/src/util.rs); es gibt im PEP keine Verwendung von ChaCha20Poly1305 oder XChaCha20Poly1305. Auch die Multiplex API über Aead::encrypt, bei der zur Laufzeit über den verwendeten Algorithmus entschieden werden kann, wird nicht verwendet (siehe https://docs.rs/libcrux-aead/latest/libcrux_aead/).",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-18T08:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "GHSA-pv9v-5j35-xwcr"
+      },
+      "products": [
+        {
+          "@id": "pkg:cargo/libcrux-poly1305"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Laut https://github.com/advisories/GHSA-pv9v-5j35-xwcr ist die Verwendung der betroffenen Bibliothek libcrux-poly1305 als Abhängigkeit von der Bibliothek libcrux-chacha20poly1305 nicht von der Schwachstelle betroffen. In diesem Projekt wird die Bibliothek nur als Abhängigkeit von libcrux-chacha20poly1305 eingesetzt und nicht als Standalone.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-18T08:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "GHSA-q29p-9pfr-j652"
+      },
+      "products": [
+        {
+          "@id": "pkg:cargo/libcrux-sha3"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "In diesem Projekt wird die Bibliothek nur als Abhängigkeit von libcrux-ml-kem und libcrux-kem eingesetzt und nicht als Standalone. Laut https://github.com/celabshq/libcrux/pull/1352 ist die Verwendung der betroffenen Bibliothek libcrux-sha3 als Abhängigkeit der Bibliotheken libcrux-ml-kem nicht von der Schwachstelle betroffen. Analog zur Analyse in https://github.com/celabshq/libcrux/pull/1352 wurde die Verwendung von libcrux-sha3 in libcrux-kem untersucht und keine Ausnutzbarkeit der Schwachstelle festgestellt.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-18T08:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-41676"
+      },
+      "products": [
+        {
+          "@id": "pkg:cargo/openssl"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Laut https://nvd.nist.gov/vuln/detail/CVE-2026-41676 ist die Schwachstelle in rust-openssl nur ausnutzbar, wenn sie in Kombination mit OpenSSL 1.x.x verwendet wird. Im PEP wird OpenSSL 3.x.x verwendet.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-18T08:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-41678"
+      },
+      "products": [
+        {
+          "@id": "pkg:cargo/openssl"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die betroffene Funktion aes::unwrap_key() wird im PEP nicht verwendet. Weiterhin wird die betroffene Bibliothek openssl von keiner anderen Bibliothek verwendet, sodass die betroffene Funktion auch nicht transitiv aufgerufen werden kann. Auch kann die Funktion nicht über eine andere im PEP genutzt API der Bibliothek, z.B. openssl::hash:hash(), aufgerufen werden.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-18T08:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-41681"
+      },
+      "products": [
+        {
+          "@id": "pkg:cargo/openssl"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die betroffene Funktion MdCtxRef::digest_final() wird im PEP nicht verwendet. Weiterhin wird die betroffene Bibliothek openssl von keiner anderen Bibliothek verwendet, sodass die betroffene Funktion auch nicht transitiv aufgerufen werden kann. Auch kann die Funktion nicht über eine andere im PEP genutzt API der Bibliothek, z.B. openssl::hash:hash(), aufgerufen werden.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-18T08:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-41898"
+      },
+      "products": [
+        {
+          "@id": "pkg:cargo/openssl"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft ausschließlich die FFI-Trampoline der Callbacks SslContextBuilder::set_psk_client_callback(), set_psk_server_callback(), set_cookie_generate_cb() und set_stateless_cookie_generate_cb(). Keine dieser Funktionen wird im PEP verwendet; das gesamte Modul openssl::ssl wird nicht genutzt (openssl dient hier nur für X.509, OCSP, EC-Schluessel und Signaturen). Da die betroffenen Closures nie registriert werden, werden die fehlerhaften Trampoline nicht ausgeführt.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-18T08:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-42327"
+      },
+      "products": [
+        {
+          "@id": "pkg:cargo/openssl"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft ausschließlich die Funktion X509Ref::ocsp_responders(), die die OCSP-Responder-URLs aus der AIA-Extension als OpensslString zurückgibt, dessen Deref<Target=str> die Rohbytes per str::from_utf8_unchecked() ungeprüft als &str interpretiert. Diese Funktion wird im PEP nicht verwendet (kein Vorkommen von ocsp_responders im Quellcode). Das PEP liest die OCSP-URL aus der AIA-Extension stattdessen in parse_ocsp_url() (src/asl_keys.rs) über cert.authority_info().location().uri() aus; GeneralNameRef::uri() validiert die Bytes per str::from_utf8(...).ok() und liefert bei Nicht-UTF-8 None, ist also nicht von der Schwachstelle betroffen. Weiterhin wird die betroffene Bibliothek openssl von keiner anderen Bibliothek verwendet, sodass X509Ref::ocsp_responders() auch nicht transitiv aufgerufen werden kann.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-18T08:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-44662"
+      },
+      "products": [
+        {
+          "@id": "pkg:cargo/openssl"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft ausschließlich die Funktionen CipherCtxRef::cipher_update(), CipherCtxRef::cipher_update_vec() und symm::Crypter::update(), und auch nur dann, wenn diese mit AES-Key-Wrap-with-Padding-Ciphern (EVP_aes_{128,192,256}_wrap_pad) verwendet werden. Andere AES-Modi sind nicht betroffen. Im PEP wird AES-Key-Wrap-with-Padding nirgends genutzt. Die einzige Kryptografie über openssl ist AES-256-GCM über openssl::symm::encrypt_aead()/decrypt_aead() (hsm_sim/src/lib.rs). Keine der betroffenen cipher_update*-Funktionen wird aufgerufen. Weiterhin wird die betroffene Bibliothek openssl von keiner anderen Bibliothek verwendet, sodass die Funktionen auch nicht transitiv aufgerufen werden können.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-18T08:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-45784"
+      },
+      "products": [
+        {
+          "@id": "pkg:cargo/openssl"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Diese Schwachstelle ist der Folge-Fix zu CVE-2026-44662 und betrifft ausschließlich die Funktion CipherCtxRef::cipher_update_inplace(), und auch nur dann, wenn diese mit AES-Key-Wrap-with-Padding-Ciphern (EVP_aes_{128,192,256}_wrap_pad) verwendet wird. Andere AES-Modi sind nicht betroffen. Die Funktion CipherCtxRef::cipher_update_inplace() wird im PEP nicht verwendet, und AES-Key-Wrap-with-Padding wird nirgends genutzt. Die einzige Kryptografie über openssl ist AES-256-GCM über openssl::symm::encrypt_aead()/decrypt_aead() in hsm_sim/src/lib.rs. Weiterhin wird die betroffene Bibliothek openssl von keiner anderen Bibliothek verwendet, sodass die Funktion auch nicht transitiv aufgerufen werden kann.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-18T08:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "GHSA-82j2-j2ch-gfr8"
+      },
+      "products": [
+        {
+          "@id": "pkg:cargo/rustls-webpki"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle ist nur erreichbar, wenn CRL-Revocation-Checking aktiviert ist. Im PEP wird rustls-webpki nur transitiv über rustls (reqwest mit Feature rustls-tls) als TLS-Client genutzt. reqwest übergibt CRLs an webpki nur, wenn per ClientBuilder::add_crl() welche hinzugefügt wurden. Der PEP fügt keine CRLs hinzu und konfiguriert keine Revocation-Prüfung (kein Vorkommen von add_crl, CertificateRevocationList, with_crls oder RevocationOptions im Quellcode), sodass der verwundbare CRL-Parsing-Pfad nicht ausgeführt wird. Der einzige reqwest-Client (src/lib.rs) setzt nur use_rustls_tls() und danger_accept_invalid_certs().",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-18T08:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "GHSA-pwjx-qhcg-rvj4"
+      },
+      "products": [
+        {
+          "@id": "pkg:cargo/rustls-webpki"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle ist nur erreichbar, wenn CRL-Revocation-Checking aktiviert ist. Sie betrifft die Matching-Logik beim Abgleich der distributionPoint-Einträge eines Zertifikats gegen den IssuingDistributionPoint einer CRL. Im PEP wird rustls-webpki nur transitiv über rustls (reqwest mit Feature rustls-tls) als TLS-Client genutzt. reqwest übergibt CRLs an webpki nur, wenn per ClientBuilder::add_crl() welche hinzugefügt wurden. Der PEP fügt keine CRLs hinzu und konfiguriert keine Revocation-Prüfung (kein Vorkommen von add_crl, CertificateRevocationList, with_crls oder RevocationOptions im Quellcode), sodass der verwundbare CRL-Pfad nicht ausgeführt wird. Der einzige reqwest-Client (src/lib.rs) setzt nur use_rustls_tls() und danger_accept_invalid_certs().",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-18T08:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-53612"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/bsdutils"
+        },
+        {
+          "@id": "pkg:deb/debian/libblkid1"
+        },
+        {
+          "@id": "pkg:deb/debian/libmount1"
+        },
+        {
+          "@id": "pkg:deb/debian/libsmartcols1"
+        },
+        {
+          "@id": "pkg:deb/debian/login"
+        },
+        {
+          "@id": "pkg:deb/debian/mount"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Diese Schwachstelle betrifft nur das Tool mount. Weiterhin gibt es keinen Eintrag in /etc/fstab. Daher kann der Angreifer die Schwachstelle nicht ausnutzen (s. https://github.com/util-linux/util-linux/security/advisories/GHSA-g8wm-75wr-g2vh). Ein Angreifer bräuchte zusätzlich Zugriff auf eine Shell/Terminal.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-30T08:24:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-53613"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/bsdutils"
+        },
+        {
+          "@id": "pkg:deb/debian/libblkid1"
+        },
+        {
+          "@id": "pkg:deb/debian/libmount1"
+        },
+        {
+          "@id": "pkg:deb/debian/libsmartcols1"
+        },
+        {
+          "@id": "pkg:deb/debian/login"
+        },
+        {
+          "@id": "pkg:deb/debian/mount"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Diese Schwachstelle betrifft nur das Tool mount. Weiterhin gibt es keinen Eintrag in /etc/fstab. Daher kann der Angreifer die Schwachstelle nicht ausnutzen (s. https://github.com/util-linux/util-linux/security/advisories/GHSA-8gj5-72r3-428g). Ein Angreifer bräuchte zusätzlich Zugriff auf eine Shell/Terminal.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-30T08:24:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-53614"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/bsdutils"
+        },
+        {
+          "@id": "pkg:deb/debian/libblkid1"
+        },
+        {
+          "@id": "pkg:deb/debian/libmount1"
+        },
+        {
+          "@id": "pkg:deb/debian/libsmartcols1"
+        },
+        {
+          "@id": "pkg:deb/debian/login"
+        },
+        {
+          "@id": "pkg:deb/debian/mount"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Diese Schwachstelle betrifft nur das Tool mount. Weiterhin gibt es keinen Eintrag in /etc/fstab. Daher kann der Angreifer die Schwachstelle nicht ausnutzen (s. https://github.com/util-linux/util-linux/security/advisories/GHSA-67r7-8m5w-22wx). Ein Angreifer bräuchte zusätzlich Zugriff auf eine Shell/Terminal.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-30T08:24:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-53615"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/bsdutils"
+        },
+        {
+          "@id": "pkg:deb/debian/libblkid1"
+        },
+        {
+          "@id": "pkg:deb/debian/libmount1"
+        },
+        {
+          "@id": "pkg:deb/debian/libsmartcols1"
+        },
+        {
+          "@id": "pkg:deb/debian/login"
+        },
+        {
+          "@id": "pkg:deb/debian/mount"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Diese Schwachstelle betrifft nur die Bibliothek libblkid1. Keine die Bibliothek auslösenden Tools sind im Image installiert, da util-linux via 'apt purge' aus dem Image entfernt wurde. Die Bibliothek wird zukünftig entfernt werden.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-30T08:24:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-13595"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/bsdutils"
+        },
+        {
+          "@id": "pkg:deb/debian/libblkid1"
+        },
+        {
+          "@id": "pkg:deb/debian/libmount1"
+        },
+        {
+          "@id": "pkg:deb/debian/login"
+        },
+        {
+          "@id": "pkg:deb/debian/libsmartcols1"
+        },
+        {
+          "@id": "pkg:deb/debian/mount"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Diese Schwachstelle betrifft nur die Bibliothek libblkid1. Keine die Bibliothek auslösenden Tools sind im Image installiert, da util-linux via 'apt purge' aus dem Image entfernt wurde. Die Bibliothek wird zukünftig entfernt werden.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-30T08:24:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-41991"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/gzip"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Betroffen sind nur die Fallback-Zweige in den Shell-Skripten gzexe und zdiff, die ausschließlich bei fehlendem mktemp einen vorhersehbaren Dateinamen verwenden. /usr/bin/mktemp ist im Image vorhanden, daher wird immer 'mktemp ... XXXXXXXXX' genutzt und der verwundbare $$-Pfad nie erreicht (verifiziert an usr/bin/gzexe Z.127-130 und usr/bin/zdiff Z.159-164, cgit.git.savannah.gnu.org/cgit/gzip.git/commit/?id=4e6f8b24ab823146ab8776f0b7fe486ab34d4269). Zudem werden gzexe/zdiff von PEP zur Laufzeit nicht verwendet.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-30T08:24:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-41992"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/gzip"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Buffer-Over-read im LZH-Decompressor des gzip-Binaries (unlzh.c, read_c_len). Auslösbar nur durch 'gzip -d' auf eine präparierte .Z (LZW)- gefolgt von einer .lzh (LZH)-Datei im selben Aufruf (cgit.git.savannah.gnu.org/cgit/gzip.git/commit/?id=63dbf6b3b9e6e781df1a6a64e609b10e23969681). Der verwundbare LZW/LZH-Code existiert ausschließlich im gzip-CLI-Binary. nginx ruft das gzip-CLI nicht auf. Das gzip-Modul (ngx_http_gzip_module) komprimiert ausschließlich und dekomprimiert nicht. Das dekomprimierende ngx_http_gunzip_filter_module ist zwar einkompiliert, aber per Konfiguration nicht aktiviert (kein 'gunzip on;'). Selbst bei Aktivierung liefe De-/Kompression in-process über libz/zlib, das ausschließlich DEFLATE/gzip implementiert und keinen LZW- oder LZH-Decoder enthält (https://zlib.net/, verifiziert: nm -D libz.so.1 exportiert nur inflate*/deflate*, keine unlzh/lzw-Symbole). Die gzip-Wrapper-Skripte rufen zwar gzip auf, werden aber im Container nicht aufgerufen (z.B. zcat, zdiff). savelog nutzt gzip nur zum Komprimieren. Ein Auslösen erfordert manuelles lokales Ausführen von gzip/gunzip/zcat auf einer präparierten .Z-gefolgt-von-.lzh-Kombination in einem Aufruf. Kein Laufzeit- oder Remote-Pfad speist solchen Input ein.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-30T08:24:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-54369"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libacl1"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "libacl ist im Base-Image vorhanden und wird nur von OS-Utilities (cp/mv/install/tar/sed) importiert, die im PEP-Betrieb nicht ausgeführt werden. Keines der acl-importierenden Binaries ist setuid. nginx und libngx_pep.so nutzen libacl nicht. Ausnutzung erfordert einen privilegierten Aufruf auf angreiferkontrollierten Pfaden — im PEP-Laufzeitkontext nicht gegeben.",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-06-30T08:24:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-54370"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libacl1"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "libacl ist im Base-Image vorhanden und wird nur von OS-Utilities (cp/mv/install/tar/sed) importiert, die im PEP-Betrieb nicht ausgeführt werden. Keines der acl-importierenden Binaries ist setuid. nginx und libngx_pep.so nutzen libacl nicht. Ausnutzung erfordert einen privilegierten Aufruf auf angreiferkontrollierten Pfaden — im PEP-Laufzeitkontext nicht gegeben. Die CLI-Tools getfacl/setfacl/chacl sind im Image nicht enthalten.",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-06-30T08:24:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-54371"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libattr1"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft die CLI-Tools getfattr und setfattr (aus dem attr-Paket). Diese Tools sind nicht im Image enthalten (verifiziert mit 'find / -name getfattr' und 'find / -name setfattr'). Im Image ist nur die Bibliothek libattr1 vorhanden.",
+      "justification": "component_not_present",
+      "timestamp": "2026-06-30T08:24:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-33630"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libcares2"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft die Bibliothek libcares2. Im Image hängt einzig das Modul ngx_otel_module.so (nginx-module-otel) von libcares2 ab; keine weitere ELF-Datei linkt gegen die Bibliothek. c-ares wird für DNS-Auflösung von gRPC-Endpoint-Namen verwendet. Die Schwachstelle ist damit nicht ausnutzbar, da ein Angreifer nicht den aufzulösenden Namen beeinflussen (nginx.conf Eintrag `otel_exporter.endpoint`).",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-07-10T09:38:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-69184"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libcares2"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft die Bibliothek libcares2. Im Image hängt einzig das Modul ngx_otel_module.so (nginx-module-otel) von libcares2 ab; keine weitere ELF-Datei linkt gegen die Bibliothek. c-ares wird für DNS-Auflösung von gRPC-Endpoint-Namen verwendet. Die Schwachstelle ist damit nicht ausnutzbar, da ein Angreifer nicht den aufzulösenden Namen beeinflussen (nginx.conf Eintrag `otel_exporter.endpoint`).",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-08-19T15:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-69184",
+        "aliases": [
+          "TEMP-0000000-191FEB",
+          "GHSA-pjmc-gx33-gc76"
+        ]
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libcares2"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft die Bibliothek libcares2. Im Image hängt einzig das Modul ngx_otel_module.so (nginx-module-otel) von libcares2 ab; keine weitere ELF-Datei linkt gegen die Bibliothek. c-ares wird für DNS-Auflösung von gRPC-Endpoint-Namen verwendet. Die Schwachstelle ist damit nicht ausnutzbar, da ein Angreifer nicht den aufzulösenden Namen beeinflussen (nginx.conf Eintrag `otel_exporter.endpoint`).",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-07-10T09:38:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-69186",
+        "alias": [
+          "GHSA-jv8r-gqr9-68wj",
+          "TEMP-0000000-A8E7DE"
+        ]
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libcares2"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft die Bibliothek libcares2. Im Image hängt einzig das Modul ngx_otel_module.so (nginx-module-otel) von libcares2 ab; keine weitere ELF-Datei linkt gegen die Bibliothek. c-ares wird für DNS-Auflösung von gRPC-Endpoint-Namen verwendet. Die Schwachstelle ist damit nicht ausnutzbar, da ein Angreifer nicht den aufzulösenden Namen beeinflussen (nginx.conf Eintrag `otel_exporter.endpoint`).",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-07-10T09:38:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-50812"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libsqlite3-0"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die betroffene Bibliothek wird nicht verwendet und in der nächsten Version des Images entfernt. Der betroffene Code kann nicht aufgerufen werden.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-07-24T11:22:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-50813"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libsqlite3-0"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die betroffene Bibliothek wird nicht verwendet und in der nächsten Version des Images entfernt. Der betroffene Code kann nicht aufgerufen werden.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-07-24T11:22:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-53910"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/diffutils"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Integer-Overflow im diff3-Werkzeug der GNU diffutils, der zu einem Heap-Buffer-Overflow führen kann. Ein Angriff setzt voraus, dass diff3 mit angreiferkontrolliertem Input aufgerufen wird (typischerweise über --diff-program mit einem manipulierten Skript). Kein Skript im Container ruft das Tool diff3 auf (überprüft mit grep). Daher liegt die Schwachstelle nicht im Ausführungspfad.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-02-13T12:54:56Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-14456"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libssl3t64"
+        },
+        {
+          "@id": "pkg:deb/debian/openssl"
+        },
+        {
+          "@id": "pkg:deb/debian/openssl-provider-legacy"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die ausgelieferten nginx images bieten keine QUIC listener an.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-08-19T15:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-18477"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/tar"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "TOCTOU-Race-Condition im inkrementellen Backup-/Restore-Pfad von GNU tar, konkret in der Dumpdir-'X'-/Rename-Behandlung. Beim Restore mit --listed-incremental (-g/-G) können dadurch Dateien und Verzeichnisse außerhalb des Extraktionsverzeichnisses erzeugt, umbenannt oder überschrieben werden. Ein Angriff setzt einen inkrementellen tar-Lauf voraus, dazu Schreibzugriff des Angreifers auf gesicherte Inhalte sowie lokalen Zugriff auf das Restore-System, um das Race-Fenster zu treffen. Das Paket ist als Essential-Paket im Image enthalten. Es existiert jedoch kein verwundbarer tar-Aufruf: keine Aufrufstelle im Image verwendet --listed-incremental, -g oder -G, und keine wird im Betrieb des PEP ausgeführt. Gescannt wurde über alle regulären Dateien des Rootfs (find / -xdev -type f | xargs grep -alE) nach 'tar' in Kommandoposition sowie nach den Optionsstrings --listed-incremental und -g/-G, jeweils in Text- und in Binärdateien (grep -a); die dabei gefundenen Aufrufstellen wurden einzeln auf ihre Argumente geprüft. Ergänzend wurde geprüft, dass kein Cron-/Anacron-Daemon und kein systemd im Image vorhanden ist und dass keine .snar-Snapshot-Datei existiert.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-08-04T13:05:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-18508"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/tar"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Fehlerhafte Auflösung von Hardlink-Zielen bei der Extraktion mit der Option --one-top-level: Die Hardlink-Ziele werden nicht auf das angegebene Top-Level-Verzeichnis beschränkt, sondern relativ zum Arbeitsverzeichnis der Extraktion aufgelöst. Ein Angriff setzt kumulativ voraus, dass ein angreiferkontrolliertes Archiv genau mit --one-top-level extrahiert wird und im Arbeitsverzeichnis ein passender Symlink existiert. Das Paket ist als Essential-Paket im Image enthalten. Es existiert jedoch kein verwundbarer tar-Aufruf: keine Aufrufstelle im Image verwendet --one-top-level, keine extrahiert ein angreiferkontrolliertes Archiv, und keine wird im Betrieb des PEP ausgeführt. Gescannt wurde über alle regulären Dateien des Rootfs (find / -xdev -type f | xargs grep -alE) nach 'tar' in Kommandoposition sowie nach dem Optionsstring --one-top-level, jeweils in Text- und in Binärdateien (grep -a); die dabei gefundenen Aufrufstellen wurden einzeln auf ihre Argumente geprüft. Ergänzend wurde geprüft, dass kein Cron-/Anacron-Daemon und kein systemd im Image vorhanden ist.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-08-04T13:05:00Z"
+    }
+  ],
+  "timestamp": "2026-02-13T12:54:56Z",
+  "last_updated": "2026-08-04T13:05:00Z"
+}

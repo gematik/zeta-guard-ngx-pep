@@ -25,7 +25,7 @@
 #![cfg_attr(test, allow(clippy::needless_lifetimes))]
 
 use ambassador::Delegate;
-use anyhow::Ok;
+use anyhow::{Ok, Result};
 use rstest::fixture;
 
 use crate::conf::{LocationConfig, MainConfig};
@@ -42,11 +42,11 @@ pub struct RequestMock {
 }
 
 impl ConfigOps for RequestMock {
-    fn main_config<'a>(&'a self) -> anyhow::Result<&'a MainConfig> {
+    fn main_config<'a>(&'a self) -> Result<&'a MainConfig> {
         Ok(&self.mcfg)
     }
 
-    fn location_config<'a>(&'a self) -> anyhow::Result<&'a LocationConfig> {
+    fn location_config<'a>(&'a self) -> Result<&'a LocationConfig> {
         Ok(&self.lcfg)
     }
 }
@@ -81,8 +81,22 @@ pub async fn request_mock() -> RequestMock {
         .expect_ensure_header_out()
         .returning(|_name, _value| Ok(()));
     mock.request
+        .expect_proxy_strips_present()
+        .returning(|| Some(true));
+    mock.request
         .expect_get_client_ip()
         .returning(|| Some("127.0.0.1"));
+    // pep_handler reads these up-front for its "effective config" debug event,
+    // before any auth check — so every handler path needs them mocked.
+    mock.request.expect_method().returning(|| "GET".to_string());
+    mock.request
+        .expect_eigenurl_normalized()
+        .returning(|| Ok("https://example.invalid/".parse().unwrap()));
+    // $zeta_client_address is set right after client_ip resolution (before the
+    // auth check), so even early-return paths reach this.
+    mock.request
+        .expect_set_zeta_upstream_header()
+        .returning(|_slot, _value| ());
 
     mock
 }

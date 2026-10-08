@@ -4,13 +4,19 @@ experimental = ["setup-scripts"]
 # This is required for integration tests, which start nginx in a configuration for
 # tests, but have no rust-code-level relationship to the lib otherwise, and would not
 # trigger needed rebuilds.
+#
+# The module build uses a dedicated target dir (target/module-test, via the
+# `cargo module-test` alias): nextest's own workspace build unifies dev-dep
+# features (client, stubs) onto the lib's build unit, while the loaded .so must
+# be built with `its` only — in a shared target dir those two feature sets
+# evict each other's fingerprints, rerunning build.rs (make install, bindgen,
+# mdbook) and relinking the cdylib twice per test run. Separate dirs let each
+# feature set stay fresh. The test-*.conf instances load the .so through the
+# prefix/modules/libngx_pep.test.* symlinks.
+#
+# Coverage/instrumentation staleness handling lives in the script.
 [scripts.setup.build-nginx-module]
-command = [
-  "/usr/bin/env",
-  "bash",
-  "-c",
-  "printf \"Building nginx module and ossl_hsm...\\n\\n\"; LLVM_PROFILE_FILE=/dev/null cargo build --features its --lib; LLVM_PROFILE_FILE=/dev/null cargo build -p ossl_hsm",
-]
+command = ["/usr/bin/env", "bash", "misc/nextest-setup"]
 capture-stdout = false
 capture-stderr = false
 

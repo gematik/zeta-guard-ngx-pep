@@ -46,7 +46,7 @@ async fn health_check() {
 
 #[tokio::test]
 async fn grpc_standard_health_check() {
-    let channel = common::start_server("127.1.33.7:0").await;
+    let channel = common::start_server("127.0.0.1:0").await;
     let mut health = HealthClient::new(channel.clone());
 
     // Check overall server health (empty service name)

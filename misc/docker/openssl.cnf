@@ -8,6 +8,7 @@ ossl_hsm = ossl_hsm_sect
 default = default_sect
 
 [ossl_hsm_sect]
+# debian: relative paths resolve in /usr/lib/x86_64-linux-gnu/ossl-modules
 module = libossl_hsm.so
 activate = 1
 

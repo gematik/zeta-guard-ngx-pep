@@ -77,5 +77,5 @@ pub async fn start_server(addr: &str) -> Channel {
 
 /// Convenience: start server on random port and return an HsmProxyService client.
 pub async fn hsm_client() -> HsmProxyServiceClient<Channel> {
-    HsmProxyServiceClient::new(start_server("127.1.33.7:0").await)
+    HsmProxyServiceClient::new(start_server("127.0.0.1:0").await)
 }

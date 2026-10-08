@@ -3,7 +3,6 @@ name = "ossl_hsm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [lib]
 crate-type = ["cdylib"]

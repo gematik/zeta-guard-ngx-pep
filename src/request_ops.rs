@@ -22,8 +22,9 @@
  * #L%
  */
 
-use crate::Module;
 use crate::conf::{LocationConfig, MainConfig};
+use crate::proxy_conf::pep_headers_applied;
+use crate::{Module, ModuleCtx};
 use anyhow::{Result, anyhow, bail};
 use http::Uri;
 use ngx::http::{HttpModuleLocationConf, HttpModuleMainConf, Request};
@@ -42,11 +43,17 @@ pub trait RequestOps {
     fn get_authorization_token(&self) -> anyhow::Result<String>;
     fn get_header_in<'a, 'b>(&'a self, name: &'b str) -> Option<&'a str>;
     fn get_header_out<'a, 'b>(&'a self, name: &'b str) -> Option<&'a str>;
-    // additional *request* headers, e.g. passed to upstream
-    fn ensure_header_in(&mut self, name: &str, value: &str) -> anyhow::Result<()>;
+    // Set the per-request value of a `$zeta_*` nginx variable (`slot` is a `ZETA_VAR_*`). Most
+    // are forwarded as the corresponding `ZETA-*` header by `proxy_set_header` in
+    // proxy_headers.conf (which also drops any client-supplied copy); the A_28783 SIEM vars
+    // (CLIENT_ID / CLIENT_ADDRESS) are instead read by `otel_span_attr`.
+    fn set_zeta_upstream_header(&self, slot: usize, value: &str);
     // additional *response* headers, will be added to response headers from upstream
     fn ensure_header_out(&mut self, name: &str, value: &str) -> anyhow::Result<()>;
     fn acceptable(&self, content_type: &str) -> anyhow::Result<bool>;
+    // Whether the matched `proxy_pass` location included `proxy_headers.conf` (which strips
+    // client credentials before forwarding). `None` if this isn't a proxy location.
+    fn proxy_strips_present(&self) -> Option<bool>;
 }
 
 fn split_authority(authority: &str) -> Result<(&str, Option<u16>)> {
@@ -250,6 +257,22 @@ impl RequestOps for ngx::http::Request {
             .1
             .or_else(|| try_parse_x_forwarded_for(self.get_header_in("x-forwarded-for")))
             .or_else(|| self.get_header_in("x-real-ip").map(|v| v.trim()))
+            // No proxy in front of us (local dev, or PEP as the edge): fall back
+            // to the actual TCP peer, which nginx records as the connection's
+            // addr_text ($remote_addr). Used only when no forwarding header is
+            // present, so it never overrides a trusted proxy's claim.
+            .or_else(|| {
+                let c = self.connection();
+                if c.is_null() {
+                    return None;
+                }
+                let addr = unsafe { (*c).addr_text };
+                if addr.len == 0 {
+                    return None;
+                }
+                let bytes = unsafe { std::slice::from_raw_parts(addr.data as *const u8, addr.len) };
+                std::str::from_utf8(bytes).ok()
+            })
     }
 
     fn get_header_in(&self, name: &str) -> Option<&str> {
@@ -279,14 +302,8 @@ impl RequestOps for ngx::http::Request {
             .map(String::from)
     }
 
-    fn ensure_header_in(&mut self, name: &str, value: &str) -> Result<()> {
-        if let Some(existing) = self.get_header_in(name)
-            && existing != value
-        {
-            anyhow::bail!("in header {name}: conflicting value declarations: {value}, {existing}")
-        }
-        self.add_header_in(name, value)
-            .ok_or(anyhow!("null table pointer"))
+    fn set_zeta_upstream_header(&self, slot: usize, value: &str) {
+        ModuleCtx::set_zeta_var(self, slot, value);
     }
 
     fn ensure_header_out(&mut self, name: &str, value: &str) -> Result<()> {
@@ -325,6 +342,11 @@ impl RequestOps for ngx::http::Request {
         }
 
         Ok(false)
+    }
+
+    fn proxy_strips_present(&self) -> Option<bool> {
+        // SAFETY: `self` is a live request, so its raw `ngx_http_request_t` is valid.
+        unsafe { pep_headers_applied(self.as_ref()) }
     }
 }
 

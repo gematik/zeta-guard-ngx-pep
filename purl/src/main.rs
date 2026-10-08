@@ -22,24 +22,21 @@
  * #L%
  */
 
+use std::collections::HashMap;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use argp::{FromArgs, parse_args_or_exit};
-use base64ct::{Base64UrlUnpadded, Encoding};
-use futures::channel::mpsc::channel;
-use futures::{SinkExt, StreamExt};
 use http::Method;
-use ngx_pep::client::asl::{asl_handshake, asl_request, encode_http_request};
-use ngx_pep::client::{
-    ClientRegistration, create_dpop_proof, create_popp_token, create_smcb_token,
-    exchange_access_token, get_nonce, get_with_dpop, insecure_access_token_sub, register_client,
-};
-use reqwest::{Client, ClientBuilder, Url};
-use sha2::{Digest, Sha256};
+use ngx_pep::client::asl::{encode_valid_http_request, valid_asl_request};
+use ngx_pep::client::register_client;
+use ngx_pep::client::token_dispenser::{PoPPKey, SmcBKey, TokenDispenser};
+use reqwest::Url;
+use reqwest::cookie::Jar;
+use tokio::sync::mpsc::{Sender, channel};
 use tokio::time::Instant;
 
 #[allow(dead_code, clippy::all)]
@@ -78,6 +75,10 @@ struct Args {
     #[argp(option, short = 'A', default = "\"alias\".to_string()")]
     popp_p12_alias: String,
 
+    /// authserver host, e.g. zeta-cd.westeurope.cloudapp.azure.com — env: PURL_HOST
+    #[argp(option, short = 'h')]
+    host: Option<String>,
+
     /// authserver base url, e.g. https://zeta-dev…/auth/ — env: PURL_AUTH
     #[argp(option, short = 'a')]
     auth: Option<String>,
@@ -95,7 +96,7 @@ struct Args {
 }
 
 impl Args {
-    fn p12_path(&self) -> PathBuf {
+    fn p12(&self) -> PathBuf {
         Path::new(
             &std::env::var("PURL_P12")
                 .unwrap_or_else(|_| self.p12.clone().expect("require -p or PURL_P12")),
@@ -128,6 +129,11 @@ impl Args {
         std::env::var("PURL_POPP_P12_ALIAS").unwrap_or(self.popp_p12_alias.clone())
     }
 
+    fn host(&self) -> String {
+        std::env::var("PURL_HOST")
+            .unwrap_or_else(|_| self.host.clone().expect("require -h or PURL_HOST"))
+    }
+
     fn auth(&self) -> String {
         std::env::var("PURL_AUTH")
             .unwrap_or_else(|_| self.auth.clone().expect("require -a or PURL_AUTH"))
@@ -156,7 +162,7 @@ impl Args {
 
     fn token_url(&self) -> Result<Url> {
         Ok(self.auth_url()?.join(&format!(
-            "realms/{}/protocol/openid-connect/token/",
+            "realms/{}/protocol/openid-connect/token",
             self.realm()
         ))?)
     }
@@ -172,13 +178,17 @@ impl Args {
 #[derive(FromArgs, PartialEq, Debug)]
 #[argp(subcommand, name = "curl")]
 struct Curl {
-    /// request method, needed for DPoP proof, pass to curl as --request also
+    /// request method, needed for DPoP proof, passed to curl as --request also
     #[argp(option, short = 'X', default = "\"GET\".to_string()")]
     request: String,
 
     /// target, e.g. https://zeta-dev…/proxy/hellozeta
     #[argp(positional)]
     target: String,
+
+    /// set PoPP header
+    #[argp(switch, short = 'p')]
+    popp: bool,
 
     /// …passed on to curl
     #[argp(positional, greedy)]
@@ -197,9 +207,13 @@ struct Asl {
     #[argp(option, short = 'T', default = "16")]
     n_tasks: u16,
 
-    /// number of inner requests per cycle
-    #[argp(option, short = 'N', default = "10")]
-    n_messages: u16,
+    /// number of repetitions, 0 = infinite
+    #[argp(option, short = 'n', default = "0")]
+    n_repeats: usize,
+
+    /// set PoPP header
+    #[argp(switch, short = 'p')]
+    popp: bool,
 }
 
 impl Asl {
@@ -214,157 +228,128 @@ impl Asl {
     }
 }
 
-async fn benchmark<F, Fut>(f: F, n_tasks: usize)
+async fn benchmark<F, Fut>(f: F, n_tasks: usize, n_repeats: usize)
 where
-    F: FnOnce() -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<Vec<f32>>> + Send + 'static,
+    F: Fn(Sender<Option<f32>>) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
 {
     let progress = indicatif::ProgressBar::new_spinner();
-    let (tx, mut rx) = channel(n_tasks);
+    let (tx, mut rx) = channel::<Option<f32>>(n_tasks);
 
-    let mut tasks = vec![];
-
-    for _ in 0..n_tasks {
-        let f = f.clone();
-        let mut tx = tx.clone();
-        tasks.push(tokio::spawn(async move {
-            loop {
-                let f = f.clone();
-                match f().await {
-                    Ok(times) => tx.send(Some(times)).await.expect("send"),
-                    Err(_e) => {
-                        // println!("{_e:?}");
-                        tx.send(None).await.expect("send")
-                    }
-                };
-            }
-        }));
-    }
+    let tasks: Vec<_> = (0..n_tasks).map(|_| tokio::spawn(f(tx.clone()))).collect();
+    drop(tx); // rx.recv() returns None once all workers hang up
 
     let start = Instant::now();
     let mut times = vec![];
     let mut e = 0;
     let mut t = 0;
 
-    while let Some(ms) = rx.next().await {
+    while let Some(ms) = rx.recv().await {
         t += 1;
+        if n_repeats > 0 && t > n_repeats {
+            break;
+        }
         match ms {
             Some(ms) => {
-                times.extend_from_slice(&ms);
+                times.push(ms);
             }
             None => {
                 e += 1;
             }
         };
         let sum: f32 = times.iter().sum();
-        let mean_ms = sum * 100f32 / times.len() as f32;
+        let mean_ms = sum * 1000f32 / times.len() as f32;
         let elapsed = Instant::now().duration_since(start).as_secs_f32();
         let rps = times.len() as f32 / elapsed;
 
-        let l = if times.len() < 1_001 {
-            times.len()
-        } else {
-            times.len() - 1000
-        };
-
-        let times_l: Vec<_> = times.iter().skip(l).copied().collect();
-        let sum_l: f32 = times_l.iter().sum();
-        let mean_ms_l = sum_l * 100f32 / times_l.len() as f32;
+        let times_recent: Vec<_> = times
+            .iter()
+            .skip(times.len().saturating_sub(1000))
+            .copied()
+            .collect();
+        let sum_recent: f32 = times_recent.iter().sum();
+        let mean_ms_recent = sum_recent * 1000f32 / times_recent.len() as f32;
+        let min_ms_recent = times.iter().fold(f32::INFINITY, |a, &b| a.min(b)) * 1000f32;
+        let max_ms_recent = times.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)) * 1000f32;
         progress.set_message(format!(
-            "{mean_ms:.4}ms {mean_ms_l:.4}ms {rps:.2} {e:6}/{t:6}"
+            "{mean_ms:.4}ms (last 1k: {mean_ms_recent:.4}ms [{min_ms_recent:.4}ms, {max_ms_recent:.4}ms] ) {rps:.2} {e:6}/{t:6}"
         ));
+    }
+    progress.finish();
+    for t in &tasks {
+        t.abort();
     }
 }
 
-async fn asl(
-    cmd: &Asl,
-    registration: &ClientRegistration,
-    client: Client,
-    access_token: &str,
-) -> Result<()> {
-    let access_token = access_token.to_string();
-    let n_tasks = cmd.n_tasks;
-    let n_messages = cmd.n_messages;
-    let cmd = cmd.clone();
-    let registration = registration.clone();
-
+async fn asl(cmd: &Asl, token_dispenser: TokenDispenser) -> Result<()> {
     benchmark(
-        move || async move {
-            let mut times = vec![];
-            let mut start = Instant::now();
-            let (cid, mut state) = asl_handshake(
-                client.clone(),
-                &registration,
-                cmd.target_url()?,
-                &access_token,
-            )
-            .await?;
+        move |tx| {
+            let token_dispenser = token_dispenser.clone();
+            let cmd = cmd.clone();
+            let mut session_dispenser = token_dispenser.new_session_dispenser();
+            async move {
+                loop {
+                    let res: Result<()> = async {
+                        let tokens = token_dispenser.tokens().await?;
+                        let session = session_dispenser.asl_session(cmd.target_url()?).await?;
 
-            times.push(Instant::now().duration_since(start).as_secs_f32());
+                        let mut extra_headers = HashMap::new();
+                        extra_headers.insert("PoPP", tokens.popp.clone());
 
-            let inner = encode_http_request(
-                &registration,
-                Method::GET,
-                cmd.target_url()?
-                    .join("/pep/achelos_testfachdienst/hellozeta")?
-                    .as_str()
-                    .parse()?,
-                &access_token,
-                None,
-            )?;
+                        let inner = encode_valid_http_request(
+                            &tokens,
+                            Method::GET,
+                            cmd.target_url()?
+                                .join("/pep/achelos_testfachdienst/hellozeta")?
+                                .as_str()
+                                .parse()?,
+                            Some(extra_headers),
+                        )?;
 
-            for req_ctr in 0..n_messages {
-                start = Instant::now();
+                        let start = Instant::now();
 
-                asl_request(
-                    &registration,
-                    client.clone(),
-                    &access_token,
-                    cmd.target_url()?,
-                    &cid,
-                    &mut state,
-                    req_ctr as u64,
-                    &inner,
-                    None,
-                )
-                .await?;
-
-                times.push(Instant::now().duration_since(start).as_secs_f32());
+                        valid_asl_request(&tokens, session, cmd.target_url()?, &inner, None)
+                            .await?;
+                        let _ = tx
+                            .send(Some(Instant::now().duration_since(start).as_secs_f32()))
+                            .await;
+                        Ok(())
+                    }
+                    .await;
+                    if res.is_err() {
+                        println!("{res:?}");
+                        let _ = tx.send(None).await;
+                    }
+                }
             }
-
-            Ok(times)
         },
-        n_tasks.into(),
+        cmd.n_tasks.into(),
+        cmd.n_repeats,
     )
     .await;
+
     Ok(())
 }
 
-async fn curl(
-    args: &Args,
-    cmd: &Curl,
-    registration: &ClientRegistration,
-    access_token: &str,
-) -> Result<()> {
-    let dpop = create_dpop_proof(
-        registration,
-        &cmd.request,
-        &cmd.target,
-        Some(&Base64UrlUnpadded::encode_string(&Sha256::digest(
-            access_token,
-        ))),
-        None,
-    )?;
+async fn curl(args: &Args, cmd: &Curl, token_dispenser: TokenDispenser) -> Result<()> {
+    let tokens = token_dispenser.tokens().await?;
     let mut curl_args = vec![
         "--header".to_string(),
-        format!("authorization: DPoP {access_token}"),
+        format!("authorization: DPoP {}", &tokens.access_token),
         "--header".to_string(),
-        format!("dpop: {dpop}"),
+        format!(
+            "dpop: {}",
+            &tokens.valid_dpop_proof(&cmd.request, &cmd.target)?
+        ),
         "--request".to_string(),
         cmd.request.clone(),
     ];
     if args.insecure {
         curl_args.push("--insecure".to_string());
+    }
+    if cmd.popp {
+        curl_args.push("--header".to_string());
+        curl_args.push(format!("PoPP: {}", tokens.popp));
     }
     curl_args.append(&mut cmd.rest.clone());
     curl_args.push(cmd.target.clone());
@@ -381,7 +366,7 @@ struct Bench {
     request: String,
 
     /// pass PoPP
-    #[argp(switch)]
+    #[argp(switch, short = 'p')]
     popp: bool,
 
     /// PoPP: override actorId claim
@@ -396,6 +381,10 @@ struct Bench {
     #[argp(option, short = 'T', default = "16")]
     n_tasks: u16,
 
+    /// number of repetitions, 0 = infinite
+    #[argp(option, short = 'n', default = "0")]
+    n_repeats: usize,
+
     /// target, e.g. https://zeta-dev…/proxy/hellozeta
     #[argp(positional)]
     target: String,
@@ -407,119 +396,104 @@ impl Bench {
     }
 }
 
-async fn bench(
-    cmd: &Bench,
-    registration: &ClientRegistration,
-    client: Client,
-    access_token: &str,
-    p12_path: &Path,
-    p12_pass: &str,
-    p12_alias: &str,
-) -> Result<()> {
-    let access_token = access_token.to_string();
-    let registration = registration.clone();
-    let popp = match cmd.popp {
-        true => {
-            let start = SystemTime::now();
-            let now = start
-                .duration_since(UNIX_EPOCH)
-                .expect("Time went backwards")
-                .as_secs();
-            let actor_id = cmd
-                .popp_actor_id_override
-                .clone()
-                .unwrap_or_else(|| insecure_access_token_sub(&access_token).unwrap());
-            Some(create_popp_token(&actor_id, p12_path, p12_pass, p12_alias, now, now).await?)
-        }
-        false => None,
-    };
-    let client = client.clone();
-    let target = cmd.target_url()?.clone();
+async fn bench(cmd: &Bench, token_dispenser: TokenDispenser) -> Result<()> {
     let expect_status = cmd.expect_status;
+    let do_popp = cmd.popp;
+    let target = cmd.target_url()?.clone();
+
     benchmark(
-        move || async move {
-            let mut times = vec![];
-            let start = Instant::now();
-            let mut request = get_with_dpop(&registration, client, &access_token, target)?;
-            if let Some(popp) = popp {
-                request = request.header("popp", popp);
-            };
-            match request.send().await {
-                Ok(response) => {
-                    if expect_status != 0 && response.status() != expect_status {
-                        println!(
-                            "unespected status; want={expect_status}, got={}",
-                            response.status()
+        move |tx| {
+            let token_dispenser = token_dispenser.clone();
+
+            let target = target.clone();
+            async move {
+                loop {
+                    let res: Result<()> = async {
+                        let tokens = token_dispenser.tokens().await?;
+                        let mut request = tokens.valid_get(&token_dispenser.jar, target.clone())?;
+                        if do_popp {
+                            request = request.header("popp", &tokens.popp);
+                        };
+                        // set forward headers to enable testing without ingress
+                        request =
+                            request.header("x-forwarded-host", target.host().unwrap().to_string());
+                        request = request.header(
+                            "x-forwarded-port",
+                            target.port_or_known_default().unwrap().to_string(),
                         );
-                        bail!(
-                            "unespected status; want={expect_status}, got={}",
-                            response.status()
-                        );
+                        request = request.header("x-forwarded-proto", target.scheme());
+
+                        let start = Instant::now();
+
+                        match request.send().await {
+                            Ok(response) => {
+                                if expect_status != 0 && response.status() != expect_status {
+                                    bail!(
+                                        "unespected status; want={expect_status}, got={}",
+                                        response.status()
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                if expect_status != 0
+                                    && let Some(status) = e.status()
+                                    && status != expect_status
+                                {
+                                    bail!("{e:?}");
+                                }
+                            }
+                        }
+
+                        let _ = tx
+                            .send(Some(Instant::now().duration_since(start).as_secs_f32()))
+                            .await;
+                        Ok(())
                     }
-                }
-                Err(e) => {
-                    if expect_status != 0
-                        && let Some(status) = e.status()
-                        && status != expect_status
-                    {
-                        println!("{e}");
-                        bail!("{e}");
+                    .await;
+                    if res.is_err() {
+                        println!("{res:?}");
+                        let _ = tx.send(None).await;
                     }
                 }
             }
-
-            times.push(Instant::now().duration_since(start).as_secs_f32());
-
-            Ok(times)
         },
         cmd.n_tasks.into(),
+        cmd.n_repeats,
     )
     .await;
+
     Ok(())
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args: Args = parse_args_or_exit(argp::DEFAULT);
-    let client: Client = ClientBuilder::new()
-        .use_rustls_tls()
-        .danger_accept_invalid_certs(args.insecure)
-        .build()?;
-    let registration = register_client(args.client_registration_url()?, &client).await?;
 
-    let nonce = get_nonce(args.nonce_url()?, &client).await?;
-    let smcb = create_smcb_token(
-        &args.p12_path(),
-        &args.p12_pass(),
-        args.auth_url()?,
-        nonce.clone(),
-        &registration,
+    let jar = Jar::default();
+    let registration = register_client(args.client_registration_url()?, &jar).await?;
+    let smcb_key = SmcBKey::from_path(&args.p12(), &args.p12_pass()).await?;
+    let popp_key = PoPPKey::from_path(
+        &args.popp_p12(),
+        &args.popp_p12_pass(),
+        &args.popp_p12_alias(),
     )
     .await?;
 
-    let access_token = exchange_access_token(
+    let jar = Arc::new(Jar::default());
+
+    let token_dispenser = TokenDispenser::new(
+        jar,
+        registration,
+        smcb_key,
+        args.host(),
+        args.nonce_url()?,
         args.token_url()?,
-        nonce.clone(),
-        &registration,
-        &smcb,
-        &client,
-    )
-    .await?;
+        popp_key,
+    );
 
     match &args.command {
-        Subcommand::Curl(cmd) => curl(&args, cmd, &registration, &access_token).await,
-        Subcommand::Asl(cmd) => asl(cmd, &registration, client, &access_token).await,
-        Subcommand::Bench(cmd) => {
-            bench(
-                cmd,
-                &registration,
-                client,
-                &access_token,
-                &args.popp_p12(),
-                &args.popp_p12_pass(),
-                &args.popp_p12_alias(),
-            )
-            .await
-        }
+        Subcommand::Curl(cmd) => curl(&args, cmd, token_dispenser).await,
+        Subcommand::Asl(cmd) => asl(cmd, token_dispenser).await,
+        Subcommand::Bench(cmd) => bench(cmd, token_dispenser).await,
     }
 }

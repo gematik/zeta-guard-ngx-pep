@@ -22,48 +22,64 @@
  * #L%
  */
 
-use std::collections::HashSet;
-use std::ptr::addr_of_mut;
-
 use anyhow::{Context, anyhow, bail};
 use async_compat::CompatExt;
 use base64ct::{Base64UrlUnpadded, Encoding};
-use http::Uri;
+use chrono::NaiveDate;
+use http::{Method, Uri};
 use jsonwebtoken::DecodingKey;
 use jsonwebtoken::jwk::{KeyAlgorithm, ThumbprintHash};
 use jsonwebtoken::{Algorithm, TokenData};
 use jsonwebtoken::{Validation, decode};
 use jsonwebtoken::{decode_header, get_current_timestamp};
 use ngx::ffi::*;
-use ngx::ngx_log_error;
+use ngx::http::HttpModuleMainConf;
 use ngx::{
     core::Status,
     http::{HTTPStatus, HttpModuleLocationConf, Request},
 };
 use ngx_tickle::RequestSpawn;
+use reqwest::Url;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::ptr::addr_of_mut;
+use std::sync::LazyLock;
+use tracing::{Instrument, debug, error, instrument, warn};
 
-use crate::ModuleCtx;
+use crate::block_list::ShmBlockList;
+use crate::capec::zeta_capec;
 use crate::error::{ZetaError, ZetaResult};
 use crate::headers::{
-    ensure_api_version_header_out, ensure_client_data_header_in, ensure_popp_token_header_in,
-    ensure_user_info_header_in,
+    ensure_api_version_header_out, ensure_client_data_upstream_header,
+    ensure_forwarded_upstream_header, ensure_popp_token_upstream_header,
+    ensure_user_info_upstream_header,
 };
 use crate::jwk_cache::JwkCacheOps;
+use crate::otel::{request_span, traced_outbound, traced_request};
 use crate::request_ops::{ConfigOps, RequestOps, normalized_uri};
 use crate::typify::{
     AccessTokenPayload, AccessTokenPayloadAud, AccessTokenPayloadPlatform, ClientData,
     ClientDataPlatform, DPoPProofJwtPayload, ZetaUserInfo,
 };
-use crate::zeta_bail;
-use crate::{Module, zeta_anyhow};
+use crate::{CLIENT, Module, ModuleCtx, zeta_anyhow};
+use crate::{ZETA_VAR_CLIENT_ADDRESS, ZETA_VAR_CLIENT_ID, ZETA_VAR_PRODUCT_ID, ZETA_VAR_PRODUCT_VERSION,
+            ZETA_VAR_PROFESSION_OID, zeta_bail
+};
+
 use crate::{
     conf::{LocationConfig, MainConfig},
     jwk_cache::jwk_cache,
-    log_debug,
 };
 
+pub(crate) static BLOCK_LIST: LazyLock<ShmBlockList> = LazyLock::new(|| {
+    let main_conf: &mut MainConfig =
+        unsafe { Module::main_conf_mut(&*ngx_cycle).expect("main_conf") };
+    ShmBlockList::new(unsafe { main_conf.block_list_zone.as_mut().expect("as_mut") })
+        .expect("ShmBlockList")
+});
+
+#[instrument(skip(token), err)]
 async fn verify_access_token(
     main_config: &MainConfig,
     location_config: &LocationConfig,
@@ -71,13 +87,26 @@ async fn verify_access_token(
     now: u64,
     client_ip: Option<String>,
 ) -> ZetaResult<TokenData<AccessTokenPayload>> {
-    let header = decode_header(token).context("while decoding authorization token header")?;
-    let kid = header.kid.ok_or_else(|| anyhow!("no kid"))?;
-    if header.alg != Algorithm::ES256 {
+    let header = decode_header(token).map_err(|e| {
+        ZetaError::AccessToken(
+            anyhow::Error::new(e).context("while decoding authorization token header"),
+        )
+    })?;
+    let kid = header
+        .kid
+        .ok_or_else(|| ZetaError::AccessToken(anyhow!("no kid")))?;
+    if header.alg != Algorithm::ES256 && header.alg != Algorithm::ES384 {
         return Err(ZetaError::AccessToken(anyhow!(
             "unsupported token alg {:?}",
             header.alg
         )));
+    }
+
+    match header.typ.as_deref() {
+        Some("JWT" | "at+jwt") => {}
+        _ => {
+            zeta_bail!(AccessTokenInvalid, "invalid typ={:?}", header.typ)
+        }
     }
 
     let jwk = jwk_cache().get_jwk_pdp(kid, client_ip).await?;
@@ -91,7 +120,7 @@ async fn verify_access_token(
     let key = DecodingKey::from_jwk(&jwk).context("while constructing DecodingKey from jwk")?;
 
     // validate
-    let mut validation = Validation::new(Algorithm::ES256);
+    let mut validation = Validation::new(header.alg);
     // we will validate aud ourselves below
     validation.validate_aud = false;
     validation.set_issuer(&[main_config.pdp_issuer.clone().expect("issuer")]);
@@ -99,7 +128,6 @@ async fn verify_access_token(
 
     validation.leeway = location_config.leeway().as_secs();
     validation.validate_nbf = true; // if present, but don't require nbf
-    log_debug!("at: {validation:?}");
 
     // NOTE: can't provide or get the timestamp used by jsonwebtoken, but we need to validate
     // iat ourselves. Technically, if both nbf and iat are provided and the validation happens
@@ -170,6 +198,7 @@ async fn verify_access_token(
     Ok(payload)
 }
 
+#[instrument(skip(popp), err)]
 async fn verify_popp(
     location_config: &LocationConfig,
     access_token_sub: &str,
@@ -260,6 +289,7 @@ async fn verify_popp(
     Ok(token_data)
 }
 
+#[instrument(skip(ath, access_token_claims, dpop), err)]
 async fn verify_dpop(
     location_config: &LocationConfig,
     access_token_claims: &AccessTokenPayload,
@@ -285,8 +315,10 @@ async fn verify_dpop(
     }
     let jwk = header.jwk.ok_or_else(|| anyhow!("no jwk"))?;
 
-    if jwk.common.key_algorithm != Some(KeyAlgorithm::ES256) {
-        anyhow::bail!("unsupported jwk alg: {:?}", jwk.common.key_algorithm);
+    if let Some(alg) = jwk.common.key_algorithm
+        && alg != KeyAlgorithm::ES256
+    {
+        anyhow::bail!("unsupported key_algorithm: {:?}", jwk.common.key_algorithm);
     }
 
     let thumbprint = jwk.thumbprint(ThumbprintHash::SHA256);
@@ -375,41 +407,115 @@ async fn verify_dpop(
     Ok(())
 }
 
-fn verify_client_ip(
-    main_config: &MainConfig,
-    access_token_claims: &AccessTokenPayload,
+async fn send_revocation(revocation_url: &Url, access_token: &str) -> anyhow::Result<()> {
+    let client = CLIENT.get().expect("client");
+
+    let (mut request, span) =
+        traced_outbound!(client, Method::POST, revocation_url, "post_revocation");
+    request = request
+        .header("content-type", "text/plain")
+        .body(access_token.to_string());
+
+    let (status, _headers, _body) = traced_request(request, span)
+        .await
+        .context("request error")?;
+
+    if !status.is_success() {
+        bail!("Unexpected status when trying to report revocation: {status}");
+    }
+
+    Ok(())
+}
+
+#[instrument(skip(access_token))]
+async fn verify_client_ip(
+    revocation_url: Option<Url>,
+    access_token: &str,
+    token_ip: &str,
     request_ip: Option<&str>,
 ) -> ZetaResult<()> {
-    if main_config.no_travel {
-        let access_ip = &access_token_claims.ip_address;
-        let client_ip = request_ip.ok_or_else(|| {
-            ZetaError::Internal(anyhow!(
-                "client IP address unavailable; ingress must set HTTP Forwarded header"
-            ))
-        })?;
-        if client_ip != access_ip {
-            return Err(ZetaError::ImpossibleTravel(anyhow!(
-                "access token IP does not match client IP address"
-            )));
+    let client_ip = request_ip.ok_or_else(|| {
+        ZetaError::Internal(anyhow!(
+            "client IP address unavailable; ingress must set HTTP Forwarded header"
+        ))
+    })?;
+    if client_ip != token_ip {
+        crate::metrics::IMPOSSIBLE_TRAVEL_COUNT.add(1, &[]);
+        warn!("client_ip {client_ip} != token_ip {token_ip}");
+        if let Some(revocation_url) = revocation_url
+            && let Err(err) = send_revocation(&revocation_url, access_token).await
+        {
+            warn!("error trying to send revocation: {err:#?}");
         }
+
+        return Err(ZetaError::ImpossibleTravel(anyhow!(
+            "access token IP does not match client IP address"
+        )));
     }
     Ok(())
 }
 
+/// professionOID „Versicherte/-r" (gemSpec_OID) — the OIDC flow's insurant tokens. SMC-B
+/// token exchange only accepts institution OIDs (1.2.276.0.76.4.50 ff.), so the sets are
+/// disjoint.
+const PROFESSION_OID_INSURANT: &str = "1.2.276.0.76.4.49";
+
+/// Build the `ZETA-User-Info` payload the PEP forwards upstream from the validated access
+/// token claims.
+///
+/// HOTFIX ANFTI2-922 / A_27558: `birthdate` is mandatory for DiPag, but no claim carries it
+/// yet — so for insurant tokens ([`PROFESSION_OID_INSURANT`]) the value comes from the
+/// configuration (`pep_user_info_birthdate`, defaulting to [`HOTFIX_USER_INFO_BIRTHDATE`])
+/// rather than from `claims`. All other client types (SMC-B/LEI) get no `birthdate`: the
+/// schema defines the field as insurant-only and consent-dependent, so a fixed value there
+/// would fake a consent that was never given. Read it off the token instead once the
+/// authorization server emits the claim.
+fn user_info_from_claims(
+    claims: &AccessTokenPayload,
+    birthdate: NaiveDate,
+) -> anyhow::Result<ZetaUserInfo> {
+    Ok(ZetaUserInfo {
+        common_name: claims.common_name.clone().context("missing common_name")?,
+        identifier: claims.sub.clone(),
+        organization_name: claims.organization_name.clone(),
+        birthdate: (claims.profession_oid == PROFESSION_OID_INSURANT).then_some(birthdate),
+        profession_oid: claims.profession_oid.clone(),
+    })
+}
+
+#[instrument(skip(request), err)]
 async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<()> {
+    // Fail fast (and loudly) if a proxied location didn't pull in `proxy_headers.conf`: the PEP
+    // relies on its `proxy_set_header … ""` strips to keep client credentials from leaking
+    // upstream, and there is no point authorizing a request we'd then forward unsafely.
+    if request.proxy_strips_present() == Some(false) {
+        return Err(ZetaError::ProxyHeadersMissing);
+    }
+
     let now = get_current_timestamp();
 
     ensure_api_version_header_out(request)?;
+
     let main_config = request.main_config()?;
     let location_config = request.location_config()?;
+    let http_method = request.method();
+    let eigenurl: Uri = request.eigenurl_normalized()?;
 
     let client_ip = request.get_client_ip().map(String::from);
+
+    // A_28783 (client.address): expose the resolved client IP for the nginx-otel
+    // SERVER span
+    if let Some(ref ip) = client_ip {
+        request.set_zeta_upstream_header(ZETA_VAR_CLIENT_ADDRESS, ip);
+    }
+
+    debug!(?main_config, ?location_config, http_method, %eigenurl, client_ip, now, "effective config");
 
     let access_token = request
         .get_authorization_token()
         .map_err(ZetaError::AccessToken)?;
     let ath = Sha256::digest(&access_token).to_vec();
-    let access_token = verify_access_token(
+    let access_token_data = verify_access_token(
         main_config,
         location_config,
         &access_token,
@@ -422,27 +528,58 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
         .get_header_in("dpop")
         .context("missing DPoP header")
         .map_err(ZetaError::DPoP)?;
-    let http_method = request.method();
-    let uri: Uri = request.eigenurl_normalized()?;
 
     verify_dpop(
         location_config,
-        &access_token.claims,
+        &access_token_data.claims,
         &ath,
         dpop,
         now,
         &http_method,
-        uri,
+        eigenurl,
     )
     .await
     .map_err(ZetaError::DPoP)?;
 
-    verify_client_ip(main_config, &access_token.claims, request.get_client_ip())?;
+    if BLOCK_LIST.is_blocked(&access_token_data.claims.sid)? {
+        crate::metrics::BLOCKED_REQUEST_COUNT.add(1, &[]);
+        return Err(ZetaError::RevokedSession);
+    }
 
-    let access_token_claims = access_token.claims;
+    if main_config.no_travel {
+        // Rejecting does not depend on being able to report: without a
+        // configured revocation API we still fail the request, just without
+        // telling the PDP (warned about at startup).
+        let revocation_url = main_config.revocation_url.clone();
+
+        verify_client_ip(
+            revocation_url,
+            &access_token,
+            &access_token_data.claims.ip_address,
+            request.get_client_ip(),
+        )
+        .await?;
+    }
+
+    let access_token_claims = access_token_data.claims;
+
+    // A_28783 (app.installation.id): expose client_id for the nginx-otel SERVER
+    // span. Only after the token is fully validated (signature, kid in JWKS, aud,
+    // ip) — a client_id we report must be trustworthy. A later PoPP failure (403)
+    // will still carry it, which is correct: an attributable anomaly for the SIEM.
+    request.set_zeta_upstream_header(ZETA_VAR_CLIENT_ID, &access_token_claims.client_id);
+
+    // A_27496: client monitoring data on the nginx-otel SERVER span (via $zeta_* vars +
+    // otel_span_attr). Same mechanism as CLIENT_ID / CLIENT_ADDRESS (A_28783).
+    request.set_zeta_upstream_header(ZETA_VAR_PRODUCT_ID, &access_token_claims.product_id);
+    request.set_zeta_upstream_header(ZETA_VAR_PRODUCT_VERSION, &access_token_claims.product_version);
+    request.set_zeta_upstream_header(ZETA_VAR_PROFESSION_OID, &access_token_claims.profession_oid);
 
     let require_popp = location_config.require_popp.unwrap_or(false);
     let forward_client_data = location_config.forward_client_data.unwrap_or(false);
+    // Copied out here (like the flags above): `main_config` borrows `request`, and the
+    // upstream-header calls below need it mutably.
+    let user_info_birthdate = main_config.user_info_birthdate;
 
     if require_popp {
         if main_config.popp_issuer.is_none() {
@@ -460,7 +597,7 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
             client_ip.clone(),
         )
         .await?;
-        ensure_popp_token_header_in(request, token_data.claims)?;
+        ensure_popp_token_upstream_header(request, token_data.claims)?;
     }
 
     if forward_client_data {
@@ -470,7 +607,7 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
             AccessTokenPayloadPlatform::Windows => ClientDataPlatform::Windows,
             AccessTokenPayloadPlatform::Linux => ClientDataPlatform::Linux,
         });
-        ensure_client_data_header_in(
+        ensure_client_data_upstream_header(
             request,
             ClientData {
                 client_id: access_token_claims.client_id.clone(),
@@ -481,17 +618,12 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
         )?;
     }
 
-    let user_info = ZetaUserInfo {
-        common_name: access_token_claims
-            .common_name
-            .context("missing common_name")?
-            .clone(),
-        identifier: access_token_claims.sub.clone(),
-        profession_oid: access_token_claims.profession_oid.clone(),
-        organization_name: access_token_claims.organization_name.clone(),
-    };
+    let user_info = user_info_from_claims(&access_token_claims, user_info_birthdate)?;
 
-    ensure_user_info_header_in(request, &user_info)?;
+    ensure_user_info_upstream_header(request, &user_info)?;
+
+    // A_28439: update the Forwarded header (RFC 7239) on the request forwarded upstream.
+    ensure_forwarded_upstream_header(request)?;
 
     Ok(())
 }
@@ -499,57 +631,91 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
 pub fn handler(request: &mut Request) -> Status {
     let config = Module::location_conf(request).expect("location config is none");
 
-    match config.pep {
-        Some(true) => {
-            // Check if we were called *again*
-            if let Some(result) = ModuleCtx::take_pep_result(request) {
-                return match result {
-                    Ok(()) => Status::NGX_OK, // OK: allow access, move to next phase
-                    Err(err) => {
-                        log_debug!("pep: {err}");
-                        let response = request
-                            .eigenurl_normalized()
-                            .and_then(|base| err.response(base));
-
-                        match response {
-                            Ok(response) => {
-                                response.send(request, Status::NGX_ERROR);
-                                Status::NGX_ERROR
-                            }
-                            Err(e) => {
-                                ngx_log_error!(
-                                    NGX_LOG_ERR,
-                                    request.log(),
-                                    "error building error response — {e}"
-                                );
-                                // request was *not* finalized, return fast finalization status
-                                HTTPStatus::INTERNAL_SERVER_ERROR.into()
-                            }
-                        }
-                    }
-                };
-            }
-
-            if let Err(e) = request.spawn(async move |request| {
-                async {
-                    let result = pep_handler(request).await;
-                    ModuleCtx::insert_pep_result(request, result);
-
-                    let c: *mut ngx_connection_t = request.connection().cast();
-                    // trigger „write” event so nginx calls our handler again
-                    unsafe { ngx_post_event((*c).write, addr_of_mut!(ngx_posted_events)) };
-                }
-                .compat()
-                .await;
-            }) {
-                ngx_log_error!(NGX_LOG_ERR, request.log(), "pep: spawn error — {e:?}");
-                return Status::NGX_ERROR;
-            }
-
-            Status::NGX_AGAIN
-        }
-        _ => Status::NGX_DECLINED,
+    if config.pep != Some(true) {
+        return Status::NGX_DECLINED;
     }
+
+    // Re-entry: pep_handler has finished asynchronously. Resume under the
+    // original span so finalize/send chain with the async work above.
+    if let Some((result, span)) = ModuleCtx::take_pep(request) {
+        let _enter = span.enter();
+        return match result {
+            Ok(()) => {
+                // Access granted — everything from here to the end of the
+                // request (proxy_pass, ASL content handler, …) runs under
+                // this span. Finalized with the response status in the
+                // log-phase handler; closed unrecorded by ModuleCtx's drop
+                // if the log phase never takes it. Created while `span` is
+                // entered, so it chains under pep::request.
+                let upstream = tracing::info_span!(
+                    "upstream",
+                    http.response.status_code = tracing::field::Empty,
+                    // upstream could be ASL or proxy_pass but we don't know yet (access phase)
+                    // asl_handler will set it to handle_{m1,m3,subrequest}, in order to enable
+                    // filtering upstream span metrics by that (if the field remains empty, it means
+                    // the upstream was a native nginx handler, like proxy_pass)
+                    is_asl = tracing::field::Empty,
+                );
+                ModuleCtx::insert_upstream_span(request, upstream);
+                Status::NGX_OK
+            }
+            Err(err) => {
+                if let Some(capec) = zeta_capec(&err) {
+                    let capec_id = capec.id();
+                    let capec_name = capec.name();
+                    let detail = tracing::field::display(&err);
+                    let origin = "pep";
+                    let clientIP = request.get_client_ip();
+                    error!(
+                        attackDetection.capecId=%capec_id,
+                        attackDetection.capecName=%capec_name,
+                        attackDetection.detail=detail,
+                        attackDetection.origin=origin,
+                        attackDetection.clientIP=clientIP,
+                        "possible attack detected: {err}"
+                    );
+                }
+                let response = request
+                    .eigenurl_normalized()
+                    .and_then(|base| err.response(base));
+
+                match response {
+                    Ok(response) => {
+                        response.finalize(request, Status::NGX_ERROR);
+                        Status::NGX_ERROR
+                    }
+                    Err(err) => {
+                        error!(%err, "error building error response");
+                        HTTPStatus::INTERNAL_SERVER_ERROR.into()
+                    }
+                }
+            }
+        };
+    }
+
+    // First entry: build the outer handler span (parent + kind + semconv set
+    // by `request_span!`) before anyone enters it, so tracing-opentelemetry
+    // captures the right OTEL parent at on_new_span.
+    let span = request_span!("pep::request", request);
+    let spawn_span = span.clone();
+
+    if let Err(err) = request.spawn(async move |request| {
+        async move {
+            let result = pep_handler(request).await;
+            ModuleCtx::insert_pep(request, result, span);
+
+            let c: *mut ngx_connection_t = request.connection().cast();
+            unsafe { ngx_post_event((*c).write, addr_of_mut!(ngx_posted_events)) };
+        }
+        .compat()
+        .instrument(spawn_span)
+        .await;
+    }) {
+        error!(%err, "spawn error");
+        return Status::NGX_ERROR;
+    }
+
+    Status::NGX_AGAIN
 }
 
 #[cfg(test)]
@@ -563,6 +729,7 @@ mod tests {
     use serde::Serialize;
     use serial_test::serial;
 
+    use crate::conf::PoppValidity;
     use crate::jwk_cache::with_jwk_cache_mock;
     use crate::tests::{RequestMock, request_mock};
     use crate::typify::AccessTokenPayloadCnf;
@@ -594,6 +761,7 @@ mod tests {
                 profession_oid: "profession_oid".to_string(),
                 scope: None,
                 sub: "sub".to_string(),
+                sid: "sid".to_string(),
             }
         }
     }
@@ -635,6 +803,39 @@ mod tests {
         let result =
             verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None).await;
         assert!(result.is_ok());
+
+        // typ
+
+        for (typ, ex) in [
+            ("JWT", true),
+            ("jwt", false),
+            ("at+jwt", true),
+            ("inval", false),
+        ] {
+            let mut header = Header::new(Algorithm::ES256);
+            header.typ = Some(typ.to_string());
+
+            let token = make_jwt(
+                header,
+                AccessTokenPayload {
+                    ..Default::default()
+                },
+            );
+            let result =
+                verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None)
+                    .await;
+            if ex {
+                assert!(result.is_ok(), "typ={typ} should be valid");
+            } else {
+                assert!(
+                    result
+                        .as_ref()
+                        .is_err_and(|e| matches!(e, ZetaError::AccessTokenInvalid { .. })),
+                    "typ={typ} should get ZetaError::AccessTokenInvalid but got {:?}",
+                    result
+                );
+            }
+        }
 
         // aud
         // tolerate extra auds
@@ -934,6 +1135,66 @@ mod tests {
         .await;
 
         assert!(result.is_err_and(|err| err.to_string().contains("invalid typ")));
+
+        // minimal jwk (no alg/kid/use) is accepted
+        let mut minimal_jwk = jwk.clone();
+        minimal_jwk.common.key_algorithm = None;
+        minimal_jwk.common.key_id = None;
+        minimal_jwk.common.public_key_use = None;
+        let mut minimal_header = Header::new(Algorithm::ES256);
+        minimal_header.typ = Some("dpop+jwt".to_string());
+        minimal_header.jwk = Some(minimal_jwk);
+        let minimal_dpop = make_jwt(
+            minimal_header,
+            DPoPProofJwtPayload {
+                ath: Some(Base64UrlUnpadded::encode_string(&ath).to_string()),
+                htm: "GET".to_string(),
+                htu: "http://localhost/htu".to_string(),
+                iat: now.try_into().expect("iat overflow"),
+                jti: "jti".to_string(),
+                nonce: None,
+            },
+        );
+        let result = verify_dpop(
+            &request_mock.lcfg,
+            &at,
+            &ath,
+            &minimal_dpop,
+            now,
+            "GET",
+            "http://localhost/htu".try_into().expect("uri"),
+        )
+        .await;
+        assert!(result.is_ok(), "minimal jwk should be accepted: {result:?}");
+
+        // an explicit non-ES256 jwk alg is still rejected
+        let mut wrong_alg_jwk = jwk.clone();
+        wrong_alg_jwk.common.key_algorithm = Some(KeyAlgorithm::RS256);
+        let mut wrong_alg_header = Header::new(Algorithm::ES256);
+        wrong_alg_header.typ = Some("dpop+jwt".to_string());
+        wrong_alg_header.jwk = Some(wrong_alg_jwk);
+        let wrong_alg_dpop = make_jwt(
+            wrong_alg_header,
+            DPoPProofJwtPayload {
+                ath: Some(Base64UrlUnpadded::encode_string(&ath).to_string()),
+                htm: "GET".to_string(),
+                htu: "http://localhost/htu".to_string(),
+                iat: now.try_into().expect("iat overflow"),
+                jti: "jti".to_string(),
+                nonce: None,
+            },
+        );
+        let result = verify_dpop(
+            &request_mock.lcfg,
+            &at,
+            &ath,
+            &wrong_alg_dpop,
+            now,
+            "GET",
+            "http://localhost/htu".try_into().expect("uri"),
+        )
+        .await;
+        assert!(result.is_err_and(|err| err.to_string().contains("unsupported key_algorithm")));
     }
 
     /// Build a `libc::tm`-derived UTC epoch for fixture dates.
@@ -975,7 +1236,7 @@ mod tests {
                 .returning(move |_, _| Ok(jwk.clone()));
         })
         .await;
-        request_mock.lcfg.popp_validity = Some(crate::conf::PoppValidity::Quarter);
+        request_mock.lcfg.popp_validity = Some(PoppValidity::Quarter);
 
         // iat = 2026-06-01 (Q2). Default sub is "sub".
         let iat = utc_epoch(2026, 6, 1);
@@ -1011,9 +1272,8 @@ mod tests {
                 .returning(move |_, _| Ok(jwk.clone()));
         })
         .await;
-        request_mock.lcfg.popp_validity = Some(crate::conf::PoppValidity::Fixed(
-            std::time::Duration::from_secs(600),
-        ));
+        request_mock.lcfg.popp_validity =
+            Some(PoppValidity::Fixed(std::time::Duration::from_secs(600)));
 
         let iat: i64 = 1_000_000;
         let popp = make_popp_jwt(iat, "sub");
@@ -1036,34 +1296,78 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
+    // NOTE: updating the block list is tested in IT
     async fn verifies_client_ip() {
-        let no_travel_on = MainConfig {
-            no_travel: true,
-            ..Default::default()
-        };
-
-        let at = AccessTokenPayload {
-            ip_address: "192.168.1.1".to_string(),
-            ..Default::default()
-        };
-
-        let result = verify_client_ip(&no_travel_on, &at, Some("192.168.1.1"));
+        let result = verify_client_ip(None, "stub", "192.168.1.1", Some("192.168.1.1")).await;
         assert!(result.is_ok());
 
         // mismatch
-        let result = verify_client_ip(&no_travel_on, &at, Some("127.0.0.1"));
+        let result = verify_client_ip(None, "stub", "192.168.1.1", Some("127.0.0.1")).await;
         assert!(result.is_err_and(|err| err.to_string().contains("Impossible Travel")));
 
         // missing client IP
-        let result = verify_client_ip(&no_travel_on, &at, None);
+        let result = verify_client_ip(None, "stub", "192.168.1.1", None).await;
         assert!(result.is_err_and(|err| err.to_string().contains("client IP address unavailable")));
+    }
 
-        // disabled
-        let no_travel_off = MainConfig {
-            no_travel: false,
+    /// HOTFIX ANFTI2-922 / A_27558: DiPag rejects a `ZETA-User-Info` without `birthdate`, so
+    /// assert on the serialized JSON — that, base64url-encoded, *is* the header — rather than
+    /// on the Rust field, which would still pass if serde skipped it.
+    #[test]
+    fn user_info_carries_hotfix_birthdate() {
+        let claims = AccessTokenPayload {
+            sub: "X110400567".to_string(),
+            common_name: Some("Max Mustermann".to_string()),
+            profession_oid: PROFESSION_OID_INSURANT.to_string(),
             ..Default::default()
         };
-        let result = verify_client_ip(&no_travel_off, &at, None);
-        assert!(result.is_ok());
+
+        let user_info = user_info_from_claims(&claims, crate::conf::HOTFIX_USER_INFO_BIRTHDATE)
+            .expect("user info");
+        let json = serde_json::to_value(&user_info).expect("json");
+
+        assert_eq!(json["birthdate"], "1900-01-01");
+        assert_eq!(json["identifier"], "X110400567");
+        assert_eq!(json["commonName"], "Max Mustermann");
+    }
+
+    /// SMC-B/LEI tokens must NOT get the hotfix birthdate — the field is insurant-only and
+    /// consent-dependent. Assert on the serialized JSON: the key must be absent entirely,
+    /// not null.
+    #[test]
+    fn user_info_omits_birthdate_for_non_insurants() {
+        let claims = AccessTokenPayload {
+            sub: "9-SMC-B-Testkarte-883110000116873".to_string(),
+            common_name: Some("Praxis Test".to_string()),
+            organization_name: Some("Testorganisation".to_string()),
+            profession_oid: "1.2.276.0.76.4.50".to_string(),
+            ..Default::default()
+        };
+
+        let user_info = user_info_from_claims(&claims, crate::conf::HOTFIX_USER_INFO_BIRTHDATE)
+            .expect("user info");
+
+        assert_eq!(user_info.birthdate, None);
+        let json = serde_json::to_value(&user_info).expect("json");
+        assert!(json.as_object().expect("object").get("birthdate").is_none());
+    }
+
+    /// A configured `pep_user_info_birthdate` must win over the hotfix default.
+    #[test]
+    fn user_info_birthdate_is_configurable() {
+        let claims = AccessTokenPayload {
+            common_name: Some("Max Mustermann".to_string()),
+            profession_oid: PROFESSION_OID_INSURANT.to_string(),
+            ..Default::default()
+        };
+        let configured = NaiveDate::from_ymd_opt(1980, 7, 15).expect("date");
+
+        let user_info = user_info_from_claims(&claims, configured).expect("user info");
+
+        assert_eq!(user_info.birthdate, Some(configured));
+        assert_eq!(
+            serde_json::to_value(&user_info).expect("json")["birthdate"],
+            "1980-07-15"
+        );
     }
 }

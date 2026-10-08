@@ -24,24 +24,30 @@ name = "purl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 anyhow = "1.0"
 ngx_pep = { path = "..", features = ["client"] }
 argp = "0.4"
 indicatif = "0.18"
-p256 = "*"
-base64ct = "*"
-futures = "*"
-hex = "*"
-http = "*"
-httparse = "*"
-reqwest = "0.12"
-serde = "*"
-serde_json = "*"
-sha2 = "*"
-tokio = { version = "*", features = ["macros", "fs", "rt", "rt-multi-thread", "process"] }
+p256 = "0.14"
+base64ct = "1.8"
+futures = "0.3"
+hex = "0.4"
+http = "1.4"
+httparse = "1.10"
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
+  "json",
+  "http2",
+  "cookies",
+] }
+serde = "1.0"
+serde_json = "1.0"
+# see the note in ../Cargo.toml — purl generates the same schema types
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+sha2 = "0.11"
+tokio = { version = "1.52", features = ["macros", "fs", "rt", "rt-multi-thread", "process"] }
 asl = { path = "../libasl" }
 
 [build-dependencies]

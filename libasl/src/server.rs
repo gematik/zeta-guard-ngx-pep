@@ -27,7 +27,7 @@ use super::util::*;
 use anyhow::anyhow;
 use serde::Serialize;
 
-const EXPIRES_AFTER_SECONDS: u64 = 24 * 60 * 60;
+pub const EXPIRES_AFTER_SECONDS: u64 = 24 * 60 * 60;
 
 #[derive(Default)]
 pub struct Config {

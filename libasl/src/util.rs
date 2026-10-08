@@ -28,9 +28,10 @@ use libcrux_aead::Aead;
 use libcrux_kem as kem;
 use libcrux_ml_kem::mlkem768;
 use libcrux_traits::aead::typed_refs::Aead as _;
+use rand::Rng;
 #[cfg(test)]
 use rand::SeedableRng;
-use rand::{Rng, RngCore};
+use rand::prelude::RngExt;
 use std::cell::RefCell;
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -4,6 +4,7 @@
 The validation of the authorization token failed. The error message lists the detail.
 
 ## Examples
+- `typ` is not "JWT" or "at+jwt"
 - `iss` claim mismatches configured `pep_pdp_issuer`
 - `nbf` after current time
 - `iat` after current time (after considering `pep_leeway`, i.e. `(iat - pep_leeway) > now)`

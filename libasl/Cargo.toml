@@ -25,17 +25,16 @@ name = "asl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [dependencies]
-libcrux-traits = "0.0.6"
-libcrux-kem = "0.0.6"
-libcrux-aead = "0.0.6"
-libcrux-hkdf = "0.0.6"
-libcrux-ecdsa = { version = "0.0.6", features = ["rand"] }
-libcrux-sha2 = "0.0.6"
-libcrux-ml-kem = "0.0.7"
-rand = "0.9"
+libcrux-traits = "0.0.7"
+libcrux-kem = "0.0.8"
+libcrux-aead = "0.0.8"
+libcrux-hkdf = "0.0.7"
+libcrux-ecdsa = { version = "0.0.7", features = ["rand"] }
+libcrux-sha2 = "0.0.7"
+libcrux-ml-kem = "0.0.9"
+rand = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_cbor = "0.11"
 serde_bytes = "0.11"
@@ -47,4 +46,4 @@ thiserror = "2.0"
 anyhow = "1"
 
 [dev-dependencies]
-x509-parser = "0.17"
+x509-parser = "0.18"

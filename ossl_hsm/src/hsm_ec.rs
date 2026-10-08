@@ -428,7 +428,7 @@ unsafe extern "C" fn keymgmt_export(
 
     eprintln!(
         "[ossl_hsm] keymgmt_export: returning public key, key_id={}, curve={:?}, {} bytes",
-        &h.key_id,
+        h.key_id,
         material.curve,
         material.pub_uncompressed.len()
     );
@@ -577,7 +577,7 @@ unsafe extern "C" fn signature_digest_sign_init(
 
     eprintln!(
         "[ossl_hsm] signature_digest_sign_init key_id={}, curve={:?}, digest={}",
-        &sig_ctx.key_id,
+        sig_ctx.key_id,
         curve,
         digest_name(&digest).to_str().unwrap(),
     );
@@ -657,7 +657,7 @@ unsafe extern "C" fn signature_digest_sign(
 
     eprintln!(
         "[ossl_hsm] Signed via gRPC, key_id={}, curve={:?}, digest={}, {} bytes DER",
-        &sig_ctx.key_id,
+        sig_ctx.key_id,
         curve,
         digest_name(&md).to_str().unwrap(),
         der.len()
@@ -687,7 +687,7 @@ unsafe extern "C" fn signature_digest_verify_init(
             sig_ctx.key_id = key_handle.key_id.clone();
             eprintln!(
                 "[ossl_hsm] signature_digest_verify_init key_id={}",
-                &key_handle.key_id
+                key_handle.key_id
             );
         }
 

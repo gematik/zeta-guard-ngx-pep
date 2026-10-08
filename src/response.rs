@@ -22,14 +22,15 @@
  * #L%
  */
 
+use std::collections::HashMap;
 use std::ptr::{self, copy_nonoverlapping};
 
 use anyhow::{Result, bail};
-use nginx_sys::{NGX_LOG_ERR, ngx_buf_t, ngx_chain_t, ngx_http_output_filter};
+use nginx_sys::{ngx_buf_t, ngx_chain_t, ngx_http_output_filter};
 use ngx::core::Status;
 use ngx::http::{HTTPStatus, Request};
-use ngx::ngx_log_error;
 use ngx_tickle::finalize_request;
+use tracing::{error, instrument};
 
 use crate::request_ops::RequestOps;
 
@@ -155,6 +156,7 @@ pub struct Response {
     pub status: HTTPStatus,
     pub content_type: Option<String>,
     pub body: Body,
+    pub extra_headers: HashMap<String, String>,
 }
 impl std::fmt::Debug for Response {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -162,6 +164,7 @@ impl std::fmt::Debug for Response {
             .field("status", &self.status)
             .field("content_type", &self.content_type)
             .field("body", &format!("({} bytes)", self.body.len()))
+            .field("extra_headers", &self.extra_headers)
             .finish()
     }
 }
@@ -172,6 +175,7 @@ impl Response {
             status,
             content_type: None,
             body: Body::default(),
+            extra_headers: HashMap::new(),
         }
     }
 
@@ -180,42 +184,72 @@ impl Response {
             status,
             content_type: Some(content_type.to_string()),
             body: Body::Heap(body),
+            extra_headers: HashMap::new(),
         }
     }
 
-    pub fn send(&self, request: &mut Request, finalization_status: Status) {
+    pub fn new_with_body_and_extra_header(
+        status: HTTPStatus,
+        content_type: &str,
+        body: Vec<u8>,
+        extra_headers: HashMap<String, String>,
+    ) -> Self {
+        Response {
+            status,
+            content_type: Some(content_type.to_string()),
+            body: Body::Heap(body),
+            extra_headers,
+        }
+    }
+    /// Send headers + body, caller must finalize afterwards.
+    #[instrument(skip(request))]
+    pub fn send(&self, request: &mut Request) -> Status {
         request.set_status(self.status);
+
+        for (header, value) in self.extra_headers.iter() {
+            if let Err(err) = request.ensure_header_out(header, value) {
+                error!(%header, %value, %err, "error setting header");
+                return Status::NGX_ERROR;
+            }
+        }
 
         let content_length = self.body.len();
         request.set_content_length_n(content_length);
         if content_length > 0
             && let Some(content_type) = &self.content_type
-            && let Err(e) = request.ensure_header_out("content-type", content_type)
+            && let Err(err) = request.ensure_header_out("content-type", content_type)
         {
-            ngx_log_error!(
-                NGX_LOG_ERR,
-                request.log(),
-                "error setting content-type: {content_type} — {e}"
-            );
-            finalize_request(request, Status::NGX_ERROR);
+            error!(%content_type, %err, "error setting content-type");
+            return Status::NGX_ERROR;
         };
 
         let rc = request.send_header();
         if !rc.is_ok() {
-            ngx_log_error!(NGX_LOG_ERR, request.log(), "error sending header — {rc:?}");
+            error!(?rc, "error sending header");
+            return rc;
+        }
+        match self.body.send(request) {
+            Ok(()) => Status::NGX_OK,
+            Err(err) => {
+                error!(%err, "error sending body");
+                Status::NGX_ERROR
+            }
+        }
+    }
+
+    /// Send headers + body, then finalize via posted event.
+    ///
+    /// Only for async contexts whose lifetime is anchored to the request pool.
+    /// Synchronous callers should use `send()` directly, then either return an rc
+    /// that triggers nginx to finalize (see `zeta_cause::header_filter`) or call
+    /// `ngx_http_finalize_request` themselves.
+    pub fn finalize(&self, request: &mut Request, finalize_status: Status) {
+        let rc = self.send(request);
+
+        if rc.is_ok() {
+            finalize_request(request, finalize_status);
+        } else {
             finalize_request(request, rc);
         }
-        let rc = self.body.send(request);
-
-        finalize_request(
-            request,
-            match rc {
-                Ok(()) => finalization_status,
-                Err(e) => {
-                    ngx_log_error!(NGX_LOG_ERR, request.log(), "error sending response — {e}");
-                    Status::NGX_ERROR
-                }
-            },
-        );
     }
 }

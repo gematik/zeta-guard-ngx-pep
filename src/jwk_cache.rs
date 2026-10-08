@@ -25,7 +25,7 @@
 use jsonwebtoken::jwk::Jwk;
 #[cfg(test)]
 use mockall::automock;
-use reqwest::header::{CACHE_CONTROL, ETAG, LAST_MODIFIED};
+use reqwest::header::{CACHE_CONTROL, ETAG, HeaderMap, LAST_MODIFIED};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -70,8 +70,7 @@ impl HttpCacheMeta {
         }
     }
 
-    fn from_response(resp: &reqwest::Response) -> Self {
-        let h = resp.headers();
+    fn from_headers(h: &HeaderMap) -> Self {
         Self {
             etag: h.get(ETAG).and_then(|v| v.to_str().ok()).map(Into::into),
             last_modified: h
@@ -84,10 +83,9 @@ impl HttpCacheMeta {
         }
     }
 
-    /// Merge metadata from a (possibly 304) response, keeping existing values
-    /// for headers the server didn't repeat.
-    fn merge_response(&mut self, resp: &reqwest::Response) {
-        let h = resp.headers();
+    /// Merge metadata from a (possibly 304) response's headers, keeping existing
+    /// values for headers the server didn't repeat.
+    fn merge_headers(&mut self, h: &HeaderMap) {
         if let Some(etag) = h.get(ETAG).and_then(|v| v.to_str().ok()) {
             self.etag = Some(etag.into());
         }
@@ -154,16 +152,21 @@ mod prod {
 
     use anyhow::{Context, anyhow, bail};
     use base64ct::Base64;
+    use bytes::Bytes;
+    use http::Method;
     use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation, jwk::JwkSet};
-    use reqwest::StatusCode;
-    use reqwest::header::{IF_MODIFIED_SINCE, IF_NONE_MATCH};
+    use reqwest::header::{HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH};
+    use reqwest::{StatusCode, Url};
     use tokio::{sync::RwLock, time::Instant};
+    use tracing::{debug, error, info, instrument, warn};
 
+    use crate::headers::forwarded_for_value;
+    use crate::otel::{traced_outbound, traced_request};
     use crate::spawn_compat;
 
     use {
         super::{HttpCacheMeta, JwkCacheOps},
-        crate::{CLIENT, conf::MainConfig, log_debug},
+        crate::{CLIENT, conf::MainConfig},
         jsonwebtoken::jwk::Jwk,
         ngx::async_::sleep,
         serde::Deserialize,
@@ -178,30 +181,37 @@ mod prod {
 
     /// Send a GET with conditional headers (If-None-Match / If-Modified-Since).
     /// Caller checks `resp.status() == 304` to distinguish cache hit from new data.
-    /// When `xff` is set, an X-Forwarded-For header is added so the IdP can
-    /// attribute the request to the client that triggered a force-refresh.
+    /// When `forwarded_for` is set, both `Forwarded: for=…` and `X-Forwarded-For`
+    /// headers are added so the IdP can attribute the request to the client that
+    /// triggered a force-refresh. We send both for compatibility reasons.
     async fn conditional_get(
         client: &reqwest::Client,
         url: &str,
         meta: &HttpCacheMeta,
-        xff: Option<&str>,
-    ) -> anyhow::Result<reqwest::Response> {
-        let mut req = client.get(url);
+        forwarded_for: Option<&str>,
+    ) -> anyhow::Result<(StatusCode, HeaderMap, Bytes)> {
+        let method = Method::GET;
+        let url: Url = url.parse()?;
+        let (mut request, span) = traced_outbound!(client, method, url, "jwk_cache_fetch");
         if let Some(etag) = &meta.etag {
-            req = req.header(IF_NONE_MATCH, etag.as_str());
+            request = request.header(IF_NONE_MATCH, etag.as_str());
         }
         if let Some(lm) = &meta.last_modified {
-            req = req.header(IF_MODIFIED_SINCE, lm.as_str());
+            request = request.header(IF_MODIFIED_SINCE, lm.as_str());
         }
-        if let Some(xff) = xff {
-            req = req.header("X-Forwarded-For", xff);
+        if let Some(forwarded_for) = forwarded_for {
+            request = request.header("Forwarded", forwarded_for_value(forwarded_for));
+            request = request.header("X-Forwarded-For", forwarded_for);
         }
-        let resp = req.send().await?;
-        if resp.status() == StatusCode::NOT_MODIFIED {
-            Ok(resp)
-        } else {
-            Ok(resp.error_for_status()?)
+        let (status, headers, body) = traced_request(request, span)
+            .await
+            .context("request error")?;
+        // traced_request relays any status; the JWKS endpoints must answer 2xx
+        // (fresh) or 304 (cache hit) — anything else is a fetch failure.
+        if !status.is_success() && status != StatusCode::NOT_MODIFIED {
+            bail!("unexpected status {status}");
         }
+        Ok((status, headers, body))
     }
 
     // --- Data types ---
@@ -302,10 +312,30 @@ mod prod {
             }
         }
 
+        /// Seconds since the last successful refresh per target, for the
+        /// staleness gauges. `None` per target when nothing was fetched yet
+        /// (or popp is unconfigured), or the (tokio) lock is briefly contended
+        /// — observable gauges tolerate skipped samples. Called from the
+        /// metrics PeriodicReader thread, hence `try_read`.
+        pub fn staleness_secs(&self) -> [(&'static str, Option<u64>); 2] {
+            let now = jsonwebtoken::get_current_timestamp();
+            let age = |jwks: &RwLock<Option<JwkStore>>| {
+                let epoch = jwks.try_read().ok()?.as_ref()?.meta.fetched_at_epoch;
+                Some(now.saturating_sub(epoch))
+            };
+            [("pdp", age(&self.pdp_jwks)), ("popp", age(&self.popp_jwks))]
+        }
+
         /// Wrapper around [`Self::fetch_pdp_inner`] that drops the cached data on refresh failure
         /// after a grace period (see [`HttpCacheMeta::trustworthy`]).
-        async fn refresh_pdp(&self, force: bool, xff: Option<&str>) -> anyhow::Result<()> {
-            let result = self.fetch_pdp_inner(force, xff).await;
+        #[instrument(skip(self))]
+        async fn refresh_pdp(
+            &self,
+            force: bool,
+            forwarded_for: Option<&str>,
+        ) -> anyhow::Result<()> {
+            let result = self.fetch_pdp_inner(force, forwarded_for).await;
+            let outcome;
             if let Err(e) = &result {
                 let grace = self.refresh_interval;
                 // Take write locks first (in inner's lock order) and re-check
@@ -317,22 +347,37 @@ mod prod {
                     .as_ref()
                     .is_some_and(|s| s.meta.trustworthy(grace));
                 if trustworthy {
-                    log_debug!("jwk_cache[pdp]: ERROR refresh failed (in grace, cache kept): {e}");
+                    warn!(error = %e, "refresh failed (in grace, cache kept)");
+                    outcome = "err_in_grace";
                 } else {
                     *jwks_guard = None;
                     *oidc_guard = None;
-                    log_debug!(
-                        "jwk_cache[pdp]: ERROR refresh failed past grace, cache dropped: {e}"
-                    );
+                    error!(error = %e, "refresh failed past grace, cache dropped");
+                    outcome = "err_dropped";
                 }
+            } else {
+                outcome = "ok";
             }
+            crate::metrics::JWK_REFRESH.add(
+                1,
+                &[
+                    opentelemetry::KeyValue::new("target", "pdp"),
+                    opentelemetry::KeyValue::new("outcome", outcome),
+                ],
+            );
             result
         }
 
         /// Wrapper around [`Self::fetch_popp_inner`] that drops the cached data on refresh failure
         /// after a grace period (see [`HttpCacheMeta::trustworthy`]).
-        async fn refresh_popp(&self, force: bool, xff: Option<&str>) -> anyhow::Result<()> {
-            let result = self.fetch_popp_inner(force, xff).await;
+        #[instrument(skip(self))]
+        async fn refresh_popp(
+            &self,
+            force: bool,
+            forwarded_for: Option<&str>,
+        ) -> anyhow::Result<()> {
+            let result = self.fetch_popp_inner(force, forwarded_for).await;
+            let outcome;
             if let Err(e) = &result {
                 let grace = self.refresh_interval;
                 let mut entity_guard = self.popp_entity.write().await;
@@ -341,15 +386,24 @@ mod prod {
                     .as_ref()
                     .is_some_and(|s| s.meta.trustworthy(grace));
                 if trustworthy {
-                    log_debug!("jwk_cache[popp]: ERROR refresh failed (in grace, cache kept): {e}");
+                    warn!(error = %e, "refresh failed (in grace, cache kept)");
+                    outcome = "err_in_grace";
                 } else {
                     *jwks_guard = None;
                     *entity_guard = None;
-                    log_debug!(
-                        "jwk_cache[popp]: ERROR refresh failed past grace, cache dropped: {e}"
-                    );
+                    error!(error = %e, "refresh failed past grace, cache dropped");
+                    outcome = "err_dropped";
                 }
+            } else {
+                outcome = "ok";
             }
+            crate::metrics::JWK_REFRESH.add(
+                1,
+                &[
+                    opentelemetry::KeyValue::new("target", "popp"),
+                    opentelemetry::KeyValue::new("outcome", outcome),
+                ],
+            );
             result
         }
 
@@ -357,7 +411,11 @@ mod prod {
         /// When `force` is false, cached responses that are still fresh are kept.
         /// When `force` is true (on-demand kid miss), freshness is bypassed but
         /// conditional GET is still used to save bandwidth.
-        async fn fetch_pdp_inner(&self, force: bool, xff: Option<&str>) -> anyhow::Result<()> {
+        async fn fetch_pdp_inner(
+            &self,
+            force: bool,
+            forwarded_for: Option<&str>,
+        ) -> anyhow::Result<()> {
             let client = CLIENT.get().expect("client");
             let issuer = self.pdp_issuer.trim_end_matches('/');
 
@@ -372,19 +430,21 @@ mod prod {
 
                     let well_known = format!("{issuer}/.well-known/openid-configuration");
 
-                    let resp = conditional_get(client, &well_known, &old_meta, xff).await?;
+                    let (status, headers, body) =
+                        conditional_get(client, &well_known, &old_meta, forwarded_for).await?;
 
                     let mut pdp_oidc = self.pdp_oidc.write().await;
-                    if resp.status() == StatusCode::NOT_MODIFIED {
+                    if status == StatusCode::NOT_MODIFIED {
                         let entry = pdp_oidc
                             .as_mut()
                             .ok_or_else(|| anyhow!("pdp: 304 but no cached OIDC config"))?;
-                        entry.meta.merge_response(&resp);
-                        log_debug!("jwk_cache[pdp]: OIDC discovery 304 not modified");
+                        entry.meta.merge_headers(&headers);
+                        debug!("OIDC discovery 304 not modified");
                         entry.jwks_uri.clone()
                     } else {
-                        let meta = HttpCacheMeta::from_response(&resp);
-                        let cfg: OidcConfig = resp.json().await?;
+                        let meta = HttpCacheMeta::from_headers(&headers);
+                        let cfg: OidcConfig =
+                            serde_json::from_slice(&body).context("parse OIDC config")?;
                         if cfg.issuer != self.pdp_issuer {
                             bail!("pdp: issuer mismatch");
                         }
@@ -402,25 +462,26 @@ mod prod {
             let old_meta = {
                 let cached = self.pdp_jwks.read().await;
                 if !force && cached.as_ref().is_some_and(|s| s.meta.is_fresh()) {
-                    log_debug!("jwk_cache[pdp]: JWKS still fresh, skipping fetch");
+                    debug!("JWKS still fresh, skipping fetch");
                     return Ok(());
                 }
 
                 cached.as_ref().map(|s| s.meta.clone()).unwrap_or_default()
             };
 
-            let resp = conditional_get(client, &jwks_uri, &old_meta, xff).await?;
+            let (status, headers, body) =
+                conditional_get(client, &jwks_uri, &old_meta, forwarded_for).await?;
 
             let mut pdp_jwks = self.pdp_jwks.write().await;
-            if resp.status() == StatusCode::NOT_MODIFIED {
+            if status == StatusCode::NOT_MODIFIED {
                 if let Some(store) = pdp_jwks.as_mut() {
-                    store.meta.merge_response(&resp);
+                    store.meta.merge_headers(&headers);
                     let kids: Vec<_> = store.keys.keys().collect();
-                    log_debug!("jwk_cache[pdp]: 304 {}, kids={kids:?}", store.meta);
+                    debug!(meta = %store.meta, ?kids, "JWKS 304 not modified");
                 }
             } else {
-                let meta = HttpCacheMeta::from_response(&resp);
-                let jwk_set: JwkSet = resp.json().await?;
+                let meta = HttpCacheMeta::from_headers(&headers);
+                let jwk_set: JwkSet = serde_json::from_slice(&body).context("parse JWKS")?;
                 let mut jwks = JwkStore {
                     meta,
                     ..Default::default()
@@ -433,7 +494,7 @@ mod prod {
                     }
                 }
                 let kids: Vec<_> = jwks.keys.keys().collect();
-                log_debug!("jwk_cache[pdp]: refresh {}, kids={kids:?}", jwks.meta);
+                info!(meta = %jwks.meta, ?kids, "JWKS refreshed");
                 pdp_jwks.replace(jwks);
             }
 
@@ -442,7 +503,11 @@ mod prod {
 
         /// Fetch PoPP JWKS via entity statement indirection, respecting HTTP cache
         /// semantics. See [`Self::fetch_pdp_inner`] for `force` semantics.
-        async fn fetch_popp_inner(&self, force: bool, xff: Option<&str>) -> anyhow::Result<()> {
+        async fn fetch_popp_inner(
+            &self,
+            force: bool,
+            forwarded_for: Option<&str>,
+        ) -> anyhow::Result<()> {
             // config for now; once federation master provides services list, use it to discover PoPP
             let issuer = self.popp_issuer.clone();
             match issuer {
@@ -468,19 +533,21 @@ mod prod {
 
                             drop(cached);
 
-                            let resp = conditional_get(client, &entity_url, &old_meta, xff).await?;
+                            let (status, headers, body) =
+                                conditional_get(client, &entity_url, &old_meta, forwarded_for)
+                                    .await?;
 
                             let mut popp_entity = self.popp_entity.write().await;
-                            if resp.status() == StatusCode::NOT_MODIFIED {
+                            if status == StatusCode::NOT_MODIFIED {
                                 let entry = popp_entity.as_mut().ok_or_else(|| {
                                     anyhow!("popp: 304 but no cached entity statement")
                                 })?;
-                                entry.meta.merge_response(&resp);
-                                log_debug!("jwk_cache[popp]: entity statement 304 not modified");
+                                entry.meta.merge_headers(&headers);
+                                debug!("entity statement 304 not modified");
                                 (entry.jwks.clone(), entry.signed_jwks_uri.clone())
                             } else {
-                                let meta = HttpCacheMeta::from_response(&resp);
-                                let entity_bytes = resp.bytes().await?;
+                                let meta = HttpCacheMeta::from_headers(&headers);
+                                let entity_bytes = body;
                                 if !is_base64url_char(entity_bytes[0]) {
                                     bail!(
                                         "Bad PoPP entity statement: {}",
@@ -532,25 +599,26 @@ mod prod {
                     let old_meta = {
                         let cached = self.popp_jwks.read().await;
                         if !force && cached.as_ref().is_some_and(|s| s.meta.is_fresh()) {
-                            log_debug!("jwk_cache[popp]: signed JWKS still fresh, skipping fetch");
+                            debug!("signed JWKS still fresh, skipping fetch");
                             return Ok(());
                         }
                         cached.as_ref().map(|s| s.meta.clone()).unwrap_or_default()
                     };
 
-                    let resp = conditional_get(client, &signed_jwks_url, &old_meta, xff).await?;
+                    let (status, headers, body) =
+                        conditional_get(client, &signed_jwks_url, &old_meta, forwarded_for).await?;
 
                     let mut popp_jwks = self.popp_jwks.write().await;
 
-                    if resp.status() == StatusCode::NOT_MODIFIED {
+                    if status == StatusCode::NOT_MODIFIED {
                         if let Some(store) = popp_jwks.as_mut() {
-                            store.meta.merge_response(&resp);
+                            store.meta.merge_headers(&headers);
                             let kids: Vec<_> = store.keys.keys().collect();
-                            log_debug!("jwk_cache[popp]: 304 {}, kids={kids:?}", store.meta);
+                            debug!(meta = %store.meta, ?kids, "signed JWKS 304 not modified");
                         }
                     } else {
-                        let meta = HttpCacheMeta::from_response(&resp);
-                        let jwks_bytes = resp.bytes().await?;
+                        let meta = HttpCacheMeta::from_headers(&headers);
+                        let jwks_bytes = body;
                         if !is_base64url_char(jwks_bytes[0]) {
                             bail!(
                                 "Bad PoPP signed JWKS: {}",
@@ -582,12 +650,12 @@ mod prod {
                             }
                         }
                         let kids: Vec<_> = jwks.keys.keys().collect();
-                        log_debug!("jwk_cache[popp]: refresh {}, kids={kids:?}", jwks.meta);
+                        info!(meta = %jwks.meta, ?kids, "JWKS refreshed");
                         popp_jwks.replace(jwks);
                     }
                 }
                 None => {
-                    log_debug!("jwk_cache[popp]: no pep_popp_issuer configured, skipping refresh");
+                    debug!("no pep_popp_issuer configured, skipping refresh");
                 }
             };
             Ok(())
@@ -599,12 +667,14 @@ mod prod {
             self.refresh_pdp(false, None).await
         }
 
+        #[instrument(skip(self))]
         async fn get_jwk_pdp(&self, kid: String, client_ip: Option<String>) -> anyhow::Result<Jwk> {
             let mut jwk = self.pdp_jwks.get_key(&kid).await;
             if jwk.is_none() {
-                log_debug!(
-                    "jwk_cache[pdp]: {kid} not found (have {:?}), refresh and retry…",
-                    self.pdp_jwks.read().await
+                info!(
+                    kid,
+                    have = ?*self.pdp_jwks.read().await,
+                    "kid not found, refresh and retry"
                 );
                 self.refresh_pdp(true, client_ip.as_deref()).await?;
                 jwk = self.pdp_jwks.get_key(&kid).await;
@@ -616,6 +686,7 @@ mod prod {
             self.refresh_popp(false, None).await
         }
 
+        #[instrument(skip(self))]
         async fn get_jwk_popp(
             &self,
             kid: String,
@@ -627,9 +698,10 @@ mod prod {
 
             let mut jwk = self.popp_jwks.get_key(&kid).await;
             if jwk.is_none() {
-                log_debug!(
-                    "jwk_cache[popp]: {kid} not found (have {:?}), refresh and retry…",
-                    self.popp_jwks.read().await
+                info!(
+                    kid,
+                    have = ?*self.popp_jwks.read().await,
+                    "kid not found, refresh and retry"
                 );
                 self.refresh_popp(true, client_ip.as_deref()).await?;
                 jwk = self.popp_jwks.get_key(&kid).await;

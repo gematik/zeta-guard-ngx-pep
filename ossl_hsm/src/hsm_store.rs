@@ -134,7 +134,7 @@ unsafe extern "C" fn store_load(
 
     eprintln!(
         "[ossl_hsm] store_load: passing KeyHandle reference, key_id={}, {} bytes",
-        &ctx.key_id, reference_size
+        ctx.key_id, reference_size
     );
 
     let object_type: libc::c_int = OSSL_OBJECT_PKEY;

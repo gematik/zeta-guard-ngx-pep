@@ -273,9 +273,8 @@ async fn get_certificate_returns_valid_chain() {
             .next()
             .unwrap()
             .data()
-            .as_utf8()
-            .unwrap()
-            .to_string(),
+            .to_string()
+            .unwrap(),
         key_id
     );
 
@@ -288,9 +287,8 @@ async fn get_certificate_returns_valid_chain() {
             .next()
             .unwrap()
             .data()
-            .as_utf8()
-            .unwrap()
-            .to_string(),
+            .to_string()
+            .unwrap(),
         "HSM Simulator CA"
     );
 

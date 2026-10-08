@@ -7,13 +7,14 @@ type: object
 properties:
   header:
     type: object
-    description: The JOSE Header of the PoPP-Token.
+    description: The JOSE Header of the Access Token.
     properties:
       typ:
         type: string
-        description: Type of the JWT. Must be "at+jwt".
+        description: Type of the JWT. Must be "at+jwt" or "JWT".
         enum:
           - at+jwt
+          - JWT
       alg:
         type: string
         description: Asymmetric algorithm used to sign the JWT.
@@ -94,6 +95,9 @@ properties:
             description: SHA-256 hash of the public key used in the DPoP proof.
         required:
           - jkt
+      sid:
+        type: string
+        description: The session ID of the client.
     required:
       - iss
       - exp
@@ -107,3 +111,4 @@ properties:
       - iat
       - jti
       - cnf
+      - sid

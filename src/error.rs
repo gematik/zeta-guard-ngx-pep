@@ -25,6 +25,7 @@
 use asl::AslError;
 use http::Uri;
 use ngx::http::HTTPStatus;
+use std::collections::HashMap;
 use std::convert::AsRef;
 use strum::AsRefStr;
 use thiserror::Error;
@@ -55,6 +56,15 @@ pub enum ZetaError {
     },
     #[error("Impossible Travel: {0}")]
     ImpossibleTravel(#[source] anyhow::Error),
+    #[error("Revoked Session")]
+    RevokedSession,
+    #[error("upstream proxy signaled error: {0}")]
+    Proxy(#[source] anyhow::Error),
+    #[error(
+        "proxy headers not configured for this location: `include proxy_headers.conf;` is \
+         missing (or was clobbered by a location-level `proxy_set_header`)"
+    )]
+    ProxyHeadersMissing,
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -83,6 +93,9 @@ impl ZetaError {
             Self::PoPPMissing => 400,
             Self::PoPPInvalidActor { .. } => 403,
             Self::ImpossibleTravel(_) => 401,
+            Self::RevokedSession => 401,
+            Self::Proxy(_) => 500,
+            Self::ProxyHeadersMissing => 500,
             Self::Internal(_) => 500,
         }
     }
@@ -97,10 +110,11 @@ impl ZetaError {
         };
 
         let body = serde_json::to_string_pretty(&error_response)?;
-        Ok(Response::new_with_body(
+        Ok(Response::new_with_body_and_extra_header(
             HTTPStatus(self.http_code()),
             "application/json",
             body.into_bytes(),
+            HashMap::from([("zeta-error-origin".to_string(), "pep".to_string())]),
         ))
     }
 }
@@ -145,6 +159,35 @@ mod tests {
             error_uri: Some("http://base/doc/errors/Internal.html".to_string()),
         };
         assert!(body == expected_body);
+        Ok(())
+    }
+
+    #[test]
+    fn error_response_carries_zeta_error_origin_header() -> Result<()> {
+        let variants: Vec<ZetaError> = vec![
+            ZetaError::AccessToken(anyhow!("expired")),
+            ZetaError::AccessTokenInvalid(anyhow!("bad sig")),
+            ZetaError::DPoP(anyhow!("missing")),
+            ZetaError::PoPP(anyhow!("invalid")),
+            ZetaError::PoPPMissing,
+            ZetaError::PoPPInvalidActor {
+                access_token_sub: "a".into(),
+                actor_id: "b".into(),
+            },
+            ZetaError::ImpossibleTravel(anyhow!("too fast")),
+            ZetaError::Proxy(anyhow!("upstream died")),
+            ZetaError::Internal(anyhow!("oops")),
+        ];
+
+        for error in variants {
+            let response = error.response("http://base".parse()?)?;
+            assert_eq!(
+                response.extra_headers.get("zeta-error-origin").map(String::as_str),
+                Some("pep"),
+                "ZetaError::{} must set zeta-error-origin: pep",
+                error.as_ref()
+            );
+        }
         Ok(())
     }
 }

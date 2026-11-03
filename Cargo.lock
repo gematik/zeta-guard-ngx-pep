@@ -147,7 +147,7 @@ checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
 
 [[package]]
 name = "asl"
-version = "1.3.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1870,7 +1870,7 @@ dependencies = [
 
 [[package]]
 name = "hsm_sim"
-version = "1.3.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2613,7 +2613,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "load_dispenser"
-version = "1.3.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-walkdir",
@@ -2794,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "ngx_pep"
-version = "1.3.3"
+version = "2.0.0"
 dependencies = [
  "ambassador",
  "anyhow",
@@ -3187,7 +3187,7 @@ dependencies = [
 
 [[package]]
 name = "ossl_hsm"
-version = "1.3.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -3774,7 +3774,7 @@ dependencies = [
 
 [[package]]
 name = "purl"
-version = "1.3.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "argp",

@@ -477,7 +477,10 @@ async fn hellozeta(
         AslResponse::Body(_) => Ok(()),
         AslResponse::Error(e) => Err(anyhow!("ASL error {e:?}")),
         AslResponse::HttpError(e) => Err(anyhow!("HTTP error {e:?}")),
-        AslResponse::Unexpected((status, body)) => bail!("unexpected error {status:?} {body}"),
+        AslResponse::Other((status, body)) => Err(anyhow!("unexpected error {status:?} {body}")),
+        AslResponse::Redirection((code, location)) => Err(anyhow!(
+            "unexpected redirection to {location} (HTTP {code})"
+        )),
     }
 }
 

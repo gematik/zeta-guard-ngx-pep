@@ -25,12 +25,10 @@
 use std::cell::RefCell;
 use std::ptr::addr_of;
 use std::sync::OnceLock;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+use std::{env, ptr};
 
 use async_compat::Compat;
-use std::{env, ptr};
-use tracing::Span;
-
 use nginx_sys::{
     NGX_HTTP_VAR_NOCACHEABLE, NGX_LOG_EMERG, NGX_LOG_WARN, ngx_http_add_variable,
     ngx_http_compile_complex_value, ngx_http_compile_complex_value_t, ngx_http_complex_value_t,
@@ -48,9 +46,10 @@ use ngx::http::{HttpModuleMainConf, NgxHttpCoreModule};
 use ngx::ngx_conf_log_error;
 use ngx::{http_request_handler, ngx_string};
 use ngx_tickle::{Task, spawn};
-use reqwest::Client;
+use reqwest::{Client, ClientBuilder};
+use tracing::Span;
 
-use crate::conf::NGX_HTTP_PEP_COMMANDS;
+use crate::conf::{MainConfig, NGX_HTTP_PEP_COMMANDS};
 use crate::error::ZetaResult;
 use crate::request_body::RequestBody;
 
@@ -146,7 +145,11 @@ pub(crate) const ZETA_VAR_IS_ASL: usize = 6;
 pub(crate) const ZETA_VAR_PRODUCT_VERSION: usize = 7;
 pub(crate) const ZETA_VAR_PRODUCT_ID: usize = 8;
 pub(crate) const ZETA_VAR_PROFESSION_OID: usize = 9;
-const ZETA_VAR_COUNT: usize = 10;
+// A_25669-01: optional `ZETA-Access-Token-Content` (`pep_forward_access_token_content`), and the
+// client's original credential headers, forwarded only when enabled per location
+// (`pep_forward_auth_headers` for Authorization + DPoP, `pep_forward_popp` for PoPP).
+pub(crate) const ZETA_VAR_ACCESS_TOKEN_CONTENT: usize = 10;
+const ZETA_VAR_COUNT: usize = 11;
 
 fn zeta_var_name(slot: usize) -> ngx_str_t {
     match slot {
@@ -160,6 +163,7 @@ fn zeta_var_name(slot: usize) -> ngx_str_t {
         ZETA_VAR_PRODUCT_VERSION => ngx_string!("zeta_product_version"),
         ZETA_VAR_PRODUCT_ID => ngx_string!("zeta_product_id"),
         ZETA_VAR_PROFESSION_OID => ngx_string!("zeta_profession_oid"),
+        ZETA_VAR_ACCESS_TOKEN_CONTENT => ngx_string!("zeta_access_token_content"),
         _ => panic!("Unknown var slot {slot}"),
     }
 }
@@ -354,6 +358,7 @@ impl http::HttpModule for Module {
                 ZETA_VAR_PRODUCT_ID,
                 ZETA_VAR_PRODUCT_VERSION,
                 ZETA_VAR_PROFESSION_OID,
+                ZETA_VAR_ACCESS_TOKEN_CONTENT,
             ] {
                 let mut name = zeta_var_name(slot);
                 let var = ngx_http_add_variable(
@@ -457,21 +462,33 @@ fn telemetry_log_phase(request: &mut Request) -> Status {
 
 pub static CLIENT: OnceLock<Client> = OnceLock::new();
 
+/// common config for all clients
+pub(crate) fn client_builder(conf: &MainConfig) -> ClientBuilder {
+    ClientBuilder::new()
+        .user_agent(concat!("ZETA Guard PEP/", env!("CARGO_PKG_VERSION")))
+        .http2_adaptive_window(true)
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(30))
+        .connect_timeout(conf.http_client_connect_timeout)
+        .timeout(conf.http_client_timeout)
+        .use_rustls_tls()
+        .danger_accept_invalid_certs(conf.http_client_accept_invalid_certs)
+}
+
 #[cfg_attr(test, allow(unused))]
 mod prod {
-
-    use std::time::Duration;
 
     use nginx_sys::ngx_cycle_t;
     use ngx::core::Status;
     use ngx::ffi::ngx_int_t;
     use ngx::http::HttpModuleMainConf;
+    use reqwest::redirect::Policy;
 
-    use crate::{CLIENT, Module, otel};
+    use crate::asl::ASL_CLIENT;
+    use crate::{CLIENT, Module, client_builder, otel};
 
     pub extern "C" fn ngx_http_pep_init_worker(cycle: *mut ngx_cycle_t) -> ngx_int_t {
-        use reqwest::ClientBuilder;
-
         ngx_tickle::init();
 
         let cycle = unsafe { &mut *cycle };
@@ -488,19 +505,13 @@ mod prod {
 
         otel::install();
 
-        CLIENT.get_or_init(|| {
-            ClientBuilder::new()
-                .user_agent(concat!("ZETA Guard PEP/", env!("CARGO_PKG_VERSION")))
-                .http2_adaptive_window(true)
-                .pool_max_idle_per_host(32)
-                .pool_idle_timeout(Duration::from_secs(60))
-                .tcp_keepalive(Duration::from_secs(30))
-                .connect_timeout(conf.http_client_connect_timeout)
-                .timeout(conf.http_client_timeout)
-                .use_rustls_tls()
-                .danger_accept_invalid_certs(conf.http_client_accept_invalid_certs)
+        CLIENT.get_or_init(|| client_builder(conf).build().expect("reqwest client"));
+
+        ASL_CLIENT.get_or_init(|| {
+            client_builder(conf)
+                .redirect(Policy::none())
                 .build()
-                .expect("reqwest client")
+                .expect("ASL reqwest client")
         });
 
         #[cfg(not(test))]

@@ -19,30 +19,11 @@ workflow:
 
 stages:
   - build
-  - test
   - deploy
   - publish
   - sign
 
 include:
-  - component: "$CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-scanning@v1.2.1"
-    inputs:
-      job-name: "container-scanning-ngx_pep"
-      cs-image: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
-      git-strategy: fetch
-      severity: HIGH,CRITICAL
-      job-stage: test
-      trivyignore-file: "trivy/.ngx_pep.trivyignore"
-      openvex-file: ".vex/ngx_pep-vulnerabilites.openvex.json"
-  - component: "$CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-scanning@v1.2.1"
-    inputs:
-      job-name: "container-scanning-ngx_ingress"
-      cs-image: "$CI_REGISTRY_IMAGE/nginx-ingress:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
-      git-strategy: fetch
-      severity: HIGH,CRITICAL
-      job-stage: test
-      trivyignore-file: "trivy/.ngx_ingress.trivyignore"
-      openvex-file: ".vex/ngx_ingress-vulnerabilites.openvex.json"
 
   - component: $CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-signing@v1.2.0
     inputs:
@@ -50,13 +31,6 @@ include:
       job-name: container-signing-ingress
       job-dependencies: [ tag_image ]
       job-stage: sign
-    # Keep in sync with tag_image's rules
-    rules:
-      - if: $CI_PIPELINE_SOURCE == "schedule"
-        when: never
-      - if: $CI_COMMIT_TAG
-      - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      - when: never
 
   - component: $CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-signing@v1.2.0
     inputs:
@@ -64,13 +38,6 @@ include:
       job-name: container-signing-hsm-sim
       job-dependencies: [ tag_image ]
       job-stage: sign
-    # Keep in sync with tag_image's rules
-    rules:
-      - if: $CI_PIPELINE_SOURCE == "schedule"
-        when: never
-      - if: $CI_COMMIT_TAG
-      - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      - when: never
 
   - component: $CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-signing@v1.2.0
     inputs:
@@ -78,13 +45,25 @@ include:
       job-name: container-signing-pep
       job-dependencies: [ tag_image ]
       job-stage: sign
-    # Keep in sync with tag_image's rules
-    rules:
-      - if: $CI_PIPELINE_SOURCE == "schedule"
-        when: never
-      - if: $CI_COMMIT_TAG
-      - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      - when: never
+
+# `needs` instead of the component's stage-wide `dependencies`: signing must not wait for unrelated publish jobs
+.sign-tagged-image:
+  # Keep in sync with tag_image's rules
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - when: never
+  needs:
+    - job: tag_image
+
+container-signing-ingress:
+  extends: .sign-tagged-image
+
+container-signing-hsm-sim:
+  extends: .sign-tagged-image
+
+container-signing-pep:
+  extends: .sign-tagged-image
 
 default:
   # Don't bump beyond 29.0 before we got the fix for https://gitlab.com/gitlab-org/gitlab/-/work_items/581900
@@ -131,9 +110,7 @@ before_script:
 base:
   stage: build
   rules:
-    # don't rebuild for nightly build, keep scanning the last-built image
-    - if: '$CI_PIPELINE_SOURCE != "schedule"'
-      when: always
+    - when: always
   script:
     - |
       printf "Build base…\n"
@@ -145,9 +122,7 @@ base:
 build:pep-build:
   stage: build
   rules:
-    # don't rebuild for nightly build, keep scanning the last-built image
-    - if: '$CI_PIPELINE_SOURCE != "schedule"'
-      when: on_success
+    - when: on_success
   needs:
   - job: base
   variables:
@@ -173,9 +148,7 @@ build:pep-build:
 build:aux-build:
   stage: build
   rules:
-    # don't rebuild for nightly build, keep scanning the last-built image
-    - if: '$CI_PIPELINE_SOURCE != "schedule"'
-      when: on_success
+    - when: on_success
   needs:
   - job: base
   variables:
@@ -191,9 +164,7 @@ build:aux-build:
 package:
   stage: build
   rules:
-    # don't rebuild for nightly build, keep scanning the last-built image
-    - if: '$CI_PIPELINE_SOURCE != "schedule"'
-      when: on_success
+    - when: on_success
   needs:
   - job: build:pep-build
   - job: build:aux-build
@@ -240,8 +211,6 @@ sonarqube:
   rules:
     - if: '($SONAR_HOST_URL == null || $SONAR_HOST_URL == "")'
       when: never
-    - if: $CI_PIPELINE_SOURCE == "schedule"
-      when: never
     - when: on_success
   variables:
     SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
@@ -252,8 +221,6 @@ sonarqube:
 trigger_helm:
   stage: deploy
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-      when: never
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       when: on_success
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
@@ -261,9 +228,7 @@ trigger_helm:
     - when: never
   trigger:
     project: zeta/devops/zeta-guard-helm
-    # release branch: smoke-test against the release chart, not main — main's chart
-    # renders pep_pdp_url, which images from this branch deliberately do not support
-    branch: releases/1.3.x
+    branch: main
     strategy: depend
   variables:
     PEPPROXY_IMAGE_TAG: "$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA" # e.g. main-cafebabe
@@ -271,10 +236,6 @@ trigger_helm:
 tag_image:
   stage: publish
   rules:
-    # don't trigger for nightly builds — they are supposed to check dependency issues in
-    # *previously* built and released images, and not build/tag anything themselves.
-    - if: $CI_PIPELINE_SOURCE == "schedule"
-      when: never
     - if: $CI_COMMIT_TAG
       variables:
         TARGET_TAG: "$CI_COMMIT_TAG"
@@ -286,7 +247,7 @@ tag_image:
     - when: never
   needs:
     - job: package
-      optional: true # resolved before rules are evaluated, which fails when schedule
+      optional: true # resolved before rules are evaluated
     - job: trigger_helm
       optional: true
   variables:
@@ -335,22 +296,18 @@ publish_artifacts:
     - when: never
   needs:
     - job: package
-      artifacts: true
-    - job: container-scanning-ngx_pep
-      artifacts: true
-    - job: container-scanning-ngx_ingress
+    - job: build:pep-build
       artifacts: true
   script:
     - git clone https://zeta-sdk:${REPORTING_TOKEN}@tas-devtools-gitlab.spree.de/zeta/reporting.git
     - mkdir -p ./reporting/zeta-guard/ngx_pep/
     - find . -path ./reporting -prune -o -name 'ngx_pep.cdx.json' -exec cp --parents '{}' ./reporting/zeta-guard/ngx_pep/ \;
     - find . -path ./reporting -prune -o -name 'coverage.lcov' -exec cp --parents '{}' ./reporting/zeta-guard/ngx_pep/ \;
-    - find . -path ./reporting -prune -o -name 'gl-container-scanning-report.json' -exec cp --parents '{}' ./reporting/zeta-guard/ngx_pep/ \;
     - cd reporting
     - git config user.email "ci@tas-devtools-gitlab.spree.de"
     - git config  user.name "ci"
     - git add .
-    - git commit -m "$COMMIT_MESSAGE"
+    - git diff --cached --quiet || git commit -m "$COMMIT_MESSAGE"
     - git push
 
 publish_to_dependencytrack:

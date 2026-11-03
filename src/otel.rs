@@ -168,10 +168,7 @@ macro_rules! request_span {
                 // _attached lives until the end of this match arm; long
                 // enough for info_span! to capture the parent.
                 let _attached = ::opentelemetry::Context::attach(ctx);
-                ::tracing::info_span!(
-                    $name,
-                    otel.kind = "internal",
-                )
+                ::tracing::info_span!($name, otel.kind = "internal",)
             }
             inbound => {
                 // Same context-attach trick — Option-mapped because there may
@@ -181,10 +178,7 @@ macro_rules! request_span {
                 // NOTE: this span is only for when there is no nginx-otel, e.g. local dev.
                 // Semconv delibrately ignored here, as it isn't trivial to figure out all the
                 // required items like http.route.
-                let span = ::tracing::info_span!(
-                    $name,
-                    otel.kind = "server",
-                );
+                let span = ::tracing::info_span!($name, otel.kind = "server",);
                 span
             }
         }

@@ -386,6 +386,7 @@ impl TokenDispenser {
         ];
 
         let now = get_current_timestamp();
+        let mut dpop_nonce = None;
         match refresh_token {
             Some(refresh_token) => {
                 let client_assertion = create_client_assertion(&self.registration, now)?;
@@ -395,6 +396,7 @@ impl TokenDispenser {
             }
             None => {
                 let nonce = get_nonce(self.nonce_url.clone(), &self.jar).await?;
+                dpop_nonce = Some(nonce.clone());
 
                 let smcb = create_smcb_token(
                     &self.smcb_key,
@@ -448,7 +450,7 @@ impl TokenDispenser {
             "POST",
             self.token_url.as_str(),
             None,
-            None,
+            dpop_nonce.as_deref(),
         )?;
 
         let mut request = SHARED_CLIENT.post(self.token_url.clone());

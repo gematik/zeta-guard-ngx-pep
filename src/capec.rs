@@ -69,6 +69,7 @@ pub fn zeta_capec(err: &ZetaError) -> Option<Capec> {
         ZetaError::RevokedSession => Some(Capec::UseOfKnownDomainCredentials),
         ZetaError::Proxy(_) => None,
         ZetaError::ProxyHeadersMissing => None,
+        ZetaError::AslSessionExpired(_, _) => None,
         ZetaError::Internal(_) => None,
     }
 }
@@ -87,6 +88,7 @@ pub fn asl_capec(err: &AslError) -> Option<Capec> {
         AslError::UnknownCID => None,
         AslError::BadRequest(_) => Some(Capec::ProtocolManipulation),
         AslError::VerificationError => None,
+        AslError::SessionExpired(_, _) => None,
         AslError::InternalError(_) => None,
     }
 }

@@ -51,6 +51,7 @@ use crate::block_list::ShmBlockList;
 use crate::capec::zeta_capec;
 use crate::error::{ZetaError, ZetaResult};
 use crate::headers::{
+    access_token_payload, ensure_access_token_content_upstream_header,
     ensure_api_version_header_out, ensure_client_data_upstream_header,
     ensure_forwarded_upstream_header, ensure_popp_token_upstream_header,
     ensure_user_info_upstream_header,
@@ -63,8 +64,9 @@ use crate::typify::{
     ClientDataPlatform, DPoPProofJwtPayload, ZetaUserInfo,
 };
 use crate::{CLIENT, Module, ModuleCtx, zeta_anyhow};
-use crate::{ZETA_VAR_CLIENT_ADDRESS, ZETA_VAR_CLIENT_ID, ZETA_VAR_PRODUCT_ID, ZETA_VAR_PRODUCT_VERSION,
-            ZETA_VAR_PROFESSION_OID, zeta_bail
+use crate::{
+    ZETA_VAR_CLIENT_ADDRESS, ZETA_VAR_CLIENT_ID, ZETA_VAR_PRODUCT_ID, ZETA_VAR_PRODUCT_VERSION,
+    ZETA_VAR_PROFESSION_OID, zeta_bail,
 };
 
 use crate::{
@@ -196,6 +198,33 @@ async fn verify_access_token(
     }
 
     Ok(payload)
+}
+
+/// Returns the PoPP token to verify and forward as `ZETA-PoPP-Token-Content`:
+///
+/// When `pep_require_popp` is on for a location, a `pep_popp_issuer` must be configured and every
+/// request must carry a valid popp header.
+///
+/// Otherwise, a present popp header will be verified and forwarded as long as `pep_popp_issuer`
+/// is configured. If no issuer is configured, it can't be verified and is dropped with a warning.
+fn popp_to_verify(
+    popp: Option<&str>,
+    require_popp: bool,
+    popp_issuer_configured: bool,
+) -> ZetaResult<Option<&str>> {
+    match (popp, require_popp, popp_issuer_configured) {
+        (None, true, _) => Err(ZetaError::PoPPMissing),
+        (None, false, _) => Ok(None),
+        (Some(_), true, false) => Err(ZetaError::PoPP(anyhow!("No `pep_popp_issuer` configured"))),
+        (Some(_), false, false) => {
+            warn!(
+                "PoPP header present but no `pep_popp_issuer` configured, \
+                 not setting ZETA-PoPP-Token-Content"
+            );
+            Ok(None)
+        }
+        (Some(popp), _, true) => Ok(Some(popp)),
+    }
 }
 
 #[instrument(skip(popp), err)]
@@ -455,32 +484,26 @@ async fn verify_client_ip(
     Ok(())
 }
 
-/// professionOID „Versicherte/-r" (gemSpec_OID) — the OIDC flow's insurant tokens. SMC-B
-/// token exchange only accepts institution OIDs (1.2.276.0.76.4.50 ff.), so the sets are
-/// disjoint.
-const PROFESSION_OID_INSURANT: &str = "1.2.276.0.76.4.49";
-
 /// Build the `ZETA-User-Info` payload the PEP forwards upstream from the validated access
 /// token claims.
 ///
-/// HOTFIX ANFTI2-922 / A_27558: `birthdate` is mandatory for DiPag, but no claim carries it
-/// yet — so for insurant tokens ([`PROFESSION_OID_INSURANT`]) the value comes from the
-/// configuration (`pep_user_info_birthdate`, defaulting to [`HOTFIX_USER_INFO_BIRTHDATE`])
-/// rather than from `claims`. All other client types (SMC-B/LEI) get no `birthdate`: the
-/// schema defines the field as insurant-only and consent-dependent, so a fixed value there
-/// would fake a consent that was never given. Read it off the token instead once the
-/// authorization server emits the claim.
-fn user_info_from_claims(
-    claims: &AccessTokenPayload,
-    birthdate: NaiveDate,
-) -> anyhow::Result<ZetaUserInfo> {
+/// A_26973-03: `birthdate` is the consent-dependent claim the authorization server takes over
+/// from the sectoral IDP's id_token. Without consent the claim is missing and so is the field;
+/// a value that is no `YYYY-MM-DD` date is dropped rather than failing the request.
+fn user_info_from_claims(claims: &AccessTokenPayload) -> anyhow::Result<ZetaUserInfo> {
     Ok(ZetaUserInfo {
         common_name: claims.common_name.clone().context("missing common_name")?,
         identifier: claims.sub.clone(),
         organization_name: claims.organization_name.clone(),
-        birthdate: (claims.profession_oid == PROFESSION_OID_INSURANT).then_some(birthdate),
+        birthdate: claims.birthdate.as_deref().and_then(parse_birthdate),
         profession_oid: claims.profession_oid.clone(),
     })
+}
+
+fn parse_birthdate(raw: &str) -> Option<NaiveDate> {
+    raw.parse::<NaiveDate>()
+        .inspect_err(|err| warn!("ignoring access token birthdate {raw:?}: {err}"))
+        .ok()
 }
 
 #[instrument(skip(request), err)]
@@ -572,23 +595,25 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
     // A_27496: client monitoring data on the nginx-otel SERVER span (via $zeta_* vars +
     // otel_span_attr). Same mechanism as CLIENT_ID / CLIENT_ADDRESS (A_28783).
     request.set_zeta_upstream_header(ZETA_VAR_PRODUCT_ID, &access_token_claims.product_id);
-    request.set_zeta_upstream_header(ZETA_VAR_PRODUCT_VERSION, &access_token_claims.product_version);
+    request.set_zeta_upstream_header(
+        ZETA_VAR_PRODUCT_VERSION,
+        &access_token_claims.product_version,
+    );
     request.set_zeta_upstream_header(ZETA_VAR_PROFESSION_OID, &access_token_claims.profession_oid);
 
     let require_popp = location_config.require_popp.unwrap_or(false);
     let forward_client_data = location_config.forward_client_data.unwrap_or(false);
-    // Copied out here (like the flags above): `main_config` borrows `request`, and the
-    // upstream-header calls below need it mutably.
-    let user_info_birthdate = main_config.user_info_birthdate;
+    let forward_access_token_content = location_config
+        .forward_access_token_content
+        .unwrap_or(false);
 
-    if require_popp {
-        if main_config.popp_issuer.is_none() {
-            return Err(ZetaError::PoPP(anyhow!("No `pep_popp_issuer` configured")));
-        }
+    let popp = popp_to_verify(
+        request.get_header_in("popp"),
+        require_popp,
+        main_config.popp_issuer.is_some(),
+    )?;
 
-        let popp = request
-            .get_header_in("popp")
-            .ok_or(ZetaError::PoPPMissing)?;
+    if let Some(popp) = popp {
         let token_data = verify_popp(
             location_config,
             &access_token_claims.sub,
@@ -618,9 +643,15 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
         )?;
     }
 
-    let user_info = user_info_from_claims(&access_token_claims, user_info_birthdate)?;
+    let user_info = user_info_from_claims(&access_token_claims)?;
 
     ensure_user_info_upstream_header(request, &user_info)?;
+
+    // A_25669-01: optional, default off
+    if forward_access_token_content {
+        let payload = access_token_payload(&access_token)?;
+        ensure_access_token_content_upstream_header(request, &payload)?;
+    }
 
     // A_28439: update the Forwarded header (RFC 7239) on the request forwarded upstream.
     ensure_forwarded_upstream_header(request)?;
@@ -665,13 +696,13 @@ pub fn handler(request: &mut Request) -> Status {
                     let capec_name = capec.name();
                     let detail = tracing::field::display(&err);
                     let origin = "pep";
-                    let clientIP = request.get_client_ip();
+                    let client_ip = request.get_client_ip();
                     error!(
                         attackDetection.capecId=%capec_id,
                         attackDetection.capecName=%capec_name,
                         attackDetection.detail=detail,
                         attackDetection.origin=origin,
-                        attackDetection.clientIP=clientIP,
+                        attackDetection.clientIP=client_ip,
                         "possible attack detected: {err}"
                     );
                 }
@@ -744,6 +775,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 aud: AccessTokenPayloadAud::String("aud".to_string()),
+                birthdate: None,
                 client_id: "client_id".to_string(),
                 cnf: AccessTokenPayloadCnf {
                     jkt: "".to_string(),
@@ -1294,6 +1326,32 @@ mod tests {
         assert!(result.is_err_and(|err| err.to_string().contains("not longer valid")));
     }
 
+    /// A_25669-01: a present PoPP is verified (and its content forwarded) regardless of
+    /// `pep_require_popp`; a missing one only fails where PoPP is required.
+    #[rstest]
+    #[case::required_present(Some("popp"), true, true, Ok(Some("popp")))]
+    #[case::optional_present(Some("popp"), false, true, Ok(Some("popp")))]
+    #[case::required_missing(None, true, true, Err("PoPPMissing"))]
+    #[case::optional_missing(None, false, true, Ok(None))]
+    #[case::required_no_issuer(Some("popp"), true, false, Err("PoPP"))]
+    #[case::optional_no_issuer(Some("popp"), false, false, Ok(None))]
+    #[case::required_missing_no_issuer(None, true, false, Err("PoPPMissing"))]
+    #[case::optional_missing_no_issuer(None, false, false, Ok(None))]
+    fn selects_popp_to_verify(
+        #[case] popp: Option<&str>,
+        #[case] require_popp: bool,
+        #[case] popp_issuer_configured: bool,
+        #[case] expected: Result<Option<&str>, &str>,
+    ) {
+        let result = popp_to_verify(popp, require_popp, popp_issuer_configured);
+        match (result, expected) {
+            (Ok(got), Ok(want)) => assert_eq!(got, want),
+            (Err(ZetaError::PoPPMissing), Err("PoPPMissing")) => {}
+            (Err(ZetaError::PoPP(_)), Err("PoPP")) => {}
+            (got, want) => panic!("want {want:?}, got {got:?}"),
+        }
+    }
+
     #[rstest]
     #[tokio::test]
     // NOTE: updating the block list is tested in IT
@@ -1310,32 +1368,31 @@ mod tests {
         assert!(result.is_err_and(|err| err.to_string().contains("client IP address unavailable")));
     }
 
-    /// HOTFIX ANFTI2-922 / A_27558: DiPag rejects a `ZETA-User-Info` without `birthdate`, so
-    /// assert on the serialized JSON — that, base64url-encoded, *is* the header — rather than
-    /// on the Rust field, which would still pass if serde skipped it.
+    /// A_26973-03: the birthdate claim ends up in `ZETA-User-Info`. Assert on the serialized
+    /// JSON — that, base64url-encoded, *is* the header — rather than on the Rust field, which
+    /// would still pass if serde skipped it.
     #[test]
-    fn user_info_carries_hotfix_birthdate() {
+    fn user_info_carries_birthdate_claim() {
         let claims = AccessTokenPayload {
             sub: "X110400567".to_string(),
-            common_name: Some("Max Mustermann".to_string()),
-            profession_oid: PROFESSION_OID_INSURANT.to_string(),
+            common_name: Some("Dr. Max Mustermann".to_string()),
+            profession_oid: "1.2.276.0.76.4.49".to_string(),
+            birthdate: Some("1987-06-05".to_string()),
             ..Default::default()
         };
 
-        let user_info = user_info_from_claims(&claims, crate::conf::HOTFIX_USER_INFO_BIRTHDATE)
-            .expect("user info");
+        let user_info = user_info_from_claims(&claims).expect("user info");
         let json = serde_json::to_value(&user_info).expect("json");
 
-        assert_eq!(json["birthdate"], "1900-01-01");
+        assert_eq!(json["birthdate"], "1987-06-05");
         assert_eq!(json["identifier"], "X110400567");
-        assert_eq!(json["commonName"], "Max Mustermann");
+        assert_eq!(json["commonName"], "Dr. Max Mustermann");
     }
 
-    /// SMC-B/LEI tokens must NOT get the hotfix birthdate — the field is insurant-only and
-    /// consent-dependent. Assert on the serialized JSON: the key must be absent entirely,
-    /// not null.
+    /// Without consent (and for SMC-B/LEI tokens) there is no claim, so the key must be absent
+    /// entirely, not null.
     #[test]
-    fn user_info_omits_birthdate_for_non_insurants() {
+    fn user_info_omits_birthdate_without_claim() {
         let claims = AccessTokenPayload {
             sub: "9-SMC-B-Testkarte-883110000116873".to_string(),
             common_name: Some("Praxis Test".to_string()),
@@ -1344,30 +1401,27 @@ mod tests {
             ..Default::default()
         };
 
-        let user_info = user_info_from_claims(&claims, crate::conf::HOTFIX_USER_INFO_BIRTHDATE)
-            .expect("user info");
+        let user_info = user_info_from_claims(&claims).expect("user info");
 
         assert_eq!(user_info.birthdate, None);
         let json = serde_json::to_value(&user_info).expect("json");
         assert!(json.as_object().expect("object").get("birthdate").is_none());
     }
 
-    /// A configured `pep_user_info_birthdate` must win over the hotfix default.
+    /// A malformed birthdate must not fail the request — it is dropped.
     #[test]
-    fn user_info_birthdate_is_configurable() {
-        let claims = AccessTokenPayload {
-            common_name: Some("Max Mustermann".to_string()),
-            profession_oid: PROFESSION_OID_INSURANT.to_string(),
-            ..Default::default()
-        };
-        let configured = NaiveDate::from_ymd_opt(1980, 7, 15).expect("date");
+    fn user_info_drops_malformed_birthdate() {
+        for bad in ["1987", "1987-13-01", "1987-02-30", "05.06.1987", ""] {
+            let claims = AccessTokenPayload {
+                common_name: Some("Dr. Max Mustermann".to_string()),
+                profession_oid: "1.2.276.0.76.4.49".to_string(),
+                birthdate: Some(bad.to_string()),
+                ..Default::default()
+            };
 
-        let user_info = user_info_from_claims(&claims, configured).expect("user info");
+            let user_info = user_info_from_claims(&claims).expect("user info");
 
-        assert_eq!(user_info.birthdate, Some(configured));
-        assert_eq!(
-            serde_json::to_value(&user_info).expect("json")["birthdate"],
-            "1980-07-15"
-        );
+            assert_eq!(user_info.birthdate, None, "{bad:?} must be dropped");
+        }
     }
 }

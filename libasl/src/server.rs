@@ -152,7 +152,14 @@ pub fn finish_handshake(
         return Err(AslError::DecodingError(anyhow!("message_type not m3")));
     }
 
-    let mut inner_cbor = vec![0u8; m3.aead_ct.len() - HANDSHAKE_OVERHEAD];
+    let plain_len = m3
+        .aead_ct
+        .len()
+        // don't panic on short ct
+        .checked_sub(HANDSHAKE_OVERHEAD)
+        .ok_or(AslError::DecryptionFailure)?;
+
+    let mut inner_cbor = vec![0u8; plain_len];
     decrypt_handshake(&keys.k1_c2s, &m3.aead_ct, &mut inner_cbor)
         .map_err(|_| AslError::DecryptionFailure)?;
     let inner: Message3InnerLayer = serde_cbor::from_slice(&inner_cbor)
@@ -252,6 +259,8 @@ pub fn encrypt_response(
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use crate::client::raw_keys_from_bytes;
 
@@ -424,5 +433,26 @@ mod tests {
         let mut crypt = vec![0u8; plain.len() + SESSION_OVERHEAD];
         encrypt_response(&conf, &session, REQUEST_COUNTER, &plain, &mut crypt).unwrap();
         assert!(crypt.starts_with(&hex::decode(EXPECTED_HEADER).unwrap()));
+    }
+
+    #[test]
+    fn short_m3_doesnt_panic_in_handshake() {
+        let conf = Config::default();
+
+        // AEAD_ct is 5 bytes, below HANDSHAKE_OVERHEAD (28).
+        let state = HandshakeState {
+            ss_e: [0u8; 64],
+            transcript: Vec::new(),
+        };
+        let m3 = Message3 {
+            message_type: MESSAGE_TYPE_3.to_string(),
+            aead_ct: vec![0u8; 5],
+            aead_ct_key_confirmation: vec![0u8; 5],
+        };
+        let msg3 = serde_cbor::to_vec(&m3).unwrap();
+
+        // ensure finish_handshake doesn't panic, which would abort the nginx worker
+        let res = finish_handshake(&conf, state, &msg3);
+        assert_matches!(res, Err(AslError::DecryptionFailure));
     }
 }

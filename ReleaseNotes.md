@@ -2,6 +2,72 @@
 
 # Release Notes ZETA PEP
 
+## Release 2.0.0
+
+### fixed
+
+- **BREAKING** `ZETA-User-Info.birthdate` is taken from the access token's `birthdate` claim
+  (A_26973-03), which the authorization server forwards from the sectoral IDP's id_token when
+  the insured person consented. Without the claim the field is absent; a value that is no
+  `YYYY-MM-DD` date is dropped with a warning. The interim fixed date (ANFTI2-922) and its
+  directive `pep_user_info_birthdate` are removed — nginx no longer starts with a
+  configuration that still sets it.
+- ASL: don't panic on short M3
+- purl and load_dispenser add nonce in dpop-token for token exchange
+- in `pep_require_popp off` locations, `popp` headers are now also verfied and forwaded
+  as `ZETA-PoPP-Token-Content` if present, given a `pep_popp_issuer` is configured.
+- `pep_forward_client_data` set at `http`/`server` level is now inherited by locations
+- ASL: session requests shorter than the session overhead are rejected (`BadFormat`)
+  instead of underflowing
+- ASL: redirects on inner responses are never followed
+
+### changed
+
+- A_25669-01: sensitive headers (authorization, dpop, popp) are no longer forwarded to
+  upstreams. This can be disabled, by setting corresponding variables either globally in
+  the server block, or on a per-location basis (before `include proxy_headers.conf;`):
+  before :
+  ```nginx.conf
+    http {
+        server {
+            set $zeta_strip_authorization 0;
+            set $zeta_strip_dpop 0;
+            set $zeta_strip_popp 0;
+
+            location / {
+                set $zeta_strip_authorization 0;
+                set $zeta_strip_dpop 0;
+                set $zeta_strip_popp 0;
+
+                include proxy_headers.conf;
+
+                proxy_pass "http://…/";
+            }
+        }
+    }
+  ```
+
+- A_29850: PoPP errors (`PoPPMissing` 400, `PoPP` and `PoPPInvalidActor` 403) no longer carry
+  the header `zeta-error-origin: pep`. They are addressed to the caller, who supplies the PoPP
+  token, so the ZETA-Client hands them on instead of re-authenticating.
+- ASL: an expired session returns the distinct error `AslSessionExpired`, so the client can
+  re-handshake and retry
+- Bumps nginx version to 1.31.7
+- Bumps nginx-ingress version to 5.7.0
+- Bumps rust version to 1.99.1
+
+### added
+
+- A_25669-01: optional `ZETA-Access-Token-Content` upstream header with the full,
+  Base64-URL encoded JSON payload of the validated access token
+  (`pep_forward_access_token_content on|off`, default off).
+- `pep_pdp_url`: optional internal base URL for OIDC discovery and the JWKS fetch.
+  `pep_pdp_issuer` stays the trust identity (the expected `iss`), so the PDP can be
+  reached over an in-cluster address while tokens keep carrying the public issuer.
+  The `jwks_uri` advertised by discovery is rewritten from the issuer prefix onto
+  `pep_pdp_url`; a `jwks_uri` outside the issuer is fetched as advertised and logged.
+  Unset (default) keeps the previous behaviour.
+
 ## Release 1.3.3
 
 ### fixed
@@ -34,6 +100,7 @@
 ## Release 1.3.0
 
 ### fixed
+
 - DPoP proofs whose embedded `jwk` omits the optional `alg`/`kid`/`use` members are now accepted;
   previously a missing `jwk` `alg` was rejected with HTTP 401. An explicit `jwk` `alg` other than
   `ES256` is still rejected.
@@ -41,6 +108,7 @@
   mechanism as elsewhere (forwarded → x-forwarded-for → x-real-ip → socket addr)
 
 ### added
+
 - Session revocation (ZETAP-1010): with `pep_revocation_url` set, the PEP reports the
   offending access token to the PDP when it detects an impossible-travel violation
   (`ip_address` claim != client ip), and subscribes to the PDP's block list as
@@ -61,6 +129,7 @@
 - logging indications of possible attacks. This logs are enriched with capec categorization. (A_25404)
 
 ### changed
+
 - Bumps nginx version to 1.31.3
 - Bumps nginx-ingress version to 5.5.4
 - Bumps rust version to 1.97.1

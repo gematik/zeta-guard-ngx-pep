@@ -1168,8 +1168,24 @@
       "status_notes": "Laut https://nvd.nist.gov/vuln/detail/CVE-2026-14456 kann ein entfernter Angreifer einen OpenSSL-QUIC-Server durch massenhaft gesendete QUIC-Initial-Pakete mit unbekannten Connection IDs dazu bringen, unbegrenzt neue Kanäle anzulegen und einzureihen, wodurch der Speicherverbrauch unbegrenzt wächst und ein Denial of Service entsteht. Das QUIC-Protokoll wird im PEP nicht verwendet, da die kein Port darauf konfiguriert ist auf das Protokoll QUIC zu lauschen ('list [port] quic'). Dies wurde mit grep überprüft. Zum Vergleich siehe die Dokumentation unter https://nginx.org/en/docs/http/ngx_http_v3_module.html. ",
       "justification": "vulnerable_code_not_in_execute_path",
       "timestamp": "2026-08-18T10:00:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-56854",
+        "aliases": [
+          "GO-2026-6303"
+        ]
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/golang.org/x/crypto"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft das Symbol 'NewServerConn' im Paket 'golang.org/x/crypto/ssh'. Dieses Symbol wird in den Go-Anwendungen innerhalb des Nginx-Ingress nicht verwendet. Verifiziert mit dem Tool govulncheck des Go-Entwicklungsteams gegen die Codebasis der jeweiligen Applikationen.",
+      "timestamp": "2026-09-22T09:42:00Z"
     }
   ],
   "timestamp": "2026-02-27T15:41:26Z",
-  "last_updated": "2026-08-18T10:00:00Z"
+  "last_updated": "2026-09-22T09:42:00Z"
 }

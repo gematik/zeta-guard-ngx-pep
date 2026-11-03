@@ -7,6 +7,14 @@
 # include main_modules.conf;
 include main_common.conf;
 
+# N.b.: this is for dev/test only
+env HTTP_PROXY;
+env HTTPS_PROXY;
+env NO_PROXY;
+env http_proxy;
+env https_proxy;
+env no_proxy;
+
 daemon off;
 
 {{- if multi_process}}
@@ -46,12 +54,6 @@ http \{
     ## server hosting PoPP entity statement at /.well-known/openid-federation
     ## optional if no locations use pep_require_popp
     pep_popp_issuer http://localhost:{port};
-    ## HOTFIX ANFTI2-922 / A_27558: `ZETA-User-Info.birthdate` is mandatory for DiPag, but
-    ## no PDP claim carries it yet. The PEP therefore emits a fixed date (1900-01-01) for
-    ## insurant tokens (professionOID 1.2.276.0.76.4.49; other client types get no
-    ## birthdate) that this directive overrides. Interim solution — drop it once the claim
-    ## exists.
-    # pep_user_info_birthdate 1900-01-01;
     # pep_http_client_connect_timeout 2; # s
     # pep_http_client_timeout 10; # s
     pep_http_client_accept_invalid_certs on;
@@ -107,9 +109,11 @@ http \{
     pep_popp_validity 86400;
     ## forward client data to upstream
     # pep_forward_client_data off;
+    ## A_25669-01: forward the full access token payload as ZETA-Access-Token-Content
+    # pep_forward_access_token_content off;
 
     server \{
-        include server_common.conf;
+        include server_common.conf; # must be the first directive in each server block
 
         listen {port};
         {{- if tls}}
@@ -123,6 +127,15 @@ http \{
 
 
         server_name localhost;
+
+        ## These headers are stripped on upstreams by default for security reasons.
+        ## If the information in the ZETA- custom headers is not enough, you can set 0
+        ## here to retain the full tokens instead.
+        ## Can also be set per-location, but *must* be before
+        ## `include proxy_headers.conf;`
+        # set $zeta_strip_authorization 0;
+        # set $zeta_strip_dpop 0;
+        # set $zeta_strip_popp 0;
 
         location /proxy/ \{
             include proxy_headers.conf;
@@ -190,6 +203,15 @@ http \{
           proxy_pass "http://127.0.0.1:{echo_port}/";
           pep_require_popp on;
           pep_forward_client_data on;
+        }
+        ## A_25669-01: all optional forwarding switches on, see popp_and_upstream_headers
+        location /echo-forward-all/ \{
+          set $zeta_strip_authorization 0;
+          set $zeta_strip_dpop 0;
+          set $zeta_strip_popp 0;
+          include proxy_headers.conf;
+          proxy_pass "http://127.0.0.1:{echo_port}/";
+          pep_forward_access_token_content on;
         }
         ## DELIBERATELY misconfigured: a pep-protected proxy_pass location that forgot to
         ## `include proxy_headers.conf;`. The PEP must reject requests here with 500

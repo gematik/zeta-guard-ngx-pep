@@ -1,10 +1,12 @@
 # PoPP
 
 ## Summary
-`require_popp` is configured, but the PoPP token could not be validated. The error
-detail lists the failing validation steps.
+
+`require_popp` is configured or the request carries a `popp` header, but the PoPP token
+could not be validated. The error detail lists the failing validation steps.
 
 ## Examples
+
 - request is missing `popp` header or the token could not be parsed
 - `typ != "vnd.telematik.popp+jwt"`
 - token JWK not found in the PoPP issuer's `jwks_uri` indicated in OpenID configuration

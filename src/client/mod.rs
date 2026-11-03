@@ -64,7 +64,6 @@ pub mod token_dispenser;
 
 #[derive(Deserialize, Debug)]
 pub struct ClientRegistrationAccessToken {
-    iat: u64,
     aud: String,
 }
 
@@ -407,7 +406,7 @@ pub fn create_client_assertion_with_attestation(
     registration.sign_jwt(None, client_assertion, &KEY)
 }
 
-pub fn client_builder(insecure: bool) -> ClientBuilder {
+pub fn test_client_builder(insecure: bool) -> ClientBuilder {
     Client::builder()
         .cookie_store(true) // session stickiness
         .use_rustls_tls()
@@ -415,9 +414,6 @@ pub fn client_builder(insecure: bool) -> ClientBuilder {
         .pool_max_idle_per_host(1)
         .pool_idle_timeout(Duration::from_secs(5))
         .tcp_keepalive(Duration::from_secs(5))
-    // .pool_max_idle_per_host(0)
-    // .pool_idle_timeout(None)
-    // .tcp_keepalive(None)
 }
 
 /// Send, retrying ONCE (on a fresh connection) when the request died on a
@@ -465,7 +461,7 @@ pub static SHARED_CLIENT: LazyLock<Client> = LazyLock::new(|| {
         .pool_idle_timeout(Duration::from_secs(65)) // < NIC keepalive-timeout (default=75s)
         .tcp_keepalive(Duration::from_secs(30))
         .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(6))
         .build()
         .expect("SHARED_CLIENT")
 });
@@ -505,7 +501,10 @@ mod tests {
 
         assert!(jwk.common.key_algorithm.is_none(), "jwk.alg must be absent");
         assert!(jwk.common.key_id.is_none(), "jwk.kid must be absent");
-        assert!(jwk.common.public_key_use.is_none(), "jwk.use must be absent");
+        assert!(
+            jwk.common.public_key_use.is_none(),
+            "jwk.use must be absent"
+        );
         assert_eq!(
             jwk.thumbprint(ThumbprintHash::SHA256),
             expected_thumbprint,

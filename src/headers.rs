@@ -22,15 +22,18 @@
  * #L%
  */
 
-use anyhow::Result;
-use base64ct::{Base64Url, Encoding};
+use anyhow::{Context, Result};
+use base64ct::{Base64Url, Base64UrlUnpadded, Encoding};
 use serde::Serialize;
 use serde_json::Value;
 use tracing::debug;
 
 use crate::request_ops::RequestOps;
 use crate::typify::{ClientData, ZetaUserInfo};
-use crate::{ZETA_VAR_CLIENT_DATA, ZETA_VAR_FORWARDED, ZETA_VAR_POPP_TOKEN, ZETA_VAR_USER_INFO};
+use crate::{
+    ZETA_VAR_ACCESS_TOKEN_CONTENT, ZETA_VAR_CLIENT_DATA, ZETA_VAR_FORWARDED, ZETA_VAR_POPP_TOKEN,
+    ZETA_VAR_USER_INFO,
+};
 
 fn to_base64_encoded_json<T: Serialize>(value: &T) -> Result<String> {
     let json = serde_json::to_string_pretty(&value)?;
@@ -66,6 +69,29 @@ pub fn ensure_client_data_upstream_header<R: RequestOps>(
     client_data: ClientData,
 ) -> Result<()> {
     request.set_zeta_upstream_header(ZETA_VAR_CLIENT_DATA, &to_base64_encoded_json(&client_data)?);
+    Ok(())
+}
+
+/// The full payload of an (already verified) access token JWT — every claim, including those
+/// [`crate::typify::AccessTokenPayload`] does not model.
+pub fn access_token_payload(access_token: &str) -> Result<Value> {
+    let payload = access_token
+        .split('.')
+        .nth(1)
+        .context("access token: no payload segment")?;
+    let payload = Base64UrlUnpadded::decode_vec(payload).context("access token: payload base64")?;
+    serde_json::from_slice(&payload).context("access token: payload json")
+}
+
+/// A_25669-01: optional `ZETA-Access-Token-Content` (`pep_forward_access_token_content`).
+pub fn ensure_access_token_content_upstream_header<R: RequestOps>(
+    request: &mut R,
+    access_token_payload: &Value,
+) -> Result<()> {
+    request.set_zeta_upstream_header(
+        ZETA_VAR_ACCESS_TOKEN_CONTENT,
+        &to_base64_encoded_json(access_token_payload)?,
+    );
     Ok(())
 }
 
@@ -119,4 +145,26 @@ pub fn ensure_forwarded_upstream_header<R: RequestOps>(request: &mut R) -> Resul
     // Replace any incoming Forwarded with the updated chain.
     request.set_zeta_upstream_header(ZETA_VAR_FORWARDED, &value);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn access_token_payload_keeps_all_claims() {
+        let claims = json!({"sub": "sub", "not_modelled": {"nested": [1, 2]}});
+        let token = format!(
+            "{}.{}.sig",
+            Base64UrlUnpadded::encode_string(br#"{"alg":"ES256"}"#),
+            Base64UrlUnpadded::encode_string(claims.to_string().as_bytes())
+        );
+
+        assert_eq!(access_token_payload(&token).expect("payload"), claims);
+        assert!(access_token_payload("no-segments").is_err());
+        assert!(access_token_payload("a.!!!.c").is_err());
+    }
 }

@@ -327,6 +327,8 @@ pub enum AslError {
     IllegalTracing, // Verwendung von ZETA-ASL-nonPU-Tracing in PU-Umgebung
     #[error("bad request: {0}")]
     BadRequest(#[source] anyhow::Error),
+    #[error("session expired: {0} (@{1})")]
+    SessionExpired(String, u64),
     #[error("internal error: {0}")]
     InternalError(#[from] anyhow::Error),
 }
@@ -346,6 +348,7 @@ impl AslError {
             AslError::VerificationError => 500,
             AslError::IllegalTracing => 403,
             AslError::BadRequest(_) => 400,
+            AslError::SessionExpired(_, _) => 403,
             AslError::InternalError(_) => 500,
         }
     }
@@ -364,6 +367,7 @@ impl AslError {
             AslError::VerificationError => 100,
             AslError::IllegalTracing => 103,
             AslError::BadRequest(_) => 101,
+            AslError::SessionExpired(_, _) => 104,
             AslError::InternalError(_) => 102,
         }
     }

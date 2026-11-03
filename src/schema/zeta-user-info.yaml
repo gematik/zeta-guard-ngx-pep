@@ -20,12 +20,11 @@ properties:
   organizationName:
     type: string
     description: "Name der Organisation oder Institution"
-  # HOTFIX ANFTI2-922 / A_27558: taken verbatim from the upstream gematik/zeta schema, so
-  # `birthdate` stays optional here. `format: date` makes typify generate a
-  # `chrono::NaiveDate`; `pattern` is kept for spec fidelity only — typify prefers `format`
-  # and never emits a pattern check for it. The PEP fills the field for insurant tokens
-  # (professionOID 1.2.276.0.76.4.49, see `user_info_from_claims`), because DiPag rejects
-  # requests without it; other client types get no birthdate.
+  # Taken verbatim from the upstream gematik/zeta schema, so `birthdate` stays optional here.
+  # `format: date` makes typify generate a `chrono::NaiveDate`; `pattern` is kept for spec
+  # fidelity only — typify prefers `format` and never emits a pattern check for it. The PEP
+  # fills the field from the access token's `birthdate` claim (A_26973-03, see
+  # `user_info_from_claims`).
   birthdate:
     type: string
     format: date

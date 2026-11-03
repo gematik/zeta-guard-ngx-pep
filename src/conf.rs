@@ -23,7 +23,6 @@
  */
 
 use anyhow::{Context, anyhow};
-use chrono::NaiveDate;
 use http::Uri;
 use nginx_sys::{
     NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF,
@@ -114,17 +113,6 @@ macro_rules! loc_command {
     };
 }
 
-/// HOTFIX ANFTI2-922 / A_27558: the authorization server does not issue a `birthdate` claim
-/// yet, but DiPag rejects requests whose `ZETA-User-Info` lacks the field. Until the real fix
-/// lands (claim from the sectoral IDP, forwarded by the authorization server) the PEP fills in
-/// this fixed value for insurant tokens (professionOID 1.2.276.0.76.4.49; other client types
-/// get no birthdate); `pep_user_info_birthdate` overrides it per environment.
-///
-/// `1900-01-01` is deliberate: a valid ISO 8601 date every upstream can parse, yet obviously a
-/// placeholder that can never be mistaken for a real insurant's date of birth.
-pub const HOTFIX_USER_INFO_BIRTHDATE: NaiveDate =
-    NaiveDate::from_ymd_opt(1900, 1, 1).expect("valid hotfix birthdate");
-
 #[derive(Debug, Clone, Default)]
 pub enum OcspMode {
     Disable,
@@ -138,11 +126,13 @@ pub enum OcspMode {
 #[cfg_attr(test, allow(unused))]
 pub struct MainConfig {
     pub pdp_issuer: Option<String>,
+    /// Optional internal base URL used *only* to reach the PDP for OIDC discovery
+    /// and the JWKS fetch. `pdp_issuer` remains the trust identity (the expected
+    /// `iss`); this moves the network path only, e.g. onto an in-cluster Service.
+    /// `None` => fetch from `pdp_issuer`, i.e. the previous behaviour.
+    pub pdp_url: Option<String>,
     pub revocation_url: Option<Url>,
     pub popp_issuer: Option<String>,
-    /// HOTFIX ANFTI2-922: value emitted as `ZETA-User-Info.birthdate`. Defaults to
-    /// [`HOTFIX_USER_INFO_BIRTHDATE`], overridable via `pep_user_info_birthdate`.
-    pub user_info_birthdate: NaiveDate,
     pub jwks_refresh_interval: Duration,
     pub http_client_connect_timeout: Duration,
     pub http_client_timeout: Duration,
@@ -164,9 +154,9 @@ impl Default for MainConfig {
     fn default() -> Self {
         Self {
             pdp_issuer: None,
+            pdp_url: None,
             revocation_url: None,
             popp_issuer: None,
-            user_info_birthdate: HOTFIX_USER_INFO_BIRTHDATE,
             jwks_refresh_interval: Duration::from_secs(300), // NOTE: not exposed as directive r.n.
             http_client_connect_timeout: Duration::from_secs(2),
             http_client_timeout: Duration::from_secs(10),
@@ -250,6 +240,19 @@ conf_handler!(pep_pdp_issuer, MainConfig, |conf: &mut MainConfig,
     Ok(ngx::core::NGX_CONF_OK)
 });
 
+conf_handler!(pep_pdp_url, MainConfig, |conf: &mut MainConfig,
+                                        val: &str|
+ -> anyhow::Result<*mut c_char> {
+    if val.trim().is_empty() {
+        // Absence is the "optional" case and handled by the None default (fetches
+        // fall back to pep_pdp_issuer). An empty *value* is a config mistake, so
+        // say what to do instead of silently ignoring it.
+        anyhow::bail!("empty value — omit the directive to fetch from pep_pdp_issuer");
+    }
+    conf.pdp_url = Some(val.trim().to_string());
+
+    Ok(ngx::core::NGX_CONF_OK)
+});
 
 conf_handler!(pep_revocation_url, MainConfig, |conf: &mut MainConfig,
                                                val: &str|
@@ -280,21 +283,6 @@ conf_handler!(pep_popp_issuer, MainConfig, |conf: &mut MainConfig,
 
     Ok(ngx::core::NGX_CONF_OK)
 });
-
-// HOTFIX ANFTI2-922 / A_27558: see [`HOTFIX_USER_INFO_BIRTHDATE`]. Parsed at configuration
-// time, so a malformed date aborts the nginx start instead of surfacing per request.
-conf_handler!(
-    pep_user_info_birthdate,
-    MainConfig,
-    |conf: &mut MainConfig, val: &str| -> anyhow::Result<*mut c_char> {
-        let val = non_empty(val)?;
-        conf.user_info_birthdate = val
-            .parse()
-            .with_context(|| format!("invalid date {val:?}, expected YYYY-MM-DD"))?;
-
-        Ok(ngx::core::NGX_CONF_OK)
-    }
-);
 
 #[inline(always)]
 fn non_empty(val: &str) -> anyhow::Result<String> {
@@ -468,6 +456,8 @@ pub struct LocationConfig {
     pub popp_validity: Option<PoppValidity>,
 
     pub forward_client_data: Option<bool>,
+    // A_25669-01: default off
+    pub forward_access_token_content: Option<bool>,
 }
 
 /// How long a PoPP token is considered valid. See gemSpec_Zeta_Guide_PoPP
@@ -563,6 +553,12 @@ impl Merge for LocationConfig {
         }
         if self.popp_validity.is_none() {
             self.popp_validity = prev.popp_validity;
+        }
+        if self.forward_client_data.is_none() {
+            self.forward_client_data = prev.forward_client_data;
+        }
+        if self.forward_access_token_content.is_none() {
+            self.forward_access_token_content = prev.forward_access_token_content;
         }
 
         Ok(())
@@ -692,11 +688,27 @@ conf_handler!(
     }
 );
 
-pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 26] = [
+conf_handler!(
+    pep_forward_access_token_content,
+    LocationConfig,
+    |conf: &mut LocationConfig, val: &str| -> anyhow::Result<*mut c_char> {
+        if val.eq_ignore_ascii_case("on") {
+            conf.forward_access_token_content = Some(true);
+        } else if val.eq_ignore_ascii_case("off") {
+            conf.forward_access_token_content = Some(false);
+        } else {
+            anyhow::bail!("expected `on` or `off`, got {val:?}")
+        }
+
+        Ok(ngx::core::NGX_CONF_OK)
+    }
+);
+
+pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 27] = [
     main_command!("pep_pdp_issuer", pep_pdp_issuer),
+    main_command!("pep_pdp_url", pep_pdp_url),
     main_command!("pep_revocation_url", pep_revocation_url),
     main_command!("pep_popp_issuer", pep_popp_issuer),
-    main_command!("pep_user_info_birthdate", pep_user_info_birthdate),
     main_command!(
         "pep_http_client_connect_timeout",
         pep_http_client_connect_timeout
@@ -723,6 +735,10 @@ pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 26] = [
     loc_command!("pep_require_popp", pep_require_popp),
     loc_command!("pep_popp_validity", pep_popp_validity),
     loc_command!("pep_forward_client_data", pep_forward_client_data),
+    loc_command!(
+        "pep_forward_access_token_content",
+        pep_forward_access_token_content
+    ),
     loc_command!("asl", asl),
     // terminate sequence
     ngx_command_t::empty(),
@@ -850,7 +866,8 @@ mod tests {
             dpop_validity: None,
             require_popp: None,
             popp_validity: None,
-            forward_client_data: None,
+            forward_client_data: Some(true),
+            forward_access_token_content: Some(true),
         };
         let mut child = LocationConfig {
             pep: Some(false),
@@ -862,25 +879,15 @@ mod tests {
             require_popp: None,
             popp_validity: None,
             forward_client_data: None,
+            forward_access_token_content: None,
         };
         child.merge(&parent).expect("merge");
         assert_eq!(child.pep, Some(false));
         assert_eq!(child.aud, None);
         assert_eq!(child.scope, Some(some_scope));
         assert_eq!(child.leeway, Some(some_duration));
-    }
-
-    /// HOTFIX ANFTI2-922: without `pep_user_info_birthdate` the PEP must still emit a
-    /// `birthdate`, so the default has to be the hotfix date — not something empty.
-    #[test]
-    fn main_config_defaults_to_hotfix_birthdate() {
-        use crate::conf::{HOTFIX_USER_INFO_BIRTHDATE, MainConfig};
-
-        assert_eq!(
-            MainConfig::default().user_info_birthdate,
-            HOTFIX_USER_INFO_BIRTHDATE
-        );
-        assert_eq!(HOTFIX_USER_INFO_BIRTHDATE.to_string(), "1900-01-01");
+        assert_eq!(child.forward_client_data, Some(true));
+        assert_eq!(child.forward_access_token_content, Some(true));
     }
 
     /// `conf_handler!` prefixes every handler error with the directive name, so the helpers
@@ -904,24 +911,6 @@ mod tests {
                 "helper error must not repeat the directive name: {msg}"
             );
             assert!(!msg.is_empty());
-        }
-    }
-
-    /// The directive parses with `NaiveDate`'s `FromStr`, i.e. ISO 8601 only. Pinned here so
-    /// the documented `YYYY-MM-DD` contract can't drift silently.
-    #[test]
-    fn user_info_birthdate_accepts_iso_dates_only() {
-        use chrono::NaiveDate;
-
-        assert_eq!(
-            "1980-07-15".parse::<NaiveDate>().ok(),
-            NaiveDate::from_ymd_opt(1980, 7, 15)
-        );
-        for bad in ["01.01.1900", "1900-13-01", "not-a-date", ""] {
-            assert!(
-                bad.parse::<NaiveDate>().is_err(),
-                "pep_user_info_birthdate must reject {bad:?}"
-            );
         }
     }
 }

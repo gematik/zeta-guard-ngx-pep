@@ -29,7 +29,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
-use asl::{Config, HandshakeState, SessionState, new_cid, utc_now};
+use asl::{AslError, Config, HandshakeState, SessionState, new_cid, utc_now};
 use nginx_sys::{
     NGX_CONF_PREFIX, NGX_PREFIX, ngx_conf_t, ngx_int_t, ngx_shared_memory_add, ngx_shm_zone_t,
 };
@@ -44,6 +44,7 @@ use tracing::{debug, info, instrument};
 use crate::Module;
 use crate::asl_keys::{AslConfig, asl_file_path, create_asl_config};
 use crate::conf::MainConfig;
+use crate::error::ZetaAslResult;
 use crate::ngx_http_pep_module;
 
 const SESSION_CACHE_SIZE: usize = 100 << 20;
@@ -235,9 +236,10 @@ impl ShmSessionCache {
     }
 
     #[instrument(skip(self))]
-    pub async fn continue_session(&'static self, cid: &str) -> Result<SessionState> {
+    pub async fn continue_session(&'static self, cid: &str) -> ZetaAslResult<SessionState> {
         self.maybe_cleanup_expired_sessions();
-        let key = NgxString::try_from_bytes_in(cid, self.pool.clone())?;
+        let key =
+            NgxString::try_from_bytes_in(cid, self.pool.clone()).context("allocation failed")?;
 
         let result = {
             let map = self.shared.map.read();
@@ -249,21 +251,21 @@ impl ShmSessionCache {
                         let prev = state.enc_ctr.fetch_add(1, Ordering::SeqCst);
                         return Ok(state.to_global(prev + 1));
                     }
-                    Ok(None)
+                    Ok((None, state.expires))
                 }
                 _ => Err(anyhow!("not established — {key}")),
             }
         };
         match result {
-            Ok(Some(session)) => Ok(session),
-            Ok(None) => {
+            Ok((Some(session), _)) => Ok(session),
+            Ok((None, expired)) => {
                 let mut map = self.shared.map.write();
                 let _ = map.remove(&key);
 
-                debug!(cid = %key, "expire");
-                Err(anyhow!("expired — {key}"))
+                debug!(cid = %key, expired, "expire");
+                Err(AslError::SessionExpired(key.to_string(), expired))
             }
-            Err(e) => Err(e),
+            Err(e) => Err(AslError::InternalError(e)),
         }
     }
 

@@ -57,6 +57,13 @@ properties:
       organization_name:
         type: string
         description: "Organization name of the subject"
+      birthdate:
+        # Deliberately no `format: date`: a malformed value must not fail the token's
+        # deserialization — `user_info_from_claims` drops it instead.
+        type: string
+        description: >-
+          Birthdate of the insured person (YYYY-MM-DD), taken over from the sectoral IDP's
+          id_token when the user consented (A_26973-03). Absent otherwise.
       client_id:
         type: string
         description: The client identifier of the OAuth 2.0 client that requested the token.

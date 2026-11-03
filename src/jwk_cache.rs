@@ -146,6 +146,53 @@ impl std::fmt::Display for HttpCacheMeta {
     }
 }
 
+/// Origin (scheme + host[:port]) of the public issuer, presented to the IdP when
+/// it is reached over an internal address so its advertised URLs stay public.
+#[derive(Debug, Clone, PartialEq)]
+struct ForwardedOrigin {
+    scheme: String,
+    host: String,
+}
+
+impl ForwardedOrigin {
+    /// `None` when `issuer` has no host, or is not a URL we could impersonate.
+    fn from_issuer(issuer: &str) -> Option<Self> {
+        let url = reqwest::Url::parse(issuer).ok()?;
+        let host = match (url.host_str()?, url.port()) {
+            (h, Some(p)) => format!("{h}:{p}"),
+            (h, None) => h.to_string(),
+        };
+        Some(Self {
+            scheme: url.scheme().to_string(),
+            host,
+        })
+    }
+}
+
+/// Rewrite a discovery-advertised `jwks_uri` onto the internal base URL.
+///
+/// The IdP advertises its *public* frontend URL, so with `pep_pdp_url` set the
+/// JWKS would otherwise still be fetched over the public path even though
+/// discovery already went in-cluster.
+///
+/// Only the `issuer` prefix is substituted. A `jwks_uri` that does not sit under
+/// the issuer returns `None` so the caller can warn and fall back to the
+/// advertised URI, rather than being silently redirected somewhere internal.
+fn internalize_jwks_uri(jwks_uri: &str, issuer: &str, fetch_base: &str) -> Option<String> {
+    let issuer = issuer.trim_end_matches('/');
+    let fetch_base = fetch_base.trim_end_matches('/');
+    if issuer == fetch_base {
+        return Some(jwks_uri.to_string());
+    }
+    let rest = jwks_uri.strip_prefix(issuer)?;
+    // Guard against a prefix that matches only partially, e.g. issuer
+    // `https://h/realms/zeta` vs `https://h/realms/zeta-other/...`.
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return None;
+    }
+    Some(format!("{fetch_base}{rest}"))
+}
+
 #[cfg_attr(test, allow(unused))]
 mod prod {
     use std::collections::HashMap;
@@ -155,7 +202,7 @@ mod prod {
     use bytes::Bytes;
     use http::Method;
     use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation, jwk::JwkSet};
-    use reqwest::header::{HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH};
+    use reqwest::header::{HOST, HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH};
     use reqwest::{StatusCode, Url};
     use tokio::{sync::RwLock, time::Instant};
     use tracing::{debug, error, info, instrument, warn};
@@ -165,7 +212,7 @@ mod prod {
     use crate::spawn_compat;
 
     use {
-        super::{HttpCacheMeta, JwkCacheOps},
+        super::{ForwardedOrigin, HttpCacheMeta, JwkCacheOps},
         crate::{CLIENT, conf::MainConfig},
         jsonwebtoken::jwk::Jwk,
         ngx::async_::sleep,
@@ -189,6 +236,7 @@ mod prod {
         url: &str,
         meta: &HttpCacheMeta,
         forwarded_for: Option<&str>,
+        origin: Option<&ForwardedOrigin>,
     ) -> anyhow::Result<(StatusCode, HeaderMap, Bytes)> {
         let method = Method::GET;
         let url: Url = url.parse()?;
@@ -202,6 +250,16 @@ mod prod {
         if let Some(forwarded_for) = forwarded_for {
             request = request.header("Forwarded", forwarded_for_value(forwarded_for));
             request = request.header("X-Forwarded-For", forwarded_for);
+        }
+        // Reaching the IdP over an internal address must not change the URLs it
+        // advertises: an IdP that derives them from the request (Keycloak with a
+        // bare `--hostname`) would answer with the internal scheme/host, and the
+        // issuer check below would reject its own metadata. Present the public
+        // issuer's origin so it renders frontend URLs as if reached there.
+        if let Some(o) = origin {
+            request = request.header(HOST, o.host.as_str());
+            request = request.header("X-Forwarded-Proto", o.scheme.as_str());
+            request = request.header("X-Forwarded-Host", o.host.as_str());
         }
         let (status, headers, body) = traced_request(request, span)
             .await
@@ -278,6 +336,9 @@ mod prod {
 
     pub struct JwkCache {
         pdp_issuer: String,
+        /// Base URL actually dialed for PDP discovery/JWKS. Equals `pdp_issuer`
+        /// unless `pep_pdp_url` moves the network path in-cluster.
+        pdp_url: String,
         pdp_oidc: RwLock<Option<OidcCacheEntry>>,
         pdp_jwks: RwLock<Option<JwkStore>>,
         popp_issuer: Option<String>,
@@ -290,6 +351,10 @@ mod prod {
         pub fn init(conf: &MainConfig) {
             let cache = JWK_CACHE.get_or_init(|| JwkCache {
                 pdp_issuer: conf.pdp_issuer.as_ref().expect("issuer").clone(),
+                pdp_url: conf
+                    .pdp_url
+                    .clone()
+                    .unwrap_or_else(|| conf.pdp_issuer.as_ref().expect("issuer").clone()),
                 pdp_oidc: Default::default(),
                 pdp_jwks: Default::default(),
                 popp_issuer: conf.popp_issuer.clone(),
@@ -418,6 +483,14 @@ mod prod {
         ) -> anyhow::Result<()> {
             let client = CLIENT.get().expect("client");
             let issuer = self.pdp_issuer.trim_end_matches('/');
+            // Network path. Identical to `issuer` unless pep_pdp_url is set.
+            let fetch_base = self.pdp_url.trim_end_matches('/');
+            // Only when the two differ do we have to make the IdP answer as if it
+            // had been reached at the public issuer.
+            let origin = (issuer != fetch_base)
+                .then(|| ForwardedOrigin::from_issuer(&self.pdp_issuer))
+                .flatten();
+            let origin = origin.as_ref();
 
             // --- Step 1: resolve JWKS URI via OIDC discovery ---
             let jwks_uri = {
@@ -428,10 +501,11 @@ mod prod {
                     let old_meta = cached.as_ref().map(|c| c.meta.clone()).unwrap_or_default();
                     drop(cached);
 
-                    let well_known = format!("{issuer}/.well-known/openid-configuration");
+                    let well_known = format!("{fetch_base}/.well-known/openid-configuration");
 
                     let (status, headers, body) =
-                        conditional_get(client, &well_known, &old_meta, forwarded_for).await?;
+                        conditional_get(client, &well_known, &old_meta, forwarded_for, origin)
+                            .await?;
 
                     let mut pdp_oidc = self.pdp_oidc.write().await;
                     if status == StatusCode::NOT_MODIFIED {
@@ -445,10 +519,21 @@ mod prod {
                         let meta = HttpCacheMeta::from_headers(&headers);
                         let cfg: OidcConfig =
                             serde_json::from_slice(&body).context("parse OIDC config")?;
+                        // Compared against the *identity*, never against the fetch
+                        // base: the IdP advertises its public issuer even when we
+                        // reached it over an internal address.
                         if cfg.issuer != self.pdp_issuer {
                             bail!("pdp: issuer mismatch");
                         }
-                        let uri = cfg.jwks_uri.clone();
+                        let uri = super::internalize_jwks_uri(&cfg.jwks_uri, issuer, fetch_base)
+                            .unwrap_or_else(|| {
+                                warn!(
+                                    jwks_uri = %cfg.jwks_uri,
+                                    "pdp: jwks_uri is not under the configured issuer; \
+                                     fetching it as advertised (pep_pdp_url not applied)"
+                                );
+                                cfg.jwks_uri.clone()
+                            });
                         *pdp_oidc = Some(OidcCacheEntry {
                             jwks_uri: uri.clone(),
                             meta,
@@ -470,7 +555,7 @@ mod prod {
             };
 
             let (status, headers, body) =
-                conditional_get(client, &jwks_uri, &old_meta, forwarded_for).await?;
+                conditional_get(client, &jwks_uri, &old_meta, forwarded_for, origin).await?;
 
             let mut pdp_jwks = self.pdp_jwks.write().await;
             if status == StatusCode::NOT_MODIFIED {
@@ -533,9 +618,14 @@ mod prod {
 
                             drop(cached);
 
-                            let (status, headers, body) =
-                                conditional_get(client, &entity_url, &old_meta, forwarded_for)
-                                    .await?;
+                            let (status, headers, body) = conditional_get(
+                                client,
+                                &entity_url,
+                                &old_meta,
+                                forwarded_for,
+                                None,
+                            )
+                            .await?;
 
                             let mut popp_entity = self.popp_entity.write().await;
                             if status == StatusCode::NOT_MODIFIED {
@@ -606,7 +696,8 @@ mod prod {
                     };
 
                     let (status, headers, body) =
-                        conditional_get(client, &signed_jwks_url, &old_meta, forwarded_for).await?;
+                        conditional_get(client, &signed_jwks_url, &old_meta, forwarded_for, None)
+                            .await?;
 
                     let mut popp_jwks = self.popp_jwks.write().await;
 
@@ -958,6 +1049,86 @@ mod tests {
         assert!(
             s.contains("etag=\"ab\"\u{2026}"),
             "short etag kept whole: {s}"
+        );
+    }
+
+    // --- internalize_jwks_uri ---
+
+    const PUB: &str = "https://zeta.example/auth/realms/zeta-guard";
+    const INT: &str = "http://authserver/auth/realms/zeta-guard";
+    const CERTS: &str = "/protocol/openid-connect/certs";
+
+    #[test]
+    fn rewrites_public_jwks_uri_onto_internal_base() {
+        assert_eq!(
+            internalize_jwks_uri(&format!("{PUB}{CERTS}"), PUB, INT).as_deref(),
+            Some(format!("{INT}{CERTS}").as_str())
+        );
+    }
+
+    #[test]
+    fn unchanged_when_fetch_base_equals_issuer() {
+        let uri = format!("{PUB}{CERTS}");
+        assert_eq!(
+            internalize_jwks_uri(&uri, PUB, PUB).as_deref(),
+            Some(uri.as_str())
+        );
+    }
+
+    #[test]
+    fn trailing_slashes_do_not_double_up() {
+        assert_eq!(
+            internalize_jwks_uri(
+                &format!("{PUB}{CERTS}"),
+                &format!("{PUB}/"),
+                &format!("{INT}/")
+            )
+            .as_deref(),
+            Some(format!("{INT}{CERTS}").as_str())
+        );
+    }
+
+    #[test]
+    fn issuer_itself_maps_to_bare_fetch_base() {
+        assert_eq!(internalize_jwks_uri(PUB, PUB, INT).as_deref(), Some(INT));
+    }
+
+    #[test]
+    fn none_when_jwks_uri_is_on_a_foreign_host() {
+        assert_eq!(
+            internalize_jwks_uri("https://elsewhere.example/certs", PUB, INT),
+            None
+        );
+    }
+
+    // --- ForwardedOrigin ---
+
+    #[test]
+    fn origin_keeps_scheme_and_host() {
+        let o = ForwardedOrigin::from_issuer(PUB).expect("origin");
+        assert_eq!(o.scheme, "https");
+        assert_eq!(o.host, "zeta.example");
+    }
+
+    #[test]
+    fn origin_keeps_explicit_port() {
+        let o = ForwardedOrigin::from_issuer("http://zeta.example:18080/auth/realms/x")
+            .expect("origin");
+        assert_eq!(o.scheme, "http");
+        assert_eq!(o.host, "zeta.example:18080");
+    }
+
+    #[test]
+    fn origin_none_for_non_url() {
+        assert_eq!(ForwardedOrigin::from_issuer("not a url"), None);
+    }
+
+    #[test]
+    fn none_on_partial_path_segment_match() {
+        // `…/zeta-guard` must not match `…/zeta-guard-other`
+        assert_eq!(
+            internalize_jwks_uri(&format!("{PUB}-other{CERTS}"), PUB, INT),
+            None
         );
     }
 }

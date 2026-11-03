@@ -23,7 +23,7 @@
  */
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
 use asl::{
@@ -36,10 +36,10 @@ use nginx_sys::ngx_cycle;
 use ngx::core::Status;
 use ngx::http::{HTTPStatus, HttpModuleLocationConf, HttpModuleMainConf, Request};
 use ngx_tickle::RequestSpawn;
-use reqwest::Url;
+use reqwest::{Client, Url};
 use tracing::{Instrument, debug, error, instrument};
 
-use crate::capec::{asl_capec, zeta_capec};
+use crate::capec::asl_capec;
 use crate::conf::MainConfig;
 use crate::error::{ToHttpResponse, ZetaAslResult};
 use crate::headers::pep_forwarded_element;
@@ -49,7 +49,7 @@ use crate::request_body::read_request_body;
 use crate::request_ops::RequestOps;
 use crate::response::{Body, Response};
 use crate::session_cache::ShmSessionCache;
-use crate::{CLIENT, Module, ModuleCtx, SELF_URL_CV};
+use crate::{Module, ModuleCtx, SELF_URL_CV};
 
 /// see also: https://github.com/http-rs/async-h1/blob/main/src/lib.rs#L100
 static MAX_HEADERS: usize = 128;
@@ -129,6 +129,9 @@ fn join_path(base: Url, rel: &str) -> Result<Url> {
         .context(format!("can't join {relative} to {base}"))
 }
 
+// initialized in ngx_http_pep_init_worker, after fork
+pub static ASL_CLIENT: OnceLock<Client> = OnceLock::new();
+
 #[instrument(skip(request), fields(body=body.len()), err)]
 async fn handle_subrequest(
     request: &mut Request,
@@ -150,7 +153,12 @@ async fn handle_subrequest(
     }
 
     let session = SESSION_CACHE.continue_session(&cid).await?;
-    let inner_len = body.len() - SESSION_OVERHEAD;
+    // Check before sizing the buffer: a body shorter than the overhead would underflow here,
+    // long before decrypt_request gets to reject it.
+    let inner_len = body
+        .len()
+        .checked_sub(SESSION_OVERHEAD)
+        .ok_or(AslError::BadFormat)?;
     let mut inner = ngx::collections::Vec::with_capacity_in(inner_len, request.pool());
     inner.resize(inner_len, 0u8);
     let ctr = decrypt_request(asl_config, &session, body, &mut inner)?;
@@ -176,9 +184,9 @@ async fn handle_subrequest(
     let method = Method::from_bytes(method.as_bytes())
         .context("unparseable method")
         .map_err(AslError::BadRequest)?;
-    let client = CLIENT
+    let client = ASL_CLIENT
         .get()
-        .ok_or_else(|| anyhow!("CLIENT not initialized"))?;
+        .ok_or_else(|| anyhow!("ASL_CLIENT not initialized"))?;
 
     let url = request
         .get_complex_value(unsafe { (&raw const SELF_URL_CV).as_ref().unwrap() })
@@ -199,6 +207,7 @@ async fn handle_subrequest(
             "zeta-user-info"
             | "zeta-client-data"
             | "zeta-popp-token-content"
+            | "zeta-access-token-content"
             | "zeta-api-version" => {}
             // Strip any traceparent/tracestate the client baked into the
             // encrypted inner request — we want our handle_subrequest span to
@@ -354,28 +363,45 @@ pub fn handler(request: &mut Request) -> Status {
 
     if let Err(err) = request.spawn(async move |request| {
         async move {
-            let response = asl_handler(request)
-                .await
-                .inspect_err(|err| {
-                    if let Some(capec) = asl_capec(&err) {
-                        let capec_id = capec.id();
-                        let capec_name = capec.name();
-                        let detail = tracing::field::display(&err);
-                        let origin = "pep";
-                        let clientIP = request.get_client_ip();
-                        error!(
-                            attackDetection.capecId=%capec_id,
-                            attackDetection.capecName=%capec_name,
-                            attackDetection.detail=detail,
-                            attackDetection.origin=origin,
-                            attackDetection.clientIP=clientIP,
-                            "possible attack detected: {err}"
-                        );
-                    }
-                })
-                .unwrap_or_else(|err| err.to_http_resposnse());
+            let response = asl_handler(request).await.inspect_err(|err| {
+                if let Some(capec) = asl_capec(err) {
+                    let capec_id = capec.id();
+                    let capec_name = capec.name();
+                    let detail = tracing::field::display(&err);
+                    let origin = "pep";
+                    let client_ip = request.get_client_ip();
+                    error!(
+                        attackDetection.capecId=%capec_id,
+                        attackDetection.capecName=%capec_name,
+                        attackDetection.detail=detail,
+                        attackDetection.origin=origin,
+                        attackDetection.clientIP=client_ip,
+                        "possible attack detected: {err}"
+                    );
+                }
+            });
 
-            response.finalize(request, Status::NGX_OK);
+            match response {
+                Ok(response) => {
+                    response.finalize(request, Status::NGX_OK);
+                    Status::NGX_OK
+                }
+                Err(err) => {
+                    match request
+                        .eigenurl_normalized()
+                        .and_then(|base| Ok(err.to_http_response(base)?))
+                    {
+                        Ok(error_response) => {
+                            error_response.finalize(request, Status::NGX_ERROR);
+                            Status::NGX_ERROR
+                        }
+                        Err(err) => {
+                            error!(%err, "error building error response");
+                            HTTPStatus::INTERNAL_SERVER_ERROR.into()
+                        }
+                    }
+                }
+            }
         }
         .compat()
         .instrument(span)

@@ -78,6 +78,10 @@ struct Args {
     #[argp(option, short = 'A', default = "\"alias\".to_string()")]
     popp_p12_alias: String,
 
+    /// authserver host, e.g. zeta-cd.westeurope.cloudapp.azure.com — env: PURL_HOST
+    #[argp(option, short = 't')]
+    host: Option<String>,
+
     /// authserver base url, e.g. https://zeta-dev…/auth/ — env: PURL_AUTH
     #[argp(option, short = 'a')]
     auth: Option<String>,
@@ -499,6 +503,7 @@ async fn main() -> Result<()> {
 
     let access_token = exchange_access_token(
         args.token_url()?,
+        args.host.as_ref().expect("host").clone(),
         nonce.clone(),
         &registration,
         &smcb,

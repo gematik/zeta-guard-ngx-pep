@@ -18,26 +18,6 @@ export RUST_BACKTRACE=1
 printf "!! configure nginx\n\n"
 cargo xtask configure
 
-printf "!! generate openssl.cnf for ossl_hsm\n\n"
-export OPENSSL_CONF="$PWD/ossl_hsm/openssl.cnf"
-cat >"$OPENSSL_CONF" <<-EOF
-	openssl_conf = openssl_init
-
-	[openssl_init]
-	providers = provider_sect
-
-	[provider_sect]
-	ossl_hsm = ossl_hsm_sect
-	default = default_sect
-
-	[ossl_hsm_sect]
-	module = $PWD/target/debug/libossl_hsm.so
-	activate = 1
-
-	[default_sect]
-	activate = 1
-EOF
-
 printf "!! tests\n\n"
 tests() {
 	set +e

@@ -81,6 +81,9 @@ pub async fn request_mock() -> RequestMock {
         .expect_ensure_header_out()
         .returning(|_name, _value| Ok(()));
     mock.request
+        .expect_proxy_strips_present()
+        .returning(|| Some(true));
+    mock.request
         .expect_get_client_ip()
         .returning(|| Some("127.0.0.1"));
 

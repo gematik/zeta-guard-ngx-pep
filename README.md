@@ -111,17 +111,19 @@ To use the "purl" utility, the following environment variables must be set:
 
 |env               |example                                                                         |
 |---               |---                                                                             |
+|IT_HOST           |zeta-cd.westeurope.cloudapp.azure.com                                           |
 |IT_AUTH           |https://zeta-cd.westeurope.cloudapp.azure.com/auth                              |
 |IT_P12            |../smb-keystore.p12                                                             |
 |IT_P12_PASS       |ichangedit                                                                      |
 
 For easier usage of the `purl` tool, these can also be defined:
 
-|env           |example                                            |
-|---           |---                                                |
-|PURL_AUTH     |https://zeta-cd.westeurope.cloudapp.azure.com/auth |
-|PURL_P12      |../smb-keystore.p12                                |
-|PURL_P12_PASS |ichangedit                                         |
+|env            |example                                            |
+|---            |---                                                |
+|PURL_HOST      |zeta-cd.westeurope.cloudapp.azure.com              |
+|PURL_AUTH      |https://zeta-cd.westeurope.cloudapp.azure.com/auth |
+|PURL_P12       |../smb-keystore.p12                                |
+|PURL_P12_PASS  |ichangedit                                         |
 
 
 Note that `PURL_AUTH` only determines the environment to register the client and
@@ -150,13 +152,23 @@ running the tests locally. So the following warning can be ignored:
 
 ## local docker build
 
-The image can be build locally with:
+The Dockerfile can produce multiple artifacts, which is selected with the `--target`
+flag.
+
+These are:
+- pep (default if no `--target`) passed
+- nginx-ingress
+- hsm-sim
+
+See top comment in `./Dockerfile` for details.
+
+To build the PEP runtime image:
 
 ```sh
 docker buildx build -t ngx_pep:local .
 ```
 
-And run with, e.g.:
+Run with, e.g.:
 
 ```sh
 docker run --tty --interactive --rm \
@@ -249,7 +261,8 @@ grpcurl -plaintext -d '{"key_id": "tls.p256"}' \
 
 ## nginx-ingress with ossl_hsm support
 
-To build a `nginx/nginx-ingress` container with installed ossl_hsm provider, you can use:
+To build a `nginx/nginx-ingress` container with installed ossl_hsm provider and the
+headers-more module, you can use:
 
 ```sh
 docker buildx build -t nginx-ingress:local --target nginx-ingress .

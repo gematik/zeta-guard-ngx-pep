@@ -21,11 +21,24 @@
 # For additional notes and disclaimer from gematik and in case of changes by gematik find details in the "Readme" file.
 # #L%
 
-ARG BASE_IMAGE_BUILD="rust:1.94-slim-bookworm"
-ARG NGINX_VERSION=1.29.8 # NOTE: keep in sync with .cargo/config.toml and .gitlab-ci.yml, and with nginx-ingress version in .gitlab-ci.yaml
+# *** Dockerfile targets ***
+# This Dockerfile can produce multiple artifacts and contains internal intermediate
+# steps (for caching purposes and reuse).
+# Some of the targets have -ci variants, that are only meant to be used from CI.
+#
+# The final --targets for interactive usage are:
+# - pep — nginxinc/nginx-unprivileged with pep, headers-more, and openssl provider
+# - nginx-ingress — nginx/nginx-ingress with headers-more and openssl provider
+# - hsm-sim — HSM Simulator
+#
+# If no --target is passed, pep is built.
+
+ARG BASE_IMAGE_BUILD="rust:1.95-slim-bookworm"
+ARG NGINX_VERSION=1.31.3 # NOTE: keep in sync with .cargo/config.toml and .gitlab-ci.yml, and with the nginx contained in BASE_IMAGE_INGRESS (exact version)
+ARG HEADERS_MORE_VERSION=0.39 # tag *without v prefix*! (https://github.com/openresty/headers-more-nginx-module/tags)
 ARG BASE_IMAGE="nginxinc/nginx-unprivileged:$NGINX_VERSION-trixie-otel"
 ARG BASE_IMAGE_HSM_SIM="debian:bookworm"
-ARG BASE_IMAGE_INGRESS="nginx/nginx-ingress:5.4.1" # NOTE: keep in sync with .gitlab-ci.yml, contained nginx major.minor must match NGINX_VERSION
+ARG BASE_IMAGE_INGRESS="nginx/nginx-ingress:5.5@sha256:379143154a02d16e4b7d56ad505636bdf73b2c190825ef023c803958ba5eb57c" # NOTE: keep in sync with .gitlab-ci.yml, contained nginx (1.31.3, controller 5.5.4) must match NGINX_VERSION exactly
 
 FROM ${BASE_IMAGE_BUILD} AS build-env
 ARG AZDO_CRATES_MIRROR_URL=""
@@ -112,7 +125,55 @@ RUN --mount=type=cache,id=cargo-home,target=/usr/local/cargo-home,sharing=locked
   cargo install mdbook --bins --locked --root /usr/local
 SH
 
-FROM build-env AS local-build
+# ***
+# *** headers-more — openresty/headers-more-nginx-module as dynamic module ***
+# ***
+
+FROM build-env AS headers-more
+
+RUN mkdir -p /usr/src/headers-more
+WORKDIR /usr/src/headers-more
+
+# use the pep xtask to acquire and configure a nginx source tree
+COPY --exclude=**/target xtask /usr/src/headers-more/xtask/
+
+ARG NGINX_VERSION
+ENV NGINX_VERSION="$NGINX_VERSION"
+ARG HEADERS_MORE_VERSION
+ENV HEADERS_MORE_VERSION="$HEADERS_MORE_VERSION"
+ADD https://github.com/openresty/headers-more-nginx-module/archive/refs/tags/v$HEADERS_MORE_VERSION.tar.gz /headers-more-nginx-module.tar.gz
+RUN \
+  --mount=type=cache,id=build-cache-headers-more,target=build-cache,sharing=locked \
+  --mount=type=cache,id=cargo-home,target=/usr/local/cargo-home,sharing=locked \
+<<-'SH'
+
+  export CARGO_HOME=/usr/local/cargo-home
+
+  mkdir -p build-cache/{target,nginx-cache,nginx}
+  cp -a build-cache/target/. xtask/target
+  cp -a build-cache/nginx-cache/. .nginx-cache
+  cp -a build-cache/nginx/. .nginx
+
+  tar -xzf /headers-more-nginx-module.tar.gz
+  export NGX_CONFIGURE_ARGS=--add-dynamic-module="$PWD/headers-more-nginx-module-$HEADERS_MORE_VERSION"
+  cargo run --manifest-path xtask/Cargo.toml -- configure
+
+  (
+    cd .nginx
+    make install -j"$(nproc)"
+  )
+  cp prefix/modules/ngx_http_headers_more_filter_module.so /ngx_http_headers_more_filter_module.so
+
+  cp -a xtask/target/. build-cache/target
+  cp -a .nginx-cache/. build-cache/nginx-cache
+  cp -a .nginx/. build-cache/nginx
+SH
+
+# ***
+# *** build-pep — build PEP module (interactive) ***
+# ***
+
+FROM build-env AS build-pep
 
 COPY misc/cargo-build /usr/local/bin/cargo-build
 
@@ -159,12 +220,13 @@ RUN \
   cp -a .nginx/. build-cache/nginx
 SH
 
-# gitlab-ci likes to build "locally", copy .so and book from context
-FROM ${BASE_IMAGE} AS ci
+# ***
+# *** pep — PEP base image with some packages removed (for CVEs) ***
+# ***
+FROM ${BASE_IMAGE} AS pep-base
 
 USER root
 RUN apt purge -y \
-    curl \
     libde265-0 \
     libexpat1 \
     libfontconfig1 \
@@ -200,11 +262,44 @@ RUN apt purge --allow-remove-essential -y \
     util-linux
 USER nginx
 
+# ***
+# *** pep — PEP runtime image (interactive) ***
+# ***
+FROM pep-base AS pep
+
+COPY misc/docker/nginx.conf /etc/nginx/nginx.conf
+COPY misc/config/common.conf /etc/nginx
+COPY misc/config/server_common.conf /etc/nginx
+COPY misc/config/asl.conf /etc/nginx
+COPY misc/config/proxy_headers.conf /etc/nginx
+RUN  rm /etc/nginx/conf.d/default.conf
+COPY prefix/conf/tls.p256.pem /etc/nginx
+# COPY libasl/fixtures/signer_cert.pem /etc/nginx
+# COPY libasl/fixtures/signer_key.pem /etc/nginx
+# COPY libasl/fixtures/issuer_cert.pem /etc/nginx
+# COPY libasl/fixtures/roots.json /etc/nginx
+COPY --from=build-pep /usr/src/ngx_pep/target/release/libngx_pep.so /etc/nginx/modules/
+COPY --from=build-pep /usr/src/ngx_pep/book/out /usr/share/nginx/html/doc
+# debian: OPENSSLDIR: "/usr/lib/ssl"
+COPY misc/docker/openssl.cnf /usr/lib/ssl/openssl.cnf
+# debian: MODULESDIR: "/usr/lib/x86_64-linux-gnu/ossl-modules"
+COPY --from=build-pep /usr/src/ngx_pep/target/release/libossl_hsm.so /usr/lib/x86_64-linux-gnu/ossl-modules
+
+COPY --from=headers-more /ngx_http_headers_more_filter_module.so /etc/nginx/modules/
+
+# ***
+# *** ci-pep — PEP runtime image (CI) ***
+# ***
+
+# gitlab-ci likes to build "local", so there is no ci-build-pep, see .gitlab-ci
+FROM pep-base AS ci-pep
+
 COPY misc/docker/nginx.conf /etc/nginx/nginx.conf
 RUN  rm /etc/nginx/conf.d/default.conf
 COPY misc/config/common.conf /etc/nginx
 COPY misc/config/server_common.conf /etc/nginx
 COPY misc/config/asl.conf /etc/nginx
+COPY misc/config/proxy_headers.conf /etc/nginx
 COPY prefix/conf/tls.p256.pem /etc/nginx
 # COPY libasl/fixtures/signer_cert.pem /etc/nginx
 # COPY libasl/fixtures/signer_key.pem /etc/nginx
@@ -216,6 +311,29 @@ COPY book/out /usr/share/nginx/html/doc
 COPY misc/docker/openssl.cnf /usr/lib/ssl/openssl.cnf
 # debian: MODULESDIR: "/usr/lib/x86_64-linux-gnu/ossl-modules"
 COPY target/release/libossl_hsm.so /usr/lib/x86_64-linux-gnu/ossl-modules
+
+# ***
+# *** hsm-sim — HSM Simulator (interactive) ***
+# ***
+
+FROM ${BASE_IMAGE_HSM_SIM} AS hsm-sim
+
+RUN apt-get update && \
+  DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+    libssl-dev \
+    && \
+  rm -rf /var/lib/apt/lists/*
+
+COPY --from=build-pep /usr/src/ngx_pep/target/release/hsm_sim /usr/local/bin/
+COPY hsm_sim/keys/ca.key /etc/hsm_sim/keys/
+COPY hsm_sim/keys/ca.crt /etc/hsm_sim/keys/
+
+ENTRYPOINT ["hsm_sim"]
+CMD ["--listen", "0.0.0.0:50051", "--keys-dir", "/etc/hsm_sim/keys/"]
+
+# ***
+# *** ci-hsm-sim — HSM Simulator (CI) ***
+# ***
 
 FROM ${BASE_IMAGE_HSM_SIM} AS ci-hsm-sim
 
@@ -233,93 +351,57 @@ COPY hsm_sim/keys/ca.crt /etc/hsm_sim/keys/
 ENTRYPOINT ["hsm_sim"]
 CMD ["--listen", "0.0.0.0:50051", "--keys-dir", "/etc/hsm_sim/keys/"]
 
-# local hsm-sim
-FROM ${BASE_IMAGE_HSM_SIM} AS hsm-sim
+# ***
+# *** nginx-ingress-base — nginx-ingress with some packages removed (for CVEs) ***
+# ***
 
-RUN apt-get update && \
-  DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-    libssl-dev \
-    && \
-  rm -rf /var/lib/apt/lists/*
+FROM ${BASE_IMAGE_INGRESS} AS nginx-ingress-base
+USER root
+RUN apt purge -y \
+    nginx-module-image-filter \
+    perl \
+    mount \
+    && apt autoremove -y && apt update && apt upgrade -y
+RUN apt purge --allow-remove-essential -y \
+    bash \
+    liblastlog2-2 \
+    libmount1 \
+    libuuid1 \
+    ncurses-base \
+    ncurses-bin \
+    perl-base \
+    util-linux
 
-COPY --from=local-build /usr/src/ngx_pep/target/release/hsm_sim /usr/local/bin/
-COPY hsm_sim/keys/ca.key /etc/hsm_sim/keys/
-COPY hsm_sim/keys/ca.crt /etc/hsm_sim/keys/
+USER nginx
 
-ENTRYPOINT ["hsm_sim"]
-CMD ["--listen", "0.0.0.0:50051", "--keys-dir", "/etc/hsm_sim/keys/"]
+# ***
+# *** nginx-ingress — nginx-ingress with headers-more and ossl_hsm (interactive) ***
+# ***
 
-# ci build; copy libossl_hsm.so from build context
-FROM ${BASE_IMAGE_INGRESS} AS ci-nginx-ingress
+FROM nginx-ingress-base AS nginx-ingress
+
+# debian: OPENSSLDIR: "/usr/lib/ssl"
+COPY misc/docker/openssl.cnf /usr/lib/ssl/openssl.cnf
+# debian: MODULESDIR: "/usr/lib/x86_64-linux-gnu/ossl-modules"
+COPY --from=build-pep /usr/src/ngx_pep/target/release/libossl_hsm.so \
+  /usr/lib/x86_64-linux-gnu/ossl-modules/libossl_hsm.so
+
+COPY --from=headers-more /ngx_http_headers_more_filter_module.so /etc/nginx/modules/
+
+# ***
+# *** ci-nginx-ingress — nginx-ingress with headers-more and ossl_hsm (CI) ***
+# ***
+
+FROM nginx-ingress-base AS ci-nginx-ingress
 
 # debian: OPENSSLDIR: "/usr/lib/ssl"
 COPY misc/docker/openssl.cnf /usr/lib/ssl/openssl.cnf
 # debian: MODULESDIR: "/usr/lib/x86_64-linux-gnu/ossl-modules"
 COPY target/release/libossl_hsm.so /usr/lib/x86_64-linux-gnu/ossl-modules/libossl_hsm.so
 
-# local, copy libossl_hsm.so from local-build stage
-FROM ${BASE_IMAGE_INGRESS} AS nginx-ingress
+COPY --from=headers-more /ngx_http_headers_more_filter_module.so /etc/nginx/modules/
 
-# debian: OPENSSLDIR: "/usr/lib/ssl"
-COPY misc/docker/openssl.cnf /usr/lib/ssl/openssl.cnf
-# debian: MODULESDIR: "/usr/lib/x86_64-linux-gnu/ossl-modules"
-COPY --from=local-build /usr/src/ngx_pep/target/release/libossl_hsm.so \
-  /usr/lib/x86_64-linux-gnu/ossl-modules/libossl_hsm.so
-
-# default target, i.e. for interactive usage, copy book and so. from local-build stage
-FROM ${BASE_IMAGE}
-
-USER root
-RUN apt purge -y \
-    curl \
-    libde265-0 \
-    libexpat1 \
-    libfontconfig1 \
-    libgcrypt20 \
-    libgd3 \
-    libheif1 \
-    libheif-plugin-dav1d \
-    libheif-plugin-libde265 \
-    libnghttp2-14 \
-    libtiff6 \
-    libxml2 \
-    nginx-module-image-filter \
-    nginx-module-njs \
-    nginx-module-xslt \
-    passwd \
-    && apt autoremove -y && apt update && apt upgrade -y
-RUN apt purge --allow-remove-essential -y \
-    apt \
-    bash \
-    debian-archive-keyring \
-    libapt-pkg7.0 \
-    liblastlog2-2 \
-    liblz4-1 \
-    libseccomp2 \
-    libsqlite3-0 \
-    libudev1 \
-    libuuid1 \
-    libxxhash0 \
-    ncurses-base \
-    ncurses-bin \
-    perl-base \
-    sqv \
-    util-linux
-USER nginx
-
-COPY misc/docker/nginx.conf /etc/nginx/nginx.conf
-COPY misc/config/common.conf /etc/nginx
-COPY misc/config/server_common.conf /etc/nginx
-COPY misc/config/asl.conf /etc/nginx
-RUN  rm /etc/nginx/conf.d/default.conf
-COPY prefix/conf/tls.p256.pem /etc/nginx
-# COPY libasl/fixtures/signer_cert.pem /etc/nginx
-# COPY libasl/fixtures/signer_key.pem /etc/nginx
-# COPY libasl/fixtures/issuer_cert.pem /etc/nginx
-# COPY libasl/fixtures/roots.json /etc/nginx
-COPY --from=local-build /usr/src/ngx_pep/target/release/libngx_pep.so /etc/nginx/modules/
-COPY --from=local-build /usr/src/ngx_pep/book/out /usr/share/nginx/html/doc
-# debian: OPENSSLDIR: "/usr/lib/ssl"
-COPY misc/docker/openssl.cnf /usr/lib/ssl/openssl.cnf
-# debian: MODULESDIR: "/usr/lib/x86_64-linux-gnu/ossl-modules"
-COPY --from=local-build /usr/src/ngx_pep/target/release/libossl_hsm.so /usr/lib/x86_64-linux-gnu/ossl-modules
+# ***
+# *** (default) — alias for pep (interactive) ***
+# ***
+FROM pep

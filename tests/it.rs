@@ -230,12 +230,32 @@ async fn popp_and_upstream_headers(
         target.clone(),
     )?
     .header("popp", &popp)
+    // A_25669-01 (ZETAP-992): client-supplied ZETA-* headers must be overwritten by the PEP, not
+    // cause a 500 (conflict) nor leak upstream. The decode/parse + cert/client_id assertions below
+    // would fail if any FAKE value survived.
+    .header("zeta-user-info", "FAKE_USER_INFO")
+    .header("zeta-client-data", "FAKE_CLIENT_DATA")
+    .header("zeta-popp-token-content", "FAKE_POPP_CONTENT")
+    // A_28439: an existing Forwarded element must be preserved and the PEP's own element appended.
+    .header("forwarded", "for=testclient;proto=https")
     .send()
     .await?;
 
     assert!(resp.status() == 200);
 
     let echo: Echo = resp.json().await?;
+
+    // A_28439: the PEP updates the Forwarded header (RFC 7239) — the client's element is kept and
+    // the PEP appends its own (by=_zetapep …).
+    let forwarded = &echo.headers["forwarded"];
+    assert!(
+        forwarded.starts_with("for=testclient;proto=https"),
+        "existing Forwarded element not preserved: {forwarded}"
+    );
+    assert!(
+        forwarded.contains("by=_zetapep"),
+        "PEP did not append its own Forwarded element: {forwarded}"
+    );
 
     // test headers passed to upstream
     let user_info: String = Base64::decode_vec(&echo.headers["zeta-user-info"])?.try_into()?;
@@ -286,6 +306,40 @@ async fn popp_and_upstream_headers(
         "zeta-client-data present when it shouldn't"
     );
 
+    // A_25669-01 (ZETAP-992): client-supplied ZETA-* headers must never reach the upstream
+    // unmodified, even on a location that does not set them itself: here PoPP is not required and
+    // client-data forwarding is off, so the PEP adds neither — both fake headers must be stripped,
+    // and the always-set zeta-user-info must be overwritten (not the fake value).
+    let resp = get_with_dpop(
+        &context.registration,
+        context.client.clone(),
+        &access_token,
+        target_without_client_data.clone(),
+    )?
+    .header("zeta-user-info", "FAKE_USER_INFO")
+    .header("zeta-client-data", "FAKE_CLIENT_DATA")
+    .header("zeta-popp-token-content", "FAKE_POPP_CONTENT")
+    .send()
+    .await?;
+
+    assert!(resp.status() == 200);
+
+    let echo: Echo = resp.json().await?;
+    assert!(
+        !echo.headers.contains_key("zeta-popp-token-content"),
+        "client-supplied zeta-popp-token-content leaked to upstream"
+    );
+    assert!(
+        !echo.headers.contains_key("zeta-client-data"),
+        "client-supplied zeta-client-data leaked to upstream (forwarding is off)"
+    );
+    assert!(
+        echo.headers
+            .get("zeta-user-info")
+            .is_some_and(|v| v != "FAKE_USER_INFO"),
+        "zeta-user-info not overwritten by PEP"
+    );
+
     // invalid actorId
     let now = get_current_timestamp();
     let iat = now;
@@ -317,6 +371,57 @@ async fn popp_and_upstream_headers(
     echo_sever.abort();
     let _ = echo_sever.await;
 
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn zeta_cause_proxy_intercepted(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    nginx.wait_ready().await?;
+    let echo_server = nginx.start_echo_server().await;
+
+    let target = nginx.url().await?.join("echo/proxy_error")?;
+    let access_token = context.access_token().await?;
+
+    let resp = get_with_dpop(
+        &context.registration,
+        context.client.clone(),
+        &access_token,
+        target.clone(),
+    )?
+    .send()
+    .await?;
+
+    // Upstream returned 200; pep must have replaced it with a 500 ZetaError::Proxy.
+    assert!(resp.status() == 500, "got status {}", resp.status());
+
+    // The upstream header itself must not be propagated.
+    assert!(resp.headers().get("zeta-cause").is_none());
+
+    // Read the body once, verify it does not leak the upstream body and is the Proxy JSON error.
+    let body = resp.bytes().await?;
+    assert!(
+        !body.windows(20).any(|w| w == b"SECRET_UPSTREAM_BODY"),
+        "upstream body leaked: {:?}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let error: HttpZetaErrorResponse = serde_json::from_slice(&body)?;
+    assert!(error.error == "Proxy", "got {:?}", error.error);
+    assert!(
+        error
+            .error_uri
+            .as_deref()
+            .is_some_and(|u| u.ends_with("/doc/errors/Proxy.html")),
+        "got error_uri {:?}",
+        error.error_uri
+    );
+
+    echo_server.abort();
+    let _ = echo_server.await;
     Ok(())
 }
 
@@ -481,10 +586,10 @@ async fn asl(#[future(awt)] context: &TestContext, #[future(awt)] nginx: NginxLe
         AslResponse::Body(_) => bail!("want error, got body"),
         AslResponse::Error(err) => bail!("want body, got asl error {err:?}"),
         AslResponse::HttpError(err) => {
-            assert!(err.error == "Internal");
+            assert!(err.error == "AccessToken");
             assert!(
                 err.error_description
-                    == Some("internal error: while decoding authorization token header".into())
+                    == Some("access token error: while decoding authorization token header".into())
             );
         }
     }
@@ -511,7 +616,7 @@ async fn asl(#[future(awt)] context: &TestContext, #[future(awt)] nginx: NginxLe
         None,
     )
     .await;
-    assert!(response.is_err_and(|e| e.to_string() == "inner status: 500 Internal Server Error"));
+    assert!(response.is_err_and(|e| e.to_string() == "inner status: 401 Unauthorized"));
 
     Ok(())
 }
@@ -997,5 +1102,270 @@ async fn asl_ocsp_stapling(
         ocsp.response_status
     );
 
+    Ok(())
+}
+
+/// A pep-protected proxy_pass location that omits `include proxy_headers.conf;` must be rejected
+/// with 500 (ProxyHeadersMissing) instead of forwarding the client's credentials unstripped.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_headers_enforcement(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    nginx.wait_ready().await?;
+    let _echo_server = nginx.start_echo_server().await;
+    let target = nginx.url().await?.join("echo-no-headers/")?;
+
+    let access_token = context.access_token().await?;
+    let resp = get_with_dpop(
+        &context.registration,
+        context.client.clone(),
+        &access_token,
+        target,
+    )?
+    .send()
+    .await?;
+
+    assert!(resp.status() == 500, "want 500, got {}", resp.status());
+    let error: HttpZetaErrorResponse = resp.json().await?;
+    assert!(
+        error.error == "ProxyHeadersMissing",
+        "want ProxyHeadersMissing, got {}",
+        error.error
+    );
+
+    Ok(())
+}
+
+/// ASL handler must not forward absolute inner requests (e.g. https://example.com or //example.com)
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn asl_no_absolute_inner(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    nginx.wait_ready().await?;
+
+    let target = nginx.url().await?;
+
+    let access_token = context.access_token().await?;
+
+    let (cid, mut state) = asl_handshake(
+        context.client.clone(),
+        &context.registration,
+        target.clone(),
+        &access_token,
+    )
+    .await?;
+
+    for inner_url in [
+        "https://example.com/",
+        "https://example.com/path",
+        "https://example.com/path/",
+        "//example.com",
+        "unix:/tmp",
+        &target.as_str().replacen("http:", "file:/", 1),
+        "http://127.0.0.1:1/",
+        "http://localhost:1/",
+    ] {
+        let inner_dpop = create_dpop_proof(
+            &context.registration,
+            "GET",
+            inner_url,
+            Some(&Base64UrlUnpadded::encode_string(&Sha256::digest(
+                &access_token,
+            ))),
+            None,
+        )?;
+
+        // locally parse the test url to construct the host header
+        let inner_url = reqwest::Url::options()
+            .base_url(Some(&target))
+            .parse(inner_url)?;
+        let host_port = format!(
+            "{}:{}",
+            target.host_str().context("host_str")?,
+            target
+                .port_or_known_default()
+                .context("port_or_known_default")?
+        );
+        let inner =
+            format!("GET {inner_url} HTTP/1.1\r\nhost: {host_port}\r\ndpop: {inner_dpop}\r\n\r\n")
+                .into_bytes();
+
+        let response = asl_request(
+            &context.registration,
+            context.client.clone(),
+            &access_token,
+            target.clone(),
+            &cid,
+            &mut state,
+            0,
+            &inner,
+            None,
+        )
+        .await?;
+
+        match response {
+            AslResponse::Body(_) => {
+                bail!("want asl error, got body")
+            }
+            AslResponse::Error(err) => {
+                assert!(err.error_code == 101);
+                // "… is not in origin-form" or "… is not relative to …"
+                assert!(
+                    err.error_message.starts_with(&format!(
+                        "bad request: error resolving request target: {inner_url} is not "
+                    )),
+                    "{}",
+                    err.error_message
+                );
+            }
+            AslResponse::HttpError(err) => bail!("want asl error, got http error {err:?}"),
+        }
+    }
+
+    Ok(())
+}
+
+/// ZF-0034: the client-chosen inner Host must not steer the loopback hop (nginx would otherwise
+/// build e.g. a directory-redirect Location from it); the PEP pins it to the outer request's Host.
+/// `/host` reflects the Host header the loopback hop arrived with (see ../misc/nginx.conf.tpl).
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn asl_inner_host_pinned(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    nginx.wait_ready().await?;
+
+    let target = nginx.url().await?;
+    let outer_host = format!(
+        "{}:{}",
+        target.host_str().context("host_str")?,
+        target
+            .port_or_known_default()
+            .context("port_or_known_default")?
+    );
+
+    let access_token = context.access_token().await?;
+
+    let (cid, mut state) = asl_handshake(
+        context.client.clone(),
+        &context.registration,
+        target.clone(),
+        &access_token,
+    )
+    .await?;
+
+    let url = target.join("host")?;
+    let ath = Base64UrlUnpadded::encode_string(&Sha256::digest(&access_token));
+    let inner_dpop =
+        create_dpop_proof(&context.registration, "GET", url.as_str(), Some(&ath), None)?;
+    // The client sets a bogus inner Host; the PEP must ignore it and pin the loopback hop to the
+    // outer Host. Built by hand (not encode_http_request_with_dpop) so there is exactly one,
+    // attacker-controlled, host header.
+    let inner = format!(
+        "GET {} HTTP/1.1\r\nhost: attacker.invalid\r\nauthorization: DPoP {access_token}\r\ndpop: {inner_dpop}\r\n\r\n",
+        url.path(),
+    )
+    .into_bytes();
+
+    let response = asl_request(
+        &context.registration,
+        context.client.clone(),
+        &access_token,
+        target.clone(),
+        &cid,
+        &mut state,
+        0,
+        &inner,
+        None,
+    )
+    .await?;
+
+    match response {
+        AslResponse::Body(body) => assert_eq!(String::from_utf8(body)?, outer_host),
+        response => bail!("want body (the outer host), got {response:?}"),
+    }
+
+    Ok(())
+}
+
+/// An origin-form inner target whose path looks like an absolute URL must still be sent to this
+/// PEP's own listener, never to the host named in the path. The echo server is reachable at
+/// http://127.1.33.7:{echo_port}/ directly; if the PEP resolved "/http://127.1.33.7:{echo_port}/"
+/// to that URL, the echo JSON would come back through the tunnel.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn asl_inner_target_stays_local(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    let echo_server = nginx.start_echo_server().await;
+    nginx.wait_ready().await?;
+
+    let target = nginx.url().await?;
+    let port = target.port_or_known_default().context("port")?;
+    let echo_port = port + 100; // see NginxLease::start_echo_server
+    let host_port = format!("{}:{port}", target.host_str().context("host_str")?);
+
+    let access_token = context.access_token().await?;
+    let ath = Base64UrlUnpadded::encode_string(&Sha256::digest(&access_token));
+
+    let (cid, mut state) = asl_handshake(
+        context.client.clone(),
+        &context.registration,
+        target.clone(),
+        &access_token,
+    )
+    .await?;
+
+    for (req_ctr, path) in [
+        format!("/http://127.1.33.7:{echo_port}/"),
+        format!("/http:127.1.33.7:{echo_port}/"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // nginx merges slashes in $uri (merge_slashes), and the PEP checks the DPoP htu against
+        // that normalized URI — sign what it will compare, so the request passes the PEP and
+        // reaches nginx's own (non-matching) location handling.
+        let htu = target.join(&path.replace("//", "/"))?;
+        let dpop = create_dpop_proof(&context.registration, "GET", htu.as_str(), Some(&ath), None)?;
+        let inner = format!(
+            "GET {path} HTTP/1.1\r\nhost: {host_port}\r\nauthorization: DPoP {access_token}\r\ndpop: {dpop}\r\n\r\n",
+        )
+        .into_bytes();
+
+        match asl_request(
+            &context.registration,
+            context.client.clone(),
+            &access_token,
+            target.clone(),
+            &cid,
+            &mut state,
+            req_ctr as u64,
+            &inner,
+            None,
+        )
+        .await
+        {
+            Ok(AslResponse::Body(body)) => bail!(
+                "{path}: inner request escaped the PEP's own listener: {}",
+                String::from_utf8_lossy(&body)
+            ),
+            // no location matches the path on the own listener
+            Err(err) => assert!(
+                err.to_string().contains("inner status: 404"),
+                "{path}: want inner 404, got {err:#}"
+            ),
+            Ok(response) => bail!("{path}: want inner 404, got {response:?}"),
+        }
+    }
+
+    echo_server.abort();
+    let _ = echo_server.await;
     Ok(())
 }

@@ -28,9 +28,9 @@ use anyhow::{Result, bail};
 use nginx_sys::{NGX_LOG_ERR, ngx_buf_t, ngx_chain_t, ngx_http_output_filter};
 use ngx::core::Status;
 use ngx::http::{HTTPStatus, Request};
-use ngx::ngx_log_error;
 use ngx_tickle::finalize_request;
 
+use crate::ngx_log_error;
 use crate::request_ops::RequestOps;
 
 /// A raw pointer to pool-allocated memory. Send+Sync is safe because nginx request
@@ -183,7 +183,8 @@ impl Response {
         }
     }
 
-    pub fn send(&self, request: &mut Request, finalization_status: Status) {
+    /// Send headers + body, caller must finalize afterwards.
+    pub fn send(&self, request: &mut Request) -> Status {
         request.set_status(self.status);
 
         let content_length = self.body.len();
@@ -195,27 +196,38 @@ impl Response {
             ngx_log_error!(
                 NGX_LOG_ERR,
                 request.log(),
-                "error setting content-type: {content_type} — {e}"
+                "error setting content-type: {content_type} — {e:?}"
             );
-            finalize_request(request, Status::NGX_ERROR);
+            return Status::NGX_ERROR;
         };
 
         let rc = request.send_header();
         if !rc.is_ok() {
             ngx_log_error!(NGX_LOG_ERR, request.log(), "error sending header — {rc:?}");
+            return rc;
+        }
+        match self.body.send(request) {
+            Ok(()) => Status::NGX_OK,
+            Err(e) => {
+                ngx_log_error!(NGX_LOG_ERR, request.log(), "error sending response — {e:?}");
+                Status::NGX_ERROR
+            }
+        }
+    }
+
+    /// Send headers + body, then finalize via posted event.
+    ///
+    /// Only for async contexts whose lifetime is anchored to the request pool.
+    /// Synchronous callers should use `send()` directly, then either return an rc
+    /// that triggers nginx to finalize (see `zeta_cause::header_filter`) or call
+    /// `ngx_http_finalize_request` themselves.
+    pub fn finalize(&self, request: &mut Request, finalize_status: Status) {
+        let rc = self.send(request);
+
+        if rc.is_ok() {
+            finalize_request(request, finalize_status);
+        } else {
             finalize_request(request, rc);
         }
-        let rc = self.body.send(request);
-
-        finalize_request(
-            request,
-            match rc {
-                Ok(()) => finalization_status,
-                Err(e) => {
-                    ngx_log_error!(NGX_LOG_ERR, request.log(), "error sending response — {e}");
-                    Status::NGX_ERROR
-                }
-            },
-        );
     }
 }

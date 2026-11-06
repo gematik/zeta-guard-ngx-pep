@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "asl"
-version = "1.0.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -1282,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "hsm_sim"
-version = "1.0.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2117,7 +2117,7 @@ dependencies = [
 
 [[package]]
 name = "ngx_pep"
-version = "1.0.1"
+version = "1.2.2"
 dependencies = [
  "ambassador",
  "anyhow",
@@ -2125,6 +2125,7 @@ dependencies = [
  "asn1-rs",
  "async-compat",
  "base64ct",
+ "bindgen",
  "cc",
  "const-oid",
  "der",
@@ -2387,7 +2388,7 @@ dependencies = [
 
 [[package]]
 name = "ossl_hsm"
-version = "1.0.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -2840,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "purl"
-version = "1.0.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "argp",

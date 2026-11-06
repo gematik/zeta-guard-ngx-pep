@@ -31,7 +31,7 @@ use std::{
     process::Stdio,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use schemars::schema::RootSchema;
 use schemars::visit::{Visitor, visit_schema_object};
 use serde::Serialize;
@@ -49,6 +49,7 @@ fn get_nginx_source_dir(build_dir: &Path) -> PathBuf {
 #[derive(Serialize)]
 struct ConfigFile {
     name: String,
+    pdp_host: String,
     libsuff: String,
     target: String,
     multi_process: bool,
@@ -68,8 +69,12 @@ struct ConfigFile {
 
 impl ConfigFile {
     fn new() -> Self {
+        println!("cargo:rerun-if-env-changed=IT_HOST");
         ConfigFile {
             name: "nginx".to_string(),
+            // fallback: the stage of the 1.2.x release line
+            pdp_host: env::var("IT_HOST")
+                .unwrap_or("zeta-12x.westeurope.cloudapp.azure.com".to_string()),
             #[cfg(target_os = "macos")]
             libsuff: "dylib".to_string(),
             #[cfg(not(target_os = "macos"))]
@@ -279,7 +284,6 @@ fn copy(source: &str, target: &str) -> Result<u64> {
     let source = Path::new(source);
     println!("cargo:rerun-if-changed={}", source.display());
     let target = Path::new(target);
-    println!("cargo:rerun-if-changed={}", target.display());
     fs::copy(source, target).context(format!("copy {} {}", source.display(), target.display()))
 }
 
@@ -309,7 +313,108 @@ fn copy_aslkeys() -> Result<()> {
         "misc/config/server_common.conf",
         "prefix/conf/server_common.conf",
     )?;
+    println!("cargo:rerun-if-changed=misc/config/proxy_headers.conf");
+    copy(
+        "misc/config/proxy_headers.conf",
+        "prefix/conf/proxy_headers.conf",
+    )?;
 
+    Ok(())
+}
+
+/// Generate Rust bindings for the (built-in) proxy module's per-location config struct.
+///
+/// We only emit `ngx_http_proxy_loc_conf_t` (+ its two proxy-local helper structs and the
+/// `ngx_http_proxy_module` symbol); every other field type is reused from `nginx_sys` via
+/// `allowlist_recursively(false)` + `use nginx_sys::*`. That keeps `ngx_hash_t` etc. identical
+/// to what `ngx_hash_find` expects, and — crucially — outsources the feature-macro-dependent
+/// layout of the embedded `ngx_http_upstream_conf_t` (which fixes the offset of `headers`) to
+/// nginx-sys, which derived it from this same configured source tree. We feed bindgen the exact
+/// include paths nginx-sys used (`DEP_NGINX_INCLUDE`), so `objs/ngx_auto_config.h` supplies the
+/// same `NGX_HTTP_*` defines. A layout/field change on an nginx bump surfaces as a compile error
+/// in `src/proxy_conf.rs`, not silent UB.
+fn generate_proxy_binding() -> Result<()> {
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+    let include =
+        env::var("DEP_NGINX_INCLUDE").context("DEP_NGINX_INCLUDE not exported by nginx-sys")?;
+
+    let mut clang_args: Vec<String> = env::split_paths(&include)
+        .map(|p| format!("-I{}", p.display()))
+        .collect();
+    // The header lives in src/http/modules; ALL_INCS already lists it, but be explicit.
+    let build_dir = PathBuf::from(env::var("DEP_NGINX_BUILD_DIR")?);
+    let modules = get_nginx_source_dir(&build_dir).join("src/http/modules");
+    clang_args.push(format!("-I{}", modules.display()));
+
+    let bindings = bindgen::Builder::default()
+        .header_contents("proxy_wrapper.h", "#include <ngx_http_proxy_module.h>\n")
+        .clang_args(&clang_args)
+        .allowlist_type("ngx_http_proxy_loc_conf_t")
+        .allowlist_type("ngx_http_proxy_headers_t")
+        .allowlist_type("ngx_http_proxy_vars_t")
+        .allowlist_var("ngx_http_proxy_module")
+        // do not regenerate the core ngx_* types — reuse nginx-sys' (identical, and correctly
+        // laid out for this build's feature macros). The including module (src/proxy_conf.rs)
+        // supplies `use nginx_sys::*;` so the unqualified field types resolve.
+        .allowlist_recursively(false)
+        .layout_tests(false)
+        .use_core()
+        .generate()
+        .map_err(|e| anyhow::anyhow!("bindgen ngx_http_proxy_module.h: {e}"))?;
+
+    bindings.write_to_file(out_dir.join("proxy_bindings.rs"))?;
+    println!(
+        "cargo:rerun-if-changed={}",
+        modules.join("ngx_http_proxy_module.h").display()
+    );
+    Ok(())
+}
+
+fn generate_openssl_cnf() -> Result<()> {
+    let target_dir = PathBuf::from(env::var("OUT_DIR")?)
+        .join("..")
+        .join("..")
+        .join("..")
+        .canonicalize()?;
+    let text = format!(
+        "\
+        openssl_conf = openssl_init \n\
+        \n\
+        [openssl_init]\n\
+        providers = provider_sect\n\
+        \n\
+        [provider_sect]\n\
+        ossl_hsm = ossl_hsm_sect\n\
+        default = default_sect\n\
+        \n\
+        [ossl_hsm_sect]\n\
+        module = {}/libossl_hsm.so\n\
+        activate = 1\n\
+        \n\
+        [default_sect]\n\
+        activate = 1\n\
+        ",
+        target_dir.display()
+    );
+    let target = target_dir.join("openssl.cnf");
+    fs::write(&target, &text)?;
+    Ok(())
+}
+
+fn run_xtask_check() -> Result<()> {
+    println!("cargo:rerun-if-env-changed=NGINX_VERSION");
+    println!("cargo:rerun-if-env-changed=NGX_CONFIGURE_ARGS");
+
+    // can't do cargo xtask configure automatically — when this is run, nginx-sys is already built
+    // instead, bail and instruct the user to run it
+    let status = Command::new("/usr/bin/env")
+        .arg("sh")
+        .arg("-c")
+        .arg("cargo xtask check")
+        .status()?;
+    if !status.success() {
+        bail!("cargo xtask check failed. Run `cargo xtask configure` and try again")
+    }
     Ok(())
 }
 
@@ -321,10 +426,13 @@ fn main() -> Result<()> {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-undefined,dynamic_lookup");
     }
 
+    run_xtask_check()?;
     make_install()?;
+    generate_proxy_binding()?;
     generate_schema()?;
     generate_book()?;
     copy_aslkeys()?;
+    generate_openssl_cnf()?;
 
     println!("cargo::rustc-check-cfg=cfg(coverage)");
     Ok(())

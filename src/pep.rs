@@ -35,7 +35,6 @@ use jsonwebtoken::{Algorithm, TokenData};
 use jsonwebtoken::{Validation, decode};
 use jsonwebtoken::{decode_header, get_current_timestamp};
 use ngx::ffi::*;
-use ngx::ngx_log_error;
 use ngx::{
     core::Status,
     http::{HTTPStatus, HttpModuleLocationConf, Request},
@@ -44,11 +43,10 @@ use ngx_tickle::RequestSpawn;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::ModuleCtx;
 use crate::error::{ZetaError, ZetaResult};
 use crate::headers::{
-    ensure_api_version_header_out, ensure_client_data_header_in, ensure_popp_token_header_in,
-    ensure_user_info_header_in,
+    ensure_api_version_header_out, ensure_client_data_header_in, ensure_forwarded_header_in,
+    ensure_popp_token_header_in, ensure_user_info_header_in,
 };
 use crate::jwk_cache::JwkCacheOps;
 use crate::request_ops::{ConfigOps, RequestOps, normalized_uri};
@@ -58,6 +56,7 @@ use crate::typify::{
 };
 use crate::zeta_bail;
 use crate::{Module, zeta_anyhow};
+use crate::{ModuleCtx, ngx_log_error};
 use crate::{
     conf::{LocationConfig, MainConfig},
     jwk_cache::jwk_cache,
@@ -71,13 +70,26 @@ async fn verify_access_token(
     now: u64,
     client_ip: Option<String>,
 ) -> ZetaResult<TokenData<AccessTokenPayload>> {
-    let header = decode_header(token).context("while decoding authorization token header")?;
-    let kid = header.kid.ok_or_else(|| anyhow!("no kid"))?;
-    if header.alg != Algorithm::ES256 {
+    let header = decode_header(token).map_err(|e| {
+        ZetaError::AccessToken(
+            anyhow::Error::new(e).context("while decoding authorization token header"),
+        )
+    })?;
+    let kid = header
+        .kid
+        .ok_or_else(|| ZetaError::AccessToken(anyhow!("no kid")))?;
+    if header.alg != Algorithm::ES256 && header.alg != Algorithm::ES384 {
         return Err(ZetaError::AccessToken(anyhow!(
             "unsupported token alg {:?}",
             header.alg
         )));
+    }
+
+    match header.typ.as_deref() {
+        Some("JWT" | "at+jwt") => {}
+        _ => {
+            zeta_bail!(AccessTokenInvalid, "invalid typ={:?}", header.typ)
+        }
     }
 
     let jwk = jwk_cache().get_jwk_pdp(kid, client_ip).await?;
@@ -91,7 +103,7 @@ async fn verify_access_token(
     let key = DecodingKey::from_jwk(&jwk).context("while constructing DecodingKey from jwk")?;
 
     // validate
-    let mut validation = Validation::new(Algorithm::ES256);
+    let mut validation = Validation::new(header.alg);
     // we will validate aud ourselves below
     validation.validate_aud = false;
     validation.set_issuer(&[main_config.pdp_issuer.clone().expect("issuer")]);
@@ -99,7 +111,6 @@ async fn verify_access_token(
 
     validation.leeway = location_config.leeway().as_secs();
     validation.validate_nbf = true; // if present, but don't require nbf
-    log_debug!("at: {validation:?}");
 
     // NOTE: can't provide or get the timestamp used by jsonwebtoken, but we need to validate
     // iat ourselves. Technically, if both nbf and iat are provided and the validation happens
@@ -397,9 +408,17 @@ fn verify_client_ip(
 }
 
 async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<()> {
+    // Fail fast (and loudly) if a proxied location didn't pull in `proxy_headers.conf`: the PEP
+    // relies on its `proxy_set_header … ""` strips to keep client credentials from leaking
+    // upstream, and there is no point authorizing a request we'd then forward unsafely.
+    if request.proxy_strips_present() == Some(false) {
+        return Err(ZetaError::ProxyHeadersMissing);
+    }
+
     let now = get_current_timestamp();
 
     ensure_api_version_header_out(request)?;
+
     let main_config = request.main_config()?;
     let location_config = request.location_config()?;
 
@@ -493,6 +512,9 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
 
     ensure_user_info_header_in(request, &user_info)?;
 
+    // A_28439: update the Forwarded header (RFC 7239) on the request forwarded upstream.
+    ensure_forwarded_header_in(request)?;
+
     Ok(())
 }
 
@@ -513,7 +535,7 @@ pub fn handler(request: &mut Request) -> Status {
 
                         match response {
                             Ok(response) => {
-                                response.send(request, Status::NGX_ERROR);
+                                response.finalize(request, Status::NGX_ERROR);
                                 Status::NGX_ERROR
                             }
                             Err(e) => {
@@ -594,6 +616,7 @@ mod tests {
                 profession_oid: "profession_oid".to_string(),
                 scope: None,
                 sub: "sub".to_string(),
+                sid: "sid".to_string(),
             }
         }
     }
@@ -635,6 +658,39 @@ mod tests {
         let result =
             verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None).await;
         assert!(result.is_ok());
+
+        // typ
+
+        for (typ, ex) in [
+            ("JWT", true),
+            ("jwt", false),
+            ("at+jwt", true),
+            ("inval", false),
+        ] {
+            let mut header = Header::new(Algorithm::ES256);
+            header.typ = Some(typ.to_string());
+
+            let token = make_jwt(
+                header,
+                AccessTokenPayload {
+                    ..Default::default()
+                },
+            );
+            let result =
+                verify_access_token(&request_mock.mcfg, &request_mock.lcfg, &token, now, None)
+                    .await;
+            if ex {
+                assert!(result.is_ok(), "typ={typ} should be valid");
+            } else {
+                assert!(
+                    result
+                        .as_ref()
+                        .is_err_and(|e| matches!(e, ZetaError::AccessTokenInvalid { .. })),
+                    "typ={typ} should get ZetaError::AccessTokenInvalid but got {:?}",
+                    result
+                );
+            }
+        }
 
         // aud
         // tolerate extra auds

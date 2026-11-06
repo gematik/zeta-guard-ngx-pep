@@ -456,7 +456,6 @@ pub async fn nginx() -> NginxLease {
 
 pub struct TestContext {
     pub client: Client,
-    pub auth_url: Url,
     pub token_url: Url,
     pub nonce_url: Url,
     pub registration: ClientRegistration,
@@ -479,16 +478,19 @@ impl TestContext {
 
         let registration_url =
             auth_url.join("realms/zeta-guard/clients-registrations/openid-connect/")?;
-        let token_url = auth_url.join("realms/zeta-guard/protocol/openid-connect/token/")?;
+        let token_url = auth_url.join("realms/zeta-guard/protocol/openid-connect/token")?;
         let nonce_url = auth_url.join("realms/zeta-guard/zeta-guard-nonce")?;
         let registration = register_client(registration_url.clone(), &client).await?;
         Ok(TestContext {
             client,
-            auth_url,
             token_url,
             nonce_url,
             registration,
         })
+    }
+
+    pub fn it_host(&self) -> String {
+        env::var("IT_HOST").expect("IT_HOST")
     }
 
     pub fn it_p12(&self) -> PathBuf {
@@ -505,7 +507,7 @@ impl TestContext {
         let smcb = create_smcb_token(
             &self.it_p12(),
             &self.it_p12_pass(),
-            self.auth_url.clone(),
+            self.token_url.clone(),
             nonce.clone(),
             &self.registration,
         )
@@ -513,6 +515,7 @@ impl TestContext {
 
         exchange_access_token(
             self.token_url.clone(),
+            self.it_host(),
             nonce,
             &self.registration,
             &smcb,

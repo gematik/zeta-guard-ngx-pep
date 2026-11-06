@@ -278,7 +278,7 @@ pub async fn read_smcb_p12(p12_path: &Path, p12_pass: &str) -> Result<(Vec<u8>, 
 pub async fn create_smcb_token(
     p12_path: &Path,
     p12_pass: &str,
-    auth_url: Url,
+    token_url: Url,
     nonce: String,
     registration: &ClientRegistration,
 ) -> Result<String> {
@@ -295,6 +295,11 @@ pub async fn create_smcb_token(
     header.typ = Some("JWT".to_string());
     header.x5c = Some(vec![ee_encoded]);
 
+    // the registered client key, which also signs the DPoP proofs; Keycloak (since 1.2.3) requires
+    // the subject token to bind both
+    let jwk = Jwk::from_encoding_key(&KEY, Algorithm::ES256)?;
+    let thumbprint = jwk.thumbprint(jsonwebtoken::jwk::ThumbprintHash::SHA256);
+
     let now = get_current_timestamp();
     let id = json!({
         "jti": Uuid::new_v4().to_string(),
@@ -302,12 +307,17 @@ pub async fn create_smcb_token(
         "iss": registration.client_id,
         "azp": "target-client",
         "sub": reg_nr,
-        "aud": [
-            auth_url.to_string()
-        ],
+        // oauth authorization server / token_endpoint
+        "aud": token_url.to_string(),
         "exp": now + 60,
         "iat": now,
         "nonce": nonce,
+        "client_key": {
+            "jkt": thumbprint,
+        },
+        "dpop_key": {
+            "jkt": thumbprint,
+        }
     });
 
     sign_jwt_brainpool(&header, &id, &key)
@@ -455,6 +465,7 @@ async fn create_client_assertion(
 
 pub async fn exchange_access_token(
     token_url: Url,
+    host: String,
     nonce: String,
     registration: &ClientRegistration,
     smcb: &str,
@@ -479,6 +490,18 @@ pub async fn exchange_access_token(
         "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
     );
     fields.insert("client_assertion", &client_assertion);
+
+    // oauth protected resource / resource -> wird von OPA geprüft
+    let opr: Url = format!("https://{}", host).parse()?;
+    let opr = opr.join("/.well-known/oauth-protected-resource")?;
+    let opr: Value = client.get(opr).send().await?.json().await?;
+    let resource = opr
+        .get("resource")
+        .expect("resource")
+        .as_str()
+        .expect("str");
+
+    fields.insert("audience", resource);
 
     let dpop = create_dpop_proof(registration, "POST", token_url.as_str(), None, None)?;
 

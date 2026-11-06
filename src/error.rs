@@ -55,6 +55,13 @@ pub enum ZetaError {
     },
     #[error("Impossible Travel: {0}")]
     ImpossibleTravel(#[source] anyhow::Error),
+    #[error("upstream proxy signaled error: {0}")]
+    Proxy(#[source] anyhow::Error),
+    #[error(
+        "proxy headers not configured for this location: `include proxy_headers.conf;` is \
+         missing (or was clobbered by a location-level `proxy_set_header`)"
+    )]
+    ProxyHeadersMissing,
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -83,6 +90,8 @@ impl ZetaError {
             Self::PoPPMissing => 400,
             Self::PoPPInvalidActor { .. } => 403,
             Self::ImpossibleTravel(_) => 401,
+            Self::Proxy(_) => 500,
+            Self::ProxyHeadersMissing => 500,
             Self::Internal(_) => 500,
         }
     }

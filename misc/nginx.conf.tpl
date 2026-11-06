@@ -36,10 +36,8 @@ http \{
 
     ### Global Config
 
-    # pep_pdp_issuer http://localhost:18080/realms/zeta-guard;
-    pep_pdp_issuer https://zeta-cd.westeurope.cloudapp.azure.com/auth/realms/zeta-guard;
-    # pep_pdp_issuer https://zeta-dev.westeurope.cloudapp.azure.com/auth/realms/zeta-guard;
-    # pep_pdp_issuer https://zeta-staging.spree.de/auth/realms/zeta-guard;
+    # pdp_host: IT_HOST at build time (see build.rs)
+    pep_pdp_issuer https://{pdp_host}/auth/realms/zeta-guard;
     ## server hosting PoPP entity statement at /.well-known/openid-federation
     ## optional if no locations use pep_require_popp
     pep_popp_issuer http://localhost:{port};
@@ -73,8 +71,8 @@ http \{
     pep on;
     ## space separated list of required audiences
     # pep_require_aud "http://localhost:18080";
-    pep_require_aud "https://zeta-cd.westeurope.cloudapp.azure.com";
-    # pep_require_aud "https://zeta-dev.westeurope.cloudapp.azure.com";
+    # pep_require_aud "https://node.k3s.internal";
+    pep_require_aud "https://{pdp_host}";
     # pep_require_aud "https://zeta-staging.spree.de";
 
     ## space separated list of required scopes
@@ -114,6 +112,7 @@ http \{
         server_name localhost;
 
         location /proxy/ \{
+            include proxy_headers.conf;
             proxy_http_version 1.1;
             proxy_pass "http://localhost:8001/";
         }
@@ -151,9 +150,15 @@ http \{
           alias html/empty.json;
           pep_require_popp on;
         }
+        ## see asl_inner_host_pinned: reflects the Host header the loopback hop arrived with
+        location = /host \{
+          default_type text/plain;
+          return 200 "$http_host";
+        }
 
         ## see tests/common/echo.rs
         location /echo/ \{
+          include proxy_headers.conf;
           proxy_http_version 1.1;
           proxy_pass "http://127.1.33.7:{echo_port}/";
 
@@ -163,6 +168,9 @@ http \{
           }
 
           location /echo/ws/ \{
+            # this location declares its own proxy_set_header, which (non-additively) drops the
+            # inherited proxy_headers.conf — so re-include it here, or the PEP returns 500.
+            include proxy_headers.conf;
             proxy_pass "http://127.1.33.7:{echo_port}/ws/";
 
             proxy_set_header Upgrade $http_upgrade;
@@ -170,9 +178,17 @@ http \{
           }
         }
         location /echo-with-popp/ \{
+          include proxy_headers.conf;
           proxy_pass "http://127.1.33.7:{echo_port}/";
           pep_require_popp on;
           pep_forward_client_data on;
+        }
+        ## DELIBERATELY misconfigured: a pep-protected proxy_pass location that forgot to
+        ## `include proxy_headers.conf;`. The PEP must reject requests here with 500
+        ## (ProxyHeadersMissing) rather than forward credentials unstripped. See the
+        ## proxy_headers_enforcement integration test.
+        location /echo-no-headers/ \{
+          proxy_pass "http://127.1.33.7:{echo_port}/";
         }
     }
 }

@@ -265,6 +265,20 @@
     },
     {
       "vulnerability": {
+        "name": "CVE-2026-5958"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/sed"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "sed wird von keinem im PEP ausgeführten Prozess verwendet.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
         "name": "CVE-2026-27456"
       },
       "products": [
@@ -287,8 +301,108 @@
           "@id": "pkg:deb/debian/mount"
         }
       ],
-      "status": "under_investigation",
-      "timestamp": "2026-04-28T10:31:00Z"
+      "status": "not_affected",
+      "status_notes": "Es gibt keinen Eintrag in /etc/fstab. Daher kann der Angreifer die Schwachstelle nicht ausnutzen (s. https://nvd.nist.gov/vuln/detail/CVE-2026-27456). Ein Angreifer bräuchte zusätzlich Zugriff auf eine Shell/Terminal.",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-34743"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/liblzma5"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "liblzma wird von keinem im PEP ausgeführten Prozess verwendet.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-29111"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libsystemd0"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "systemd läuft im Container nicht als PID 1.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-40225"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libsystemd0"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "systemd läuft im Container nicht als PID 1.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-40226"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libsystemd0"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "systemd läuft im Container nicht als PID 1.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2025-69720"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libtinfo6"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft infocomp, was im PIP nicht vorhanden ist.",
+      "justification": "vulnerable_code_not_present",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-5704"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/tar"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Tar wird von keinem im PEP ausgeführten Prozess verwendet. Für das Ausnutzen der Schwachstelle bräuchte ein Angreifer Zugriff auf eine Shell/Terminal.",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-05-11T14:50:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-27171"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/zlib1g"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die betroffenen funktionen crc32_combine64 und crc32_combine_gen64 werden in keinem im PEP ausgeführten Prozess verwendet.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-11T14:50:00Z"
     },
     {
       "vulnerability": {
@@ -296,14 +410,13 @@
       },
       "products": [
         {
-          "@id": "pkg:deb/debian/libc-bin"
-        },
-        {
           "@id": "pkg:deb/debian/libc6"
         }
       ],
-      "status": "under_investigation",
-      "timestamp": "2026-04-28T10:31:00Z"
+      "status": "not_affected",
+      "status_notes": "Die betroffenen Funktionen gethostbyaddr und gethostbyaddr_r werden in keiner Nginx-Binary oder Nginx-Modul geladen. Durchsucht wurden '/usr/sbin/nginx' '/usr/lib/nginx/modules/' '/etc/nginx/modules/'. Keine Systembibliothek lädt ein der betroffenen Funktionen von libc6. Verifiziert mithilfe von von nm -D, ldd und grep -aF.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-21T15:09:00Z"
     },
     {
       "vulnerability": {
@@ -311,18 +424,66 @@
       },
       "products": [
         {
-          "@id": "pkg:deb/debian/libc-bin"
-        },
-        {
           "@id": "pkg:deb/debian/libc6"
         }
       ],
-      "status": "under_investigation",
-      "timestamp": "2026-04-28T10:31:00Z"
+      "status": "not_affected",
+      "status_notes": "Die betroffenen Funktionen gethostbyaddr und gethostbyaddr_r werden in keiner Nginx-Binary oder Nginx-Modul geladen. Durchsucht wurden '/usr/sbin/nginx' '/usr/lib/nginx/modules/' '/etc/nginx/modules/'. Keine Systembibliothek lädt ein der betroffenen Funktionen von libc6. Verifiziert mithilfe von von nm -D, ldd und grep -aF.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-21T15:09:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-5435"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc6"
+        },
+        {
+          "@id": "pkg:deb/debian/libc-bin"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die betroffenen Funktionen ns_printrrf, ns_printrr und fp_nquery werden in keiner Nginx-Binary oder Nginx-Modul geladen. Durchsucht wurden '/usr/sbin/nginx' '/usr/lib/nginx/modules/' '/etc/nginx/modules/'. Keine Systembibliothek lädt ein der betroffenen Funktionen von libc6. Verifiziert mithilfe von von nm -D, ldd und grep -aF.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-21T15:09:00Z"
     },
     {
       "vulnerability": {
         "name": "CVE-2026-5450"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc6"
+        },
+        {
+          "@id": "pkg:deb/debian/libc-bin"
+        }
+      ],
+      "status": "affected",
+      "status_notes": "Eine Funktion der scanf-Familie wird in diversen Executables und Libraries importiert. Dabei ist unklar, ob %mc verwendet wird. Dies ist notwendig, um die Schwachstellen ausnutzen zu können. Es kann daher nicht ausgeschlossen werden, dass eine der Executables oder Libraries betroffen ist. Für das Ausnutzen der Schwachstelle müsste der Angreifer den Input kontrollieren und die Executable aufrufen oder die betroffene Libary-Funktion triggern. Das einzige nginx-bezogene Finding von scanf ist in /usr/lib/nginx/modules/ngx_otel_module.so. Dort wird sscanf() verwendet, allerdings nicht mit %mc. Die Schwachstelle wird von der NVD als Critical eingestuft (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H). Doch Red Hat bietet eine gut begründete Analyse (https://access.redhat.com/security/cve/cve-2026-5450), durch die diese Schwachstelle eine Kritikalität einen CVSS3.1-Score von 5 (Medium) erhält (CVSS:3.1/AV:L/AC:H/PR:L/UI:R/S:U/C:N/I:L/A:H).",
+      "timestamp": "2026-05-21T15:09:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-5928"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libc6"
+        },
+        {
+          "@id": "pkg:deb/debian/libc-bin"
+        }
+      ],
+      "status": "affected",
+      "status_notes": "Die Funktion ungetwc wird von libstdc++ geladen, welche wiederum vom /usr/lib/nginx/modules/ngx_otel_module.so geladen wird. Ob es einen Pfad von den importierten Funktion aus libstdc++ zur betroffenen Funktion ungetwc gibt, ist unklar. Daher kann daher nicht ausgeschlossen werden, dass die Schwachstelle theoretisch ausnutzbar ist. Die Schwachstelle wird von der NVD als High eingestuft (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H). Doch Red Hat bietet eine Analyse (https://access.redhat.com/security/cve/cve-2026-5450), durch die diese Schwachstelle eine Kritikalität einen CVSS3.1-Score von 5 (Medium) erhält (CVSS:3.1/AV:L/AC:H/PR:L/UI:R/S:U/C:L/I:N/A:H).",
+      "timestamp": "2026-05-21T15:09:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-6238"
       },
       "products": [
         {
@@ -332,8 +493,318 @@
           "@id": "pkg:deb/debian/libc6"
         }
       ],
-      "status": "under_investigation",
-      "timestamp": "2026-04-28T10:31:00Z"
+      "status": "not_affected",
+      "status_notes": "Die betroffenen Funktionen ns_printrrf, ns_printrr und fp_nquery werden in keiner Nginx-Binary oder Nginx-Modul geladen. Durchsucht wurden '/usr/sbin/nginx' '/usr/lib/nginx/modules/' '/etc/nginx/modules/'. Keine Systembibliothek lädt ein der betroffenen Funktionen von libc6. Verifiziert mithilfe von von nm -D, ldd und grep -aF.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-21T15:09:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-42250"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libbz2-1.0"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Das Tool bzip2recover, in dem die Schwachstelle besteht, wird nicht im Image nicht verwendet. Für einen erfolgreichen Angriff müsste ein Angreifer bzip2recover auf eine von ihm kontrollierte Datei aufrufen können. Ein Angreifer bräuchte Zugriff auf eine Shell/Terminal.",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-05-21T15:09:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-3184"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/bsdutils"
+        },
+        {
+          "@id": "pkg:deb/debian/libblkid1"
+        },
+        {
+          "@id": "pkg:deb/debian/libmount1"
+        },
+        {
+          "@id": "pkg:deb/debian/libsmartcols1"
+        },
+        {
+          "@id": "pkg:deb/debian/login"
+        },
+        {
+          "@id": "pkg:deb/debian/mount"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Es ist nur das Tool login betroffen. Diese Schwachstelle wurde von Red Hat mit dem CVSS3.1-Score 3.7 (Low) bewertet (CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:L/A:N).",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-05-21T15:09:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-54369"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libacl1"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "libacl ist im Base-Image vorhanden und wird nur von OS-Utilities (cp/mv/install/tar/sed) importiert, die im PEP-Betrieb nicht ausgeführt werden. Keines der acl-importierenden Binaries ist setuid. nginx und libngx_pep.so nutzen libacl nicht. Ausnutzung erfordert einen privilegierten Aufruf auf angreiferkontrollierten Pfaden — im PEP-Laufzeitkontext nicht gegeben.",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-06-30T08:24:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-33630"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libcares2"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft die Bibliothek libcares2. Im Image hängt einzig das Modul ngx_otel_module.so (nginx-module-otel) von libcares2 ab; keine weitere ELF-Datei linkt gegen die Bibliothek. c-ares wird für DNS-Auflösung von gRPC-Endpoint-Namen verwendet. Die Schwachstelle ist damit nicht ausnutzbar, da ein Angreifer nicht den aufzulösenden Namen beeinflussen (nginx.conf Eintrag `otel_exporter.endpoint`).",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-07-10T09:38:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-69184"
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libcares2"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft die Bibliothek libcares2. Im Image hängt einzig das Modul ngx_otel_module.so (nginx-module-otel) von libcares2 ab; keine weitere ELF-Datei linkt gegen die Bibliothek. c-ares wird für DNS-Auflösung von gRPC-Endpoint-Namen verwendet. Die Schwachstelle ist damit nicht ausnutzbar, da ein Angreifer nicht den aufzulösenden Namen beeinflussen (nginx.conf Eintrag `otel_exporter.endpoint`).",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-08-19T15:37:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-69184",
+        "aliases": [
+          "TEMP-0000000-191FEB",
+          "GHSA-pjmc-gx33-gc76"
+        ]
+      },
+      "products": [
+        {
+          "@id": "pkg:deb/debian/libcares2"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle betrifft die Bibliothek libcares2. Im Image hängt einzig das Modul ngx_otel_module.so (nginx-module-otel) von libcares2 ab; keine weitere ELF-Datei linkt gegen die Bibliothek. c-ares wird für DNS-Auflösung von gRPC-Endpoint-Namen verwendet. Die Schwachstelle ist damit nicht ausnutzbar, da ein Angreifer nicht den aufzulösenden Namen beeinflussen (nginx.conf Eintrag `otel_exporter.endpoint`).",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-07-10T09:38:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-46600",
+        "aliases": [
+          "GO-2026-5942"
+        ]
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/golang.org/x/net"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle liegt im Parsen ungültiger SVCB-/HTTPS-Resource-Records in golang.org/x/net/dns/dnsmessage (https://pkg.go.dev/vuln/GO-2026-5942). Die betroffenen Symbole werden allerdings in der Anwendung nicht verwendet. Verifiziert über die ELF-Section 'pclntab' der Go-Binaries '/nginx-ingress' und '/usr/bin/nginx-agent' und mit govulncheck.",
+      "justification": "component_not_present",
+      "timestamp": "2026-07-24T11:22:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-56852",
+        "aliases": [
+          "GO-2026-5970"
+        ]
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/golang.org/x/text"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "DoS-Endlosschleife in golang.org/x/text/unicode/norm (norm.Iter) bei ungültigem UTF-8-Input (https://pkg.go.dev/vuln/GO-2026-5970). govulncheck (Source-Mode, gesamtes Modul github.com/nginx/kubernetes-ingress) meldet als einzigen erreichbaren Pfad zu den verwundbaren Symbolen die IDNA-Normalisierung der Ziel-Authority beim HTTP/2-Request: internal/nginx.verifyClient.GetConfigVersion (verify.go:49) -> http.Client.Do -> x/net/http2.authorityAddr -> idna.ToASCII -> norm.Form.*. Die dabei normalisierte Authority ist der in verify.go:44 fest kodierte Host 'config-version' (der Client dialt fest den Unix-Socket /var/lib/nginx/nginx-config-version.sock). Es fließt kein angreiferkontrollierter und kein ungültiger UTF-8-Input in norm. Die Trigger-Bedingung der Schwachstelle kann nie erfüllt werden. Allgemein normalisiert IDNA ausschließlich Verbindungs-Hostnamen aus Konfiguration/Cluster, nie eingehende Request-Daten.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-07-24T12:45:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "GHSA-hrxh-6v49-42gf"
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/google.golang.org/grpc"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die relevante der drei in GHSA-hrxh-6v49-42gf gebündelten Schwachstellen ist die HTTP/2 Rapid Reset / Control Buffer Flooding (DoS) in internal/transport. Die beiden xDS-RBAC-Schwachstellen sind mangels Nutzung von internal/xds/rbac irrelevant. Der Rapid-Reset-DoS ist nur gegen einen gRPC-Server ausnutzbar, der Streams von untrusted Clients annimmt. Das Go-Binary '/nginx-ingress' lauscht ausschließlich auf HTTP-Endpunkten (Prometheus-Metrics :9113, Readiness/Health :8081), die Ports :80/:443/:8080 werden vom NGINX-Prozess bedient. Ein lauschender gRPC-Server existiert nicht. grpc-go wird ausschließlich als ausgehender OTLP-Trace-Client zu einem vertrauenswürdigen Collector verwendet. Der verwundbare Code-Pfad liegt damit nicht im erreichbaren Ausführungspfad.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-07-24T11:22:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-27145"
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/stdlib"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die betroffenen drei Funktionen werden im aus dem Paket net/mail werden in '/nginx-ingress' und '/usr/bin/nginx-agent' nicht geladen. Verifiziert mit grep -aF (in stripped Go-Binaries sind Funktionsnamen noch in der 'PC Line Table' gehalten, solange nicht absichtlich entfernt).",
+      "justification": "vulnerable_code_not_present",
+      "timestamp": "2026-06-08T14:31:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-33818",
+        "aliases": [
+          "GO-2026-5972"
+        ]
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/stdlib"
+        }
+      ],
+      "status": "affected",
+      "status_notes": "encoding/asn1 - DoS durch exzessive Rekursion in Unmarshal (https://pkg.go.dev/vuln/GO-2026-5972). Die Erreichbarkeit wurde mit 'govulncheck -show traces' gegen die Quellcodestände von kubernetes-ingress 5.5.4 (Go 1.26.5) und nginx-agent 3.11.2 (Go 1.26.4) für beide Binaries nachgewiesen. In '/nginx-ingress' führt der Aufrufpfad über internal/k8s/secrets/validation.go:93 (ValidateCASecret) nach crypto/x509.ParseCertificate und von dort nach asn1.Unmarshal; in '/usr/bin/nginx-agent' über crypto/x509.CertPool.AppendCertsFromPEM sowie pkg/tls/self_signed_cert.go:203 (DoesCertAlreadyExist). Beide Pfade verarbeiten extern bereitgestellte Zertifikate (Kubernetes-Secret des Typs CA bzw. Zertifikatsdateien aus der Agent-Konfiguration). Die Ausnutzbarkeit durch einen Angreifer wurde bestätigt: Die geparsten Zertifikatsdaten stammen aus Kubernetes-Secrets, die von Mandanten im Cluster angelegt werden (internal/k8s/controller.go:2409 ruft ValidateCASecret, :2303 und :2417 rufen ValidateTLSSecret). Wer Schreibrechte auf Secrets in einem vom Controller beobachteten Namespace besitzt, kann damit beliebig tief verschachtelte ASN.1-Strukturen einschleusen. Die Secrets können nur von einem Angreifer mit hohen Privilegien und aus dem Kubernetes Cluster gesetzt werden, daher wurde der auf der öffentlichen Schwachstellenmeldung (https://nvd.nist.gov/vuln/detail/CVE-2026-33818) basierende CVSS3.1-Vektor über 'Environmental Score Metrics' angepasst. Außerdem wurden 'Temporal Score Metrics' gesetzt'. Der resultierende CVSS3.1-Score ist Low. CVSS3.1-Vektor: AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H/E:F/RL:O/RC:C/CR:X/IR:X/AR:X/MAV:A/MAC:H/MPR:H/MUI:X/MS:X/MC:X/MI:X/MA:X",
+      "timestamp": "2026-08-15T10:00:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-39821",
+        "aliases": [
+          "GO-2026-5026"
+        ]
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/stdlib"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "golang.org/x/net/idna - Privilege Escalation durch fehlerhafte Punycode-Label-Verarbeitung (https://pkg.go.dev/vuln/GO-2026-5026). Zwar weist govulncheck net/http.Client.Do in beiden Binaries als erreichbar aus, ein Angreifer kann den dafür nötigen Hostnamen jedoch nicht kontrollieren. '/nginx-ingress' enthält im Produktivcode genau zwei HTTP-Clients (internal/nginx/verify.go:44 und internal/nginx/manager.go:531); beide werden über getSocketClient (cmd/nginx-ingress/main.go:793) an einen Unix-Socket der lokalen NGINX-Instanz gebunden und verwenden konstante Platzhalter-Hostnamen ('config-version' bzw. 'nginx-plus-api'). In '/usr/bin/nginx-agent' stammen die angesprochenen Endpunkte aus der lokalen nginx.conf (internal/datasource/config/nginx_config_parser.go) beziehungsweise aus der Agent-Konfiguration und sind damit administrativ gesetzt. Ein von einem Angreifer eingeschleuster Punycode-Hostname erreicht die verwundbare Stelle folglich nicht.",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-08-15T10:00:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-39822"
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/stdlib"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "Die Schwachstelle in os.Root folgt auf Unix-Systemen Symlinks aus dem Wurzelverzeichnis heraus, wenn die letzte Pfadkomponente ein Symlink ist und der Pfad auf '/' endet, wodurch ein Symlink-Escape (Path Traversal) möglich wird. Keines der betroffenen Symbole ist in den Go-Binaries '/nginx-ingress' und '/usr/bin/nginx-agent' enthalten. Verifiziert mit dem Tool govulncheck.",
+      "justification": "component_not_present",
+      "timestamp": "2026-07-10T09:38:32Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-42504"
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/stdlib"
+        }
+      ],
+      "status": "affected",
+      "status_notes": "Die Executable /nginx-ingress importiert die betroffene Funktion mime.WordDecoder.DecodeHeader und ist somit vermutlich betroffen.",
+      "timestamp": "2026-06-08T14:31:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-56853",
+        "aliases": [
+          "GO-2026-6089"
+        ]
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/stdlib"
+        }
+      ],
+      "status": "affected",
+      "status_notes": "net/http - DoS über unverschlüsselte HTTP/2-Verbindungen (https://pkg.go.dev/vuln/GO-2026-6089). Die Erreichbarkeit wurde mit 'govulncheck -show traces' gegen die Quellcodestände von kubernetes-ingress 5.5.4 (Go 1.26.5) und nginx-agent 3.11.2 (Go 1.26.4) für beide Binaries nachgewiesen. In '/nginx-ingress' betrifft dies den Ready-Status-Server (cmd/nginx-ingress/main.go:355, http.ListenAndServe) sowie den Metrics-Server (internal/metrics/listener.go:114 und :116, ListenAndServeTLS bzw. ListenAndServe); in '/usr/bin/nginx-agent' den HTTP-Health-Check-Server des eingebetteten OTel-Collectors (net/http.Server.Serve). Diese Listener sind aus dem Cluster erreichbar und der fehlende ReadHeaderTimeout erlaubt beim h2c-Erkennungsschritt einen Slowloris-artigen DoS. Die Ausnutzbarkeit durch einen Angreifer wurde bestätigt: Kontrolliert wird hier die Verbindung selbst und kein Datenwert. Der Ready-Status-Server (Standardport 8081), der Prometheus-Metrics-Server (Standardport 9113) und der Service-Insight-Server binden an alle Interfaces und sind damit aus dem Cluster erreichbar; beim Agent gilt dasselbe für den OTLP-Receiver und die health_check-Extension. Eine halb geöffnete Verbindung bindet dort ohne greifenden ReadHeaderTimeout dauerhaft Ressourcen. Die betroffenen Endpunkte kommunizieren nur innerhalb eines abgetrennten Netzwerks (z.B. Kubernetes Cluster), daher wurde der auf der öffentlichen Schwachstellenmeldung (https://nvd.nist.gov/vuln/detail/CVE-2026-56853) basierende CVSS3.1-Vektor über 'Environmental Score Metrics' angepasst. Außerdem wurden 'Temporal Score Metrics' gesetzt'. Der resultierende CVSS3.1-Score ist Medium. CVSS3.1-Vektor: AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H/E:F/RL:O/RC:C/CR:X/IR:X/AR:X/MAV:A/MAC:H/MPR:X/MUI:X/MS:X/MC:X/MI:X/MA:X",
+      "timestamp": "2026-08-15T10:00:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-56858",
+        "aliases": [
+          "GO-2026-6091"
+        ]
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/stdlib"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "html/template - Cross-Site Scripting bei pathologischem Input (https://pkg.go.dev/vuln/GO-2026-6091). Die verwundbare Funktion ist zwar im Aufrufgraph erreichbar, entscheidend ist jedoch, womit die Templates gefüllt werden. In '/nginx-ingress' ist internal/nginx/verify.go die einzige Stelle im Produktivcode, die html/template importiert: Das Template ist die Konstante configVersionTemplateString und setzt über {{.ConfigVersion}} ausschließlich einen int-Wert ein - es gibt weder einen JavaScript-Kontext noch angreiferkontrollierten Input. In '/usr/bin/nginx-agent' wird html/template im Produktivcode überhaupt nicht verwendet. Die von govulncheck zusätzlich gemeldeten Pfade über golang.org/x/net/trace sind nicht ausnutzbar: Das Paket registriert seine Handler in init() ausschließlich am http.DefaultServeMux (trace.go:130-131), der in beiden Binaries nie bedient wird - sämtliche Listener verwenden eigene ServeMux-Instanzen. Diese Traces sind Artefakte der Call-Graph-Analyse über net/http.HandlerFunc. Die ursprünglich hinterlegte Begründung 'vulnerable_code_not_present' trifft für '/nginx-ingress' nicht zu, da der Code dort vorhanden ist und aufgerufen wird.",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-08-15T10:00:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-56859",
+        "aliases": [
+          "GO-2026-6088"
+        ]
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/stdlib"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "encoding/xml - DoS durch Rekursionstiefe beim XML-Decoding (https://pkg.go.dev/vuln/GO-2026-6088). Die betroffenen Symbole aus dem Paket encoding/xml werden in den Go-Binaries '/nginx-ingress' und '/usr/bin/nginx-agent' nicht geladen. Verifiziert mit dem Tool govulncheck des Go-Entwicklungsteams.",
+      "justification": "vulnerable_code_not_present",
+      "timestamp": "2026-08-15T10:00:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-56860",
+        "aliases": [
+          "GO-2026-6218"
+        ]
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/stdlib"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "net/url - DoS durch quadratische Komplexität beim Path-Parsing (https://pkg.go.dev/vuln/GO-2026-6218). net/url.URL.Parse wird auf diesem Pfad ausschließlich in net/http.Client.do (client.go:650) aufgerufen, um den Location-Header einer Redirect-Antwort aufzulösen; der zu parsende Pfad stammt also von der jeweils angesprochenen Gegenstelle. Das ist in beiden Binaries die lokale NGINX-Instanz: '/nginx-ingress' kommuniziert mit ihr ausschließlich über Unix-Sockets (internal/nginx/verify.go:44 und internal/nginx/manager.go:531, jeweils über getSocketClient), '/usr/bin/nginx-agent' fragt Stub-Status- und Plus-API-Endpunkte ab, die aus der lokalen nginx.conf stammen. Diese Endpunkte werden aus den Templates des Ingress Controllers erzeugt und antworten mit statischen 200er-Antworten statt mit Redirects. Ein Angreifer kann den Location-Header und damit den zu parsenden Pfad nicht kontrollieren.",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-08-15T10:00:00Z"
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-56862",
+        "aliases": [
+          "GO-2026-6090"
+        ]
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/stdlib"
+        }
+      ],
+      "status": "affected",
+      "status_notes": "crypto/tls - DoS durch unbegrenzte KeyUpdate-Nachrichten (https://pkg.go.dev/vuln/GO-2026-6090). Die Erreichbarkeit wurde mit 'govulncheck -show traces' gegen die Quellcodestände von kubernetes-ingress 5.5.4 (Go 1.26.5) und nginx-agent 3.11.2 (Go 1.26.4) für beide Binaries nachgewiesen. In '/nginx-ingress' sind Conn.Handshake (gRPC-/SPIFFE-Client), Conn.HandshakeContext (Metrics-Server mit TLS, internal/metrics/listener.go:116), Conn.Read, Conn.Write und tls.Dialer.DialContext erreichbar; in '/usr/bin/nginx-agent' unter anderem der gRPC-Client-Handshake zur Management-Plane sowie tls.Dialer.DialContext im Proxy-Dialer (internal/grpc/proxy_dialer.go). Da eine TLS-Gegenstelle nach dem Handshake beliebig viele KeyUpdate-Nachrichten senden kann, bleibt der Status 'affected'. Behoben erst ab Go 1.26.6. Die Ausnutzbarkeit durch einen Angreifer wurde bestätigt: Angreifer ist hier die TLS-Gegenstelle. Der Metrics-Server (internal/metrics/listener.go:114) und der Service-Insight-Server (internal/healthcheck/healthcheck.go:87) nehmen bei konfiguriertem TLS Verbindungen aus dem Cluster entgegen; eine solche Gegenstelle kann nach dem Handshake unbegrenzt viele KeyUpdate-Nachrichten senden. Die betroffenen Endpunkte kommunizieren nur innerhalb eines abgetrennten Netzwerks (z.B. Kubernetes Cluster), daher wurde der auf der öffentlichen Schwachstellenmeldung (https://nvd.nist.gov/vuln/detail/CVE-2026-56862) basierende CVSS3.1-Vektor über 'Environmental Score Metrics' angepasst. Außerdem wurden 'Temporal Score Metrics' gesetzt'. Der resultierende CVSS3.1-Score ist Medium. CVSS3.1-Vektor: AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H/E:F/RL:O/RC:C/CR:X/IR:X/AR:X/MAV:A/MAC:H/MPR:X/MUI:X/MS:X/MC:X/MI:X/MA:X",
+      "timestamp": "2026-08-15T10:00:00Z"
     },
     {
       "vulnerability": {
@@ -347,95 +818,54 @@
           "@id": "pkg:deb/debian/libc6"
         }
       ],
-      "status": "under_investigation",
-      "timestamp": "2026-04-28T10:31:00Z"
+      "status": "not_affected",
+      "status_notes": "Die betroffenen Funktion ungetwc wird von keiner Executable oder Library geladen. Verifiziert mithilfe von von nm -D, ldd und grep -aF.",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "timestamp": "2026-06-08T14:31:00Z"
     },
     {
       "vulnerability": {
-        "name": "CVE-2026-34743"
+        "name": "CVE-2026-5450"
       },
       "products": [
         {
-          "@id": "pkg:deb/debian/liblzma5"
+          "@id": "pkg:deb/debian/libc6"
+        },
+        {
+          "@id": "pkg:deb/debian/libc-bin"
         }
       ],
-      "status": "under_investigation",
-      "timestamp": "2026-04-28T10:31:00Z"
+      "status": "affected",
+      "status_notes": "Eine Funktion der scanf-Familie wird in diversen Executables und Libraries importiert. Dabei ist unklar, ob %mc verwendet wird. Dies ist notwendig, um die Schwachstellen ausnutzen zu können. Es kann daher nicht ausgeschlossen werden, dass eine der Executables oder Libraries betroffen ist. Für das Ausnutzen der Schwachstelle müsste der Angreifer den Input kontrollieren und die Executable aufrufen oder die betroffene Libary-Funktion triggern. Das einzige nginx-bezogene Finding von scanf ist in /usr/lib/nginx/modules/ngx_otel_module.so. Dort wird sscanf() verwendet, allerdings nicht mit %mc. Die Schwachstelle wird von der NVD als Critical eingestuft (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H). Doch Red Hat bietet eine gut begründete Analyse (https://access.redhat.com/security/cve/cve-2026-5450), durch die diese Schwachstelle eine Kritikalität einen CVSS3.1-Score von 5 (Medium) erhält (CVSS:3.1/AV:L/AC:H/PR:L/UI:R/S:U/C:N/I:L/A:H).",
+      "timestamp": "2026-06-08T14:31:00Z"
     },
     {
       "vulnerability": {
-        "name": "CVE-2026-29111"
+        "name": "CVE-2026-74860"
       },
       "products": [
         {
-          "@id": "pkg:deb/debian/libsystemd0"
+          "@id": "pkg:deb/debian/libxml2"
         }
       ],
-      "status": "under_investigation",
-      "timestamp": "2026-04-28T10:31:00Z"
+      "status": "not_affected",
+      "status_notes": "Kein XML Processing in PEP.",
+      "timestamp": "2026-09-18T14:31:00Z"
     },
     {
       "vulnerability": {
-        "name": "CVE-2026-40225"
+        "name": "CVE-2026-86140"
       },
       "products": [
         {
-          "@id": "pkg:deb/debian/libsystemd0"
+          "@id": "pkg:deb/debian/libxml2"
         }
       ],
-      "status": "under_investigation",
-      "timestamp": "2026-04-28T10:31:00Z"
-    },
-    {
-      "vulnerability": {
-        "name": "CVE-2026-40226"
-      },
-      "products": [
-        {
-          "@id": "pkg:deb/debian/libsystemd0"
-        }
-      ],
-      "status": "under_investigation",
-      "status_info": "Seit Version v250 ist nur noch das Sicherheitsziel Verfügbarkeit betroffen. Daher ist die Severity nur mit MEDIUM zu bewerten: https://nvd.nist.gov/vuln/detail/CVE-2026-29111. Die Bewertung von RedHat ist hier nicht zutreffend (https://access.redhat.com/security/cve/cve-2026-29111)",
-      "timestamp": "2026-04-28T10:31:00Z"
-    },
-    {
-      "vulnerability": {
-        "name": "CVE-2025-69720"
-      },
-      "products": [
-        {
-          "@id": "pkg:deb/debian/libtinfo6"
-        }
-      ],
-      "status": "under_investigation",
-      "timestamp": "2026-04-28T10:31:00Z"
-    },
-    {
-      "vulnerability": {
-        "name": "CVE-2026-5704"
-      },
-      "products": [
-        {
-          "@id": "pkg:deb/debian/tar"
-        }
-      ],
-      "status": "under_investigation",
-      "timestamp": "2026-04-28T10:31:00Z"
-    },
-    {
-      "vulnerability": {
-        "name": "CVE-2026-27171"
-      },
-      "products": [
-        {
-          "@id": "pkg:deb/debian/zlib1g"
-        }
-      ],
-      "status": "under_investigation",
-      "timestamp": "2026-04-28T10:31:00Z"
+      "status": "not_affected",
+      "status_notes": "Kein XML Processing in PEP.",
+      "timestamp": "2026-09-18T14:31:00Z"
     }
   ],
   "timestamp": "2026-02-13T12:54:56Z",
-  "last_updated": "2026-04-28T10:31:00Z"
+  "last_updated": "2026-05-21T15:09:00Z"
 }

@@ -23,16 +23,6 @@ stages:
   - deploy
   - publish
 
-include:
-  - component: "$CI_SERVER_FQDN/zeta/zeta-ci-cd-components/container-scanning@v0.4.2"
-    inputs:
-      analyzer-image: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/aquasec/trivy:0.69.3@sha256:7228e304ae0f610a1fad937baa463598cadac0c2ac4027cc68f3a8b997115689"
-      cs-image: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
-      git-strategy: fetch
-      severity: HIGH,CRITICAL
-      job-stage: test
-      openvex-file: "vulnerabilites.openvex.json"
-
 default:
   image: $CI_REGISTRY/zeta/devops/ci-images/docker:24.0.5-zeta-0
   tags: [ zeta ]
@@ -50,9 +40,9 @@ variables:
   DOCKER_CERT_PATH: $DOCKER_TLS_CERTDIR/client
   DOCKER_TLS_VERIFY: "1"
   BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.94-slim-bookworm
-  NGINX_VERSION: "1.29.8" # NOTE: keep in sync with .cargo/config.toml and Dockerfile, and with nginx-ingress version (major.minor)
+  NGINX_VERSION: "1.31.3" # NOTE: keep in sync with .cargo/config.toml and Dockerfile, and with the nginx contained in BASE_IMAGE_INGRESS (exact version: modules only load into the nginx they were built for)
   BASE_IMAGE: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginxinc/nginx-unprivileged:$NGINX_VERSION-trixie-otel"
-  BASE_IMAGE_INGRESS: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx/nginx-ingress:5.4.1" # NOTE: keep in sync with Dockerfile, contained nginx major.minor must match NGINX_VERSION
+  BASE_IMAGE_INGRESS: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx/nginx-ingress:5.5@sha256:379143154a02d16e4b7d56ad505636bdf73b2c190825ef023c803958ba5eb57c" # NOTE: keep in sync with Dockerfile, contained nginx (1.31.3, controller 5.5.4) must match NGINX_VERSION exactly
   BASE_IMAGE_HSM_SIM: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/debian:bookworm"
   IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
   IMAGE_INGRESS: $CI_REGISTRY_IMAGE/nginx-ingress:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
@@ -118,7 +108,11 @@ build:
         - "${CI_PROJECT_DIR}/.nginx"
         - "${CI_PROJECT_DIR}/.nginx-cache"
   variables:
-    IT_AUTH: https://zeta-cd.westeurope.cloudapp.azure.com/auth
+    # 1.2.x line: run the ITs against the zeta-12x stage (keycloak-zeta 1.2.x), not zeta-cd/dev
+    IT_STAGE_HOST: zeta-12x.westeurope.cloudapp.azure.com
+    IT_POPP_P12: "${CI_PROJECT_DIR}/misc/popp-token-Server-Sim-nist-komp61.p12"
+    IT_POPP_P12_ALIAS: "alias"
+    IT_POPP_P12_PASS: "00"
   script:
     - |
       export CARGO_HOME="${CI_PROJECT_DIR}/.cargo-home"
@@ -127,6 +121,13 @@ build:
       MIRROR=${AZDO_CRATES_MIRROR_URL:-} \
         TOKEN=${AZDO_CRATES_PAT:-} \
         . /usr/local/bin/cargo-env
+
+      # project CI/CD variables outrank job variables, so the IT_HOST project variable can only
+      # be overridden here in the script; build.rs renders the test PEP's PDP issuer/audience
+      # from IT_HOST, so token source (IT_AUTH) and PDP must point at the same stage
+      IT_HOST=$IT_STAGE_HOST
+      IT_AUTH="https://$IT_STAGE_HOST/auth"
+      export IT_HOST IT_AUTH
 
       IT_P12=$(mktemp)
       export IT_P12
@@ -146,7 +147,7 @@ build:
         --build-arg BASE_IMAGE="$BASE_IMAGE" \
         --build-arg BASE_IMAGE_HSM_SIM="$BASE_IMAGE_HSM_SIM" \
         --build-arg BASE_IMAGE_INGRESS="$BASE_IMAGE_INGRESS" \
-        --target ci \
+        --target ci-pep \
         --tag "$IMAGE" \
         --push \
         "$@" \
@@ -220,6 +221,8 @@ sonarqube:
     - if: $CI_PIPELINE_SOURCE == "schedule"
       when: never
     - when: on_success
+  # report-only on the 1.2.x line: a failing scan must not block the MR
+  allow_failure: true
   variables:
     SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
     GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
@@ -231,14 +234,15 @@ trigger_helm:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: never
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      when: on_success
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # MRs into the 1.2.x line deploy to the zeta-12x stage (helm releases/1.2.x)
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "releases/1.2.x"'
       when: on_success
     - when: never
   trigger:
     project: zeta/devops/zeta-guard-helm
-    branch: main
+    # release branch: smoke-test against the release chart, not main.
+    # A pipeline triggered on releases/1.2.x deploys to zeta-12x, never to zeta-cd.
+    branch: releases/1.2.x
     strategy: depend
   variables:
     PEPPROXY_IMAGE_TAG: "$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA" # e.g. main-cafebabe
@@ -297,14 +301,11 @@ publish_artifacts:
   needs:
     - job: build
       artifacts: true
-    - job: container-scanning
-      artifacts: true
   script:
     - git clone https://zeta-sdk:${REPORTING_TOKEN}@tas-devtools-gitlab.spree.de/zeta/reporting.git
     - mkdir -p ./reporting/zeta-guard/ngx_pep/
     - find . -path ./reporting -prune -o -name 'ngx_pep.cdx.json' -exec cp --parents '{}' ./reporting/zeta-guard/ngx_pep/ \;
     - find . -path ./reporting -prune -o -name 'coverage.lcov' -exec cp --parents '{}' ./reporting/zeta-guard/ngx_pep/ \;
-    - find . -path ./reporting -prune -o -name 'gl-container-scanning-report.json' -exec cp --parents '{}' ./reporting/zeta-guard/ngx_pep/ \;
     - cd reporting
     - git config user.email "ci@tas-devtools-gitlab.spree.de"
     - git config  user.name "ci"

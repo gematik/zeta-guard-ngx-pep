@@ -42,11 +42,16 @@ pub trait RequestOps {
     fn get_authorization_token(&self) -> anyhow::Result<String>;
     fn get_header_in<'a, 'b>(&'a self, name: &'b str) -> Option<&'a str>;
     fn get_header_out<'a, 'b>(&'a self, name: &'b str) -> Option<&'a str>;
-    // additional *request* headers, e.g. passed to upstream
-    fn ensure_header_in(&mut self, name: &str, value: &str) -> anyhow::Result<()>;
+    // Set the per-request value of a `$zeta_*` nginx variable (`slot` is a `ZETA_VAR_*`). The
+    // value is forwarded as the corresponding `ZETA-*` header by `proxy_set_header` in
+    // proxy_headers.conf, which also drops any client-supplied copy of that header.
+    fn set_zeta_upstream_header(&mut self, slot: usize, value: &str);
     // additional *response* headers, will be added to response headers from upstream
     fn ensure_header_out(&mut self, name: &str, value: &str) -> anyhow::Result<()>;
     fn acceptable(&self, content_type: &str) -> anyhow::Result<bool>;
+    // Whether the matched `proxy_pass` location included `proxy_headers.conf` (which strips
+    // client credentials before forwarding). `None` if this isn't a proxy location.
+    fn proxy_strips_present(&self) -> Option<bool>;
 }
 
 fn split_authority(authority: &str) -> Result<(&str, Option<u16>)> {
@@ -279,14 +284,8 @@ impl RequestOps for ngx::http::Request {
             .map(String::from)
     }
 
-    fn ensure_header_in(&mut self, name: &str, value: &str) -> Result<()> {
-        if let Some(existing) = self.get_header_in(name)
-            && existing != value
-        {
-            anyhow::bail!("in header {name}: conflicting value declarations: {value}, {existing}")
-        }
-        self.add_header_in(name, value)
-            .ok_or(anyhow!("null table pointer"))
+    fn set_zeta_upstream_header(&mut self, slot: usize, value: &str) {
+        crate::ModuleCtx::set_zeta_header(self, slot, value);
     }
 
     fn ensure_header_out(&mut self, name: &str, value: &str) -> Result<()> {
@@ -325,6 +324,11 @@ impl RequestOps for ngx::http::Request {
         }
 
         Ok(false)
+    }
+
+    fn proxy_strips_present(&self) -> Option<bool> {
+        // SAFETY: `self` is a live request, so its raw `ngx_http_request_t` is valid.
+        unsafe { crate::proxy_conf::pep_headers_applied(self.as_ref()) }
     }
 }
 

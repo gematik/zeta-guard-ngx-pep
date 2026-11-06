@@ -145,6 +145,17 @@ async fn echo_service(
             let response = serde_json::to_string_pretty(&response)?;
             Ok(Response::new(full(response)))
         }
+        // Used by the integration test for the zeta-cause: proxy interceptor. The body and
+        // status are intentionally non-error-shaped so the test can verify that pep did not
+        // pass the upstream response through.
+        (&Method::GET, "/proxy_error") => {
+            let mut response = Response::new(full("SECRET_UPSTREAM_BODY"));
+            *response.status_mut() = StatusCode::OK;
+            response
+                .headers_mut()
+                .insert("zeta-cause", HeaderValue::from_static("proxy"));
+            Ok(response)
+        }
         (&Method::GET, "/ws/") => {
             tokio::task::spawn(async move {
                 match hyper::upgrade::on(&mut req).await {

@@ -407,7 +407,7 @@ pub fn create_client_assertion_with_attestation(
     registration.sign_jwt(None, client_assertion, &KEY)
 }
 
-pub fn client_builder(insecure: bool) -> ClientBuilder {
+pub fn test_client_builder(insecure: bool) -> ClientBuilder {
     Client::builder()
         .cookie_store(true) // session stickiness
         .use_rustls_tls()
@@ -415,9 +415,6 @@ pub fn client_builder(insecure: bool) -> ClientBuilder {
         .pool_max_idle_per_host(1)
         .pool_idle_timeout(Duration::from_secs(5))
         .tcp_keepalive(Duration::from_secs(5))
-    // .pool_max_idle_per_host(0)
-    // .pool_idle_timeout(None)
-    // .tcp_keepalive(None)
 }
 
 /// Send, retrying ONCE (on a fresh connection) when the request died on a

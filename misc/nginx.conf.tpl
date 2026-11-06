@@ -163,6 +163,11 @@ http \{
           alias html/empty.json;
           pep_require_popp on;
         }
+        ## see asl_inner_host_pinned: reflects the Host header the loopback hop arrived with
+        location = /host \{
+          default_type text/plain;
+          return 200 "$http_host";
+        }
 
         ## see tests/common/echo.rs
         location /echo/ \{

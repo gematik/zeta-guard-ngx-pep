@@ -26,6 +26,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -45,14 +46,14 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use ngx_pep::client::token_dispenser::{Tokens, create_dpop_proof, create_popp_token};
-use ngx_pep::client::{SHARED_CLIENT, admission_from_x509, client_builder};
+use ngx_pep::client::{SHARED_CLIENT, admission_from_x509, test_client_builder};
 use ngx_pep::revocation::parse_event;
 mod common;
 use common::{NginxLease, TestContext, context, nginx};
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 
-use crate::common::echo::{Echo, ws_request};
+use crate::common::echo::{Echo, GOTO_FAIL_CALLED, ws_request};
 use crate::common::typify::{ClientData, HttpZetaErrorResponse, ZetaUserInfo};
 
 #[rstest]
@@ -493,11 +494,7 @@ async fn asl(#[future(awt)] context: &TestContext, #[future(awt)] nginx: NginxLe
             // empty.json is {}
             assert!(result == json!({}));
         }
-        AslResponse::Error(err) => bail!("want body, got asl error {err:?}"),
-        AslResponse::HttpError(err) => bail!("want body, got http error {err:?}"),
-        AslResponse::Unexpected((status, body)) => {
-            bail!("want body, got unexpected error {status:?} {body}")
-        }
+        response => bail!("unexpected: {response:?}"),
     }
 
     let inner_invalid = [0u8; 1];
@@ -511,18 +508,12 @@ async fn asl(#[future(awt)] context: &TestContext, #[future(awt)] nginx: NginxLe
     .await?;
 
     match response {
-        AslResponse::Body(_) => {
-            bail!("want error, got body");
-        }
         AslResponse::Error(err) => {
             assert!(err.message_type == "Error");
             assert!(err.error_code == 102);
             assert!(err.error_message == "internal error: unparseable inner request");
         }
-        AslResponse::HttpError(err) => bail!("want asl error, got http error {err:?}"),
-        AslResponse::Unexpected((status, body)) => {
-            bail!("want asl error, got unexpected error {status:?} {body}")
-        }
+        response => bail!("unexpected: {response:?}"),
     }
 
     let inner_invalid = [0u8; 0];
@@ -536,19 +527,13 @@ async fn asl(#[future(awt)] context: &TestContext, #[future(awt)] nginx: NginxLe
     .await?;
 
     match response {
-        AslResponse::Body(_) => {
-            bail!("want error, got body");
-        }
         AslResponse::Error(err) => {
             // sic, A_26928
             assert!(err.message_type == "Error");
             assert!(err.error_code == 6);
             assert!(err.error_message == "bad format: extended ciphertext");
         }
-        AslResponse::HttpError(err) => bail!("want asl error, got http error {err:?}"),
-        AslResponse::Unexpected((status, body)) => {
-            bail!("want asl error, got unexpected error {status:?} {body}")
-        }
+        response => bail!("unexpected: {response:?}"),
     };
 
     // access phase errors on /ASL/<cid> lead to application/json errors, not application/cbor
@@ -571,8 +556,6 @@ async fn asl(#[future(awt)] context: &TestContext, #[future(awt)] nginx: NginxLe
     .await?;
 
     match response {
-        AslResponse::Body(_) => bail!("want http error, got body"),
-        AslResponse::Error(err) => bail!("want body, got asl error {err:?}"),
         AslResponse::HttpError(err) => {
             assert!(err.error == "AccessToken");
             assert!(
@@ -580,9 +563,7 @@ async fn asl(#[future(awt)] context: &TestContext, #[future(awt)] nginx: NginxLe
                     == Some("access token error: while decoding authorization token header".into())
             );
         }
-        AslResponse::Unexpected((status, body)) => {
-            bail!("want http error, got unexpected error {status:?} {body}")
-        }
+        response => bail!("unexpected: {response:?}"),
     }
 
     // access phase errors in the inner request lead to error in asl_request helper
@@ -643,11 +624,7 @@ async fn asl_forward_header(
             // empty.json is {}
             assert!(result == json!({}));
         }
-        AslResponse::Error(err) => bail!("want body, got asl error {err:?}"),
-        AslResponse::HttpError(err) => bail!("want body, got http error {err:?}"),
-        AslResponse::Unexpected((status, body)) => {
-            bail!("want body, got unexpected error {status:?} {body}")
-        }
+        response => bail!("unexpected: {response:?}"),
     };
 
     // outer x-forwarded-*
@@ -692,11 +669,7 @@ async fn asl_forward_header(
             // empty.json is {}
             assert!(result == json!({}));
         }
-        AslResponse::Error(err) => bail!("want body, got asl error {err:?}"),
-        AslResponse::HttpError(err) => bail!("want body, got http error {err:?}"),
-        AslResponse::Unexpected((status, body)) => {
-            bail!("want body, got unexpected error {status:?} {body}")
-        }
+        response => bail!("unexpected: {response:?}"),
     };
 
     // outer with both forwarded and x-forwarded-* — forwarded takes precedence (see
@@ -739,11 +712,7 @@ async fn asl_forward_header(
             // empty.json is {}
             assert!(result == json!({}));
         }
-        AslResponse::Error(err) => bail!("want body, asl error {err:?}"),
-        AslResponse::HttpError(err) => bail!("want body, got http error {err:?}"),
-        AslResponse::Unexpected((status, body)) => {
-            bail!("want body, got unexpected error {status:?} {body}")
-        }
+        response => bail!("unexpected: {response:?}"),
     };
 
     Ok(())
@@ -800,11 +769,7 @@ async fn asl_forward_client_ip(
                 "expected {expected} in forwarded header, got: {forwarded}"
             );
         }
-        AslResponse::Error(err) => bail!("want body, got asl error {err:?}"),
-        AslResponse::HttpError(err) => bail!("want body, got http error {err:?}"),
-        AslResponse::Unexpected((status, body)) => {
-            bail!("want body, got unexpected error {status:?} {body}")
-        }
+        response => bail!("unexpected: {response:?}"),
     };
 
     // X-Forwarded-For (typical reverse proxy setting)
@@ -832,11 +797,7 @@ async fn asl_forward_client_ip(
                 "expected {expected} in forwarded header, got: {forwarded}"
             );
         }
-        AslResponse::Error(err) => bail!("want body, got asl error {err:?}"),
-        AslResponse::HttpError(err) => bail!("want body, got http error {err:?}"),
-        AslResponse::Unexpected((status, body)) => {
-            bail!("want body, got unexpected error {status:?} {body}")
-        }
+        response => bail!("unexpected: {response:?}"),
     };
 
     // RFC 7239 Forwarded header with for=, host= matching the loopback so eigenurl stays the same
@@ -872,11 +833,7 @@ async fn asl_forward_client_ip(
                 "expected {expected} in forwarded header, got: {forwarded}"
             );
         }
-        AslResponse::Error(err) => bail!("want body, got asl error {err:?}"),
-        AslResponse::HttpError(err) => bail!("want body, got http error {err:?}"),
-        AslResponse::Unexpected((status, body)) => {
-            bail!("want body, got unexpected error {status:?} {body}")
-        }
+        response => bail!("unexpected: {response:?}"),
     };
 
     echo_server.abort();
@@ -927,19 +884,13 @@ async fn cid_expiry(
     let response =
         valid_asl_request(&tokens, &mut asl_session, target.clone(), &inner, None).await?;
     match response {
-        AslResponse::Body(_) => {
-            bail!("want Error, got Body");
-        }
         AslResponse::Error(err) => {
             assert!(err.message_type == "Error");
             assert!(err.error_code == 102);
             // removal on access — clue "expired" in the message
             assert!(err.error_message == format!("internal error: expired — {}", asl_session.cid));
         }
-        AslResponse::HttpError(err) => bail!("want asl error, got http error {err:?}"),
-        AslResponse::Unexpected((status, body)) => {
-            bail!("want asl error, got unexpected error {status:?} {body}")
-        }
+        response => bail!("unexpected: {response:?}"),
     };
 
     // expired cid should be removed now
@@ -947,18 +898,12 @@ async fn cid_expiry(
         valid_asl_request(&tokens, &mut asl_session, target.clone(), &inner, None).await?;
 
     match response {
-        AslResponse::Body(_) => {
-            bail!("want error, got body");
-        }
         AslResponse::Error(err) => {
             assert!(err.message_type == "Error");
             assert!(err.error_code == 102);
             assert!(err.error_message == format!("internal error: missing — {}", asl_session.cid));
         }
-        AslResponse::HttpError(err) => bail!("want asl error, got http error {err:?}"),
-        AslResponse::Unexpected((status, body)) => {
-            bail!("want asl error, got unexpected error {status:?} {body}")
-        }
+        response => bail!("unexpected: {response:?}"),
     };
 
     // now toggle always_expire…
@@ -978,9 +923,6 @@ async fn cid_expiry(
         valid_asl_request(&tokens, &mut asl_session, target.clone(), &inner, None).await?;
 
     match response {
-        AslResponse::Body(_) => {
-            bail!("want error, got body");
-        }
         AslResponse::Error(err) => {
             assert!(err.message_type == "Error");
             assert!(err.error_code == 102);
@@ -988,10 +930,7 @@ async fn cid_expiry(
             // see above.
             assert!(err.error_message == format!("internal error: missing — {}", asl_session.cid));
         }
-        AslResponse::HttpError(err) => bail!("want asl error, got http error {err:?}"),
-        AslResponse::Unexpected((status, body)) => {
-            bail!("want asl error, got unexpected error {status:?} {body}")
-        }
+        response => bail!("unexpected: {response:?}"),
     };
 
     Ok(())
@@ -1311,7 +1250,7 @@ async fn hsm_proxy_tls(#[future(awt)] nginx: NginxLease) -> Result<()> {
     nginx.wait_ready().await?;
 
     // Build a client with tls_info enabled so we can extract the peer certificate
-    let client = client_builder(true).tls_info(true).build()?;
+    let client = test_client_builder(true).tls_info(true).build()?;
 
     let tls_url = nginx.tls_url().await?.join("ready/")?;
     let resp = client.get(tls_url).send().await?;
@@ -1487,21 +1426,168 @@ async fn asl_no_absolute_inner(
             valid_asl_request(&tokens, &mut asl_session, target.clone(), &inner, None).await?;
 
         match response {
-            AslResponse::Body(_) => {
-                bail!("want asl error, got body")
-            }
             AslResponse::Error(err) => {
                 assert!(err.error_code == 101);
-                assert!(err.error_message.starts_with(&format!(
-                    "bad request: error resolving request target: {inner_url} is not relative to"
-                )));
+                // "… is not in origin-form" or "… is not relative to …"
+                assert!(
+                    err.error_message.starts_with(&format!(
+                        "bad request: error resolving request target: {inner_url} is not "
+                    )),
+                    "{}",
+                    err.error_message
+                );
             }
-            AslResponse::HttpError(err) => bail!("want asl error, got http error {err:?}"),
-            AslResponse::Unexpected((status, body)) => {
-                bail!("want asl error, got unexpected error {status:?} {body}")
-            }
+            response => bail!("unexpected: {response:?}"),
         }
     }
 
+    Ok(())
+}
+
+/// ASL handler should not follow redirects returned by upstreams itself.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn asl_no_redirects(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    let echo_server = nginx.start_echo_server().await;
+    nginx.wait_ready().await?;
+
+    let target = nginx.url().await?;
+    let token_dispenser = context.token_dispenser().await?;
+    let tokens = token_dispenser.tokens().await?;
+
+    let mut asl_session = asl_handshake(&tokens, target.clone()).await?;
+
+    // echoserver sends redirections for these codes that pep should not follow
+    for code in [301, 302, 308] {
+        // /echo/* is forwarded to http://echo_server/* by proxy_pass, see ../misc/nginx.conf.tpl
+        let echo_url = target.join(&format!("echo/{code}"))?;
+        let inner = encode_http_request(
+            &tokens.access_token,
+            &tokens.valid_dpop_proof("GET", echo_url.as_str())?,
+            Method::GET,
+            echo_url.as_str().parse()?,
+            None,
+        )?;
+
+        let response =
+            valid_asl_request(&tokens, &mut asl_session, target.clone(), &inner, None).await?;
+
+        match response {
+            AslResponse::Redirection((status, location)) => {
+                assert_eq!(code, status);
+                assert_eq!(location, "/echo/gotofail");
+            }
+            response => bail!("unexpected: {response:?}"),
+        };
+        assert!(
+            !GOTO_FAIL_CALLED.load(Ordering::Relaxed),
+            "{} was unexpectedly called; pep should not follow redirections, but pass them as-is (code={code})",
+            target.join("/echo/gotofail").unwrap(),
+        )
+    }
+
+    echo_server.abort();
+    let _ = echo_server.await;
+    Ok(())
+}
+
+/// The client-chosen inner Host must not reach the loopback hop (it feeds e.g. nginx's directory
+/// redirect Location); the outer request's Host is used instead.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn asl_inner_host_pinned(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    nginx.wait_ready().await?;
+
+    let target = nginx.url().await?;
+    let outer_host = format!(
+        "{}:{}",
+        target.host_str().context("host_str")?,
+        target
+            .port_or_known_default()
+            .context("port_or_known_default")?
+    );
+
+    let token_dispenser = context.token_dispenser().await?;
+    let tokens = token_dispenser.tokens().await?;
+
+    let mut asl_session = asl_handshake(&tokens, target.clone()).await?;
+
+    let url = target.join("host")?;
+    let dpop = tokens.valid_dpop_proof("GET", url.as_str())?;
+    let inner = format!(
+        "GET {} HTTP/1.1\r\nhost: attacker.invalid\r\nauthorization: DPoP {}\r\ndpop: {dpop}\r\n\r\n",
+        url.path(),
+        tokens.access_token
+    )
+    .into_bytes();
+
+    match valid_asl_request(&tokens, &mut asl_session, target.clone(), &inner, None).await? {
+        AslResponse::Body(body) => assert_eq!(String::from_utf8(body)?, outer_host),
+        response => bail!("want body, got {response:?}"),
+    }
+
+    Ok(())
+}
+
+/// An origin-form inner target whose path looks like an absolute URL must still be sent to this
+/// PEP's own listener, never to the host named in the path. The echo server is reachable at
+/// http://127.0.0.1:{echo_port}/ directly; if the PEP resolved "/http://127.0.0.1:{echo_port}/"
+/// to that URL, the echo JSON would come back through the tunnel.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn asl_inner_target_stays_local(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    let echo_server = nginx.start_echo_server().await;
+    nginx.wait_ready().await?;
+
+    let target = nginx.url().await?;
+    let port = target.port_or_known_default().context("port")?;
+    let echo_port = port + 100; // see NginxLease::start_echo_server
+    let host_port = format!("{}:{port}", target.host_str().context("host_str")?);
+
+    let token_dispenser = context.token_dispenser().await?;
+    let tokens = token_dispenser.tokens().await?;
+
+    let mut asl_session = asl_handshake(&tokens, target.clone()).await?;
+
+    for path in [
+        format!("/http://127.0.0.1:{echo_port}/"),
+        format!("/http:127.0.0.1:{echo_port}/"),
+    ] {
+        // nginx merges slashes in $uri (merge_slashes), and the PEP checks the DPoP htu against
+        // that normalized URI — sign what it will compare, so the request passes the PEP and
+        // reaches nginx's own (non-matching) location handling.
+        let htu = target.join(&path.replace("//", "/"))?;
+        let dpop = tokens.valid_dpop_proof("GET", htu.as_str())?;
+        let inner = format!(
+            "GET {path} HTTP/1.1\r\nhost: {host_port}\r\nauthorization: DPoP {}\r\ndpop: {dpop}\r\n\r\n",
+            tokens.access_token
+        )
+        .into_bytes();
+
+        match valid_asl_request(&tokens, &mut asl_session, target.clone(), &inner, None).await {
+            Ok(AslResponse::Body(body)) => bail!(
+                "{path}: inner request escaped the PEP's own listener: {}",
+                String::from_utf8_lossy(&body)
+            ),
+            // no location matches the path on the own listener
+            Err(err) => assert!(
+                err.to_string().contains("inner status: 404"),
+                "{path}: want inner 404, got {err:#}"
+            ),
+            Ok(response) => bail!("{path}: want inner 404, got {response:?}"),
+        }
+    }
+
+    echo_server.abort();
+    let _ = echo_server.await;
     Ok(())
 }

@@ -25,12 +25,10 @@
 use std::cell::RefCell;
 use std::ptr::addr_of;
 use std::sync::OnceLock;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+use std::{env, ptr};
 
 use async_compat::Compat;
-use std::{env, ptr};
-use tracing::Span;
-
 use nginx_sys::{
     NGX_HTTP_VAR_NOCACHEABLE, NGX_LOG_EMERG, NGX_LOG_WARN, ngx_http_add_variable,
     ngx_http_compile_complex_value, ngx_http_compile_complex_value_t, ngx_http_complex_value_t,
@@ -48,9 +46,10 @@ use ngx::http::{HttpModuleMainConf, NgxHttpCoreModule};
 use ngx::ngx_conf_log_error;
 use ngx::{http_request_handler, ngx_string};
 use ngx_tickle::{Task, spawn};
-use reqwest::Client;
+use reqwest::{Client, ClientBuilder};
+use tracing::Span;
 
-use crate::conf::NGX_HTTP_PEP_COMMANDS;
+use crate::conf::{MainConfig, NGX_HTTP_PEP_COMMANDS};
 use crate::error::ZetaResult;
 use crate::request_body::RequestBody;
 
@@ -371,7 +370,7 @@ impl http::HttpModule for Module {
             // This is required in handle_subrequest — a nginx Request doesn't know the original
             // server port (easily), but we want to send inner to the same server that handles
             // outer.
-            let mut asl_self_url = ngx_string!("http://localhost:$server_port");
+            let mut asl_self_url = ngx_string!("http://127.0.0.1:$server_port");
             let mut ccv: ngx_http_compile_complex_value_t = std::mem::zeroed();
             ccv.cf = cf;
             ccv.value = &mut asl_self_url;
@@ -457,21 +456,33 @@ fn telemetry_log_phase(request: &mut Request) -> Status {
 
 pub static CLIENT: OnceLock<Client> = OnceLock::new();
 
+/// common config for all clients
+pub(crate) fn client_builder(conf: &MainConfig) -> ClientBuilder {
+    ClientBuilder::new()
+        .user_agent(concat!("ZETA Guard PEP/", env!("CARGO_PKG_VERSION")))
+        .http2_adaptive_window(true)
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(30))
+        .connect_timeout(conf.http_client_connect_timeout)
+        .timeout(conf.http_client_timeout)
+        .use_rustls_tls()
+        .danger_accept_invalid_certs(conf.http_client_accept_invalid_certs)
+}
+
 #[cfg_attr(test, allow(unused))]
 mod prod {
-
-    use std::time::Duration;
 
     use nginx_sys::ngx_cycle_t;
     use ngx::core::Status;
     use ngx::ffi::ngx_int_t;
     use ngx::http::HttpModuleMainConf;
+    use reqwest::redirect::Policy;
 
-    use crate::{CLIENT, Module, otel};
+    use crate::asl::ASL_CLIENT;
+    use crate::{CLIENT, Module, client_builder, otel};
 
     pub extern "C" fn ngx_http_pep_init_worker(cycle: *mut ngx_cycle_t) -> ngx_int_t {
-        use reqwest::ClientBuilder;
-
         ngx_tickle::init();
 
         let cycle = unsafe { &mut *cycle };
@@ -488,19 +499,16 @@ mod prod {
 
         otel::install();
 
-        CLIENT.get_or_init(|| {
-            ClientBuilder::new()
-                .user_agent(concat!("ZETA Guard PEP/", env!("CARGO_PKG_VERSION")))
-                .http2_adaptive_window(true)
-                .pool_max_idle_per_host(32)
-                .pool_idle_timeout(Duration::from_secs(60))
-                .tcp_keepalive(Duration::from_secs(30))
-                .connect_timeout(conf.http_client_connect_timeout)
-                .timeout(conf.http_client_timeout)
-                .use_rustls_tls()
-                .danger_accept_invalid_certs(conf.http_client_accept_invalid_certs)
+        CLIENT.get_or_init(|| client_builder(conf).build().expect("reqwest client"));
+
+        // ASL inner requests only ever target this PEP's own listener: never follow a redirect
+        // off it, never route the loopback hop through a proxy.
+        ASL_CLIENT.get_or_init(|| {
+            client_builder(conf)
+                .redirect(Policy::none())
+                .no_proxy()
                 .build()
-                .expect("reqwest client")
+                .expect("ASL reqwest client")
         });
 
         #[cfg(not(test))]

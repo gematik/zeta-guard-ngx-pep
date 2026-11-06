@@ -247,9 +247,13 @@ pub fn encode_valid_http_request(
 #[derive(Debug)]
 pub enum AslResponse {
     Body(Vec<u8>),
+    Redirection((u16, String)),
+    // Error on ASL channel (CBOR)
     Error(ErrorResponse),
+    // Error on outer channel (JSON)
     HttpError(HttpZetaErrorResponse),
-    Unexpected((StatusCode, String)),
+    // Unexpected HTTP Error (unknown CT)
+    Other((StatusCode, String)),
 }
 
 pub async fn asl_request(
@@ -332,26 +336,43 @@ pub async fn asl_request(
 
         let status = response.code.expect("code");
         let reason = response.reason.expect("reason");
-        if status != 200 {
-            bail!("inner status: {} {}", status, reason);
+        // inner success, just return Body (might be empty)
+        if (200..=299).contains(&status) {
+            return Ok(AslResponse::Body(body));
         }
 
-        Ok(AslResponse::Body(body))
-    } else {
-        match content_type {
-            "application/json" => {
-                let err: HttpZetaErrorResponse = serde_json::from_slice(&response_bitez)?;
-                Ok(AslResponse::HttpError(err))
-            }
-            "application/cbor" => {
-                let err: ErrorResponse = serde_cbor::from_slice(&response_bitez)?;
-                Ok(AslResponse::Error(err))
-            }
-            _ => {
-                let response_text =
-                    String::from_utf8(response_bitez.into()).unwrap_or("not utf8".to_string());
-                Ok(AslResponse::Unexpected((status, response_text)))
-            }
+        // inner redirection
+        if (300..=399).contains(&status) {
+            let location = str::from_utf8(
+                headers
+                    .into_iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("location"))
+                    .unwrap_or_else(|| panic!("redirection ({status}), but no location?"))
+                    .value,
+            )
+            .expect("location value")
+            .to_string();
+
+            return Ok(AslResponse::Redirection((status, location)));
+        }
+
+        bail!("inner status: {} {}", status, reason);
+    }
+
+    // outer error, try to decode it
+    match content_type {
+        "application/json" => {
+            let err: HttpZetaErrorResponse = serde_json::from_slice(&response_bitez)?;
+            Ok(AslResponse::HttpError(err))
+        }
+        "application/cbor" => {
+            let err: ErrorResponse = serde_cbor::from_slice(&response_bitez)?;
+            Ok(AslResponse::Error(err))
+        }
+        _ => {
+            let response_text =
+                String::from_utf8(response_bitez.into()).unwrap_or("not utf8".to_string());
+            Ok(AslResponse::Other((status, response_text)))
         }
     }
 }

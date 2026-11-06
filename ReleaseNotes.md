@@ -2,6 +2,17 @@
 
 # Release Notes ZETA PEP
 
+## Release 1.3.4
+
+### fixed
+
+- ASL: redirects on inner responses are never followed, but passed to the client as-is
+- ASL: the inner request's `Host` header is no longer forwarded on the loopback hop; the outer
+  request's `Host` is used instead (with thanks to Machine Spirits UG)
+- ASL: inner request targets are only accepted in origin-form (`/path?query`) and always stay on
+  the PEP's own listener; a path like `/http://host/…` no longer redirects the inner request to
+  that host (with thanks to Machine Spirits UG)
+
 ## Release 1.3.3
 
 ### fixed

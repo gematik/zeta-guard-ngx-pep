@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -136,6 +137,8 @@ pub async fn ws_request(tokens: Tokens, uri: Uri, msg: u8) -> Result<u8> {
     .context("ws client error or timeout")?
 }
 
+pub static GOTO_FAIL_CALLED: AtomicBool = AtomicBool::new(false);
+
 async fn echo_service(
     mut req: Request<hyper::body::Incoming>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
@@ -149,6 +152,34 @@ async fn echo_service(
             let response = echo_response(&req)?;
             let response = serde_json::to_string_pretty(&response)?;
             Ok(Response::new(full(response)))
+        }
+        (&Method::GET, "/301") => {
+            let mut redirect = Response::new(empty());
+            *redirect.status_mut() = StatusCode::MOVED_PERMANENTLY;
+            redirect
+                .headers_mut()
+                .insert("location", HeaderValue::from_static("/echo/gotofail"));
+            Ok(redirect)
+        }
+        (&Method::GET, "/302") => {
+            let mut redirect = Response::new(empty());
+            *redirect.status_mut() = StatusCode::FOUND;
+            redirect
+                .headers_mut()
+                .insert("location", HeaderValue::from_static("/echo/gotofail"));
+            Ok(redirect)
+        }
+        (&Method::GET, "/308") => {
+            let mut redirect = Response::new(empty());
+            *redirect.status_mut() = StatusCode::PERMANENT_REDIRECT;
+            redirect
+                .headers_mut()
+                .insert("location", HeaderValue::from_static("/echo/gotofail"));
+            Ok(redirect)
+        }
+        (&Method::GET, "/gotofail") => {
+            GOTO_FAIL_CALLED.store(true, Ordering::Relaxed);
+            Ok(Response::new(empty()))
         }
         // Used by the integration test for the zeta-cause: proxy interceptor. The body and
         // status are intentionally non-error-shaped so the test can verify that pep did not

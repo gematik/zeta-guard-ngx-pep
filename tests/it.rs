@@ -1052,8 +1052,8 @@ async fn cid_expiry(
     // During integration tests this auto-cleanup is *not* random — it is either never or always,
     // defaulting to never on startup, and blocking.
     //
-    // The observable difference is subtle — the error message mentions "expired" in the on access
-    // case, and "missing" in the auto-cleanup case, but it is enough to test both cases here.
+    // The observable difference: on access, the error is AslSessionExpired (403, "expired"); after
+    // auto-cleanup the cid is simply unknown (403, code 9, A_26924). Both cases are tested here.
 
     // expire cid and try otherwise valid request
     control_client
@@ -1081,8 +1081,9 @@ async fn cid_expiry(
     match response {
         AslResponse::Error(err) => {
             assert!(err.message_type == "Error");
-            assert!(err.error_code == 102);
-            assert!(err.error_message == format!("internal error: missing — {}", asl_session.cid));
+            // A_26924: unknown CID
+            assert!(err.error_code == 9);
+            assert!(err.error_message == "unknown CID");
         }
         response => bail!("unexpected: {response:?}"),
     };
@@ -1106,10 +1107,10 @@ async fn cid_expiry(
     match response {
         AslResponse::Error(err) => {
             assert!(err.message_type == "Error");
-            assert!(err.error_code == 102);
             // should be removed by cleanup_expired, not on access cleanup → we skip the "expired",
             // see above.
-            assert!(err.error_message == format!("internal error: missing — {}", asl_session.cid));
+            assert!(err.error_code == 9);
+            assert!(err.error_message == "unknown CID");
         }
         response => bail!("unexpected: {response:?}"),
     };
@@ -1447,9 +1448,7 @@ async fn hsm_proxy_tls(#[future(awt)] nginx: NginxLease) -> Result<()> {
 
     // Compare the SPKI (public key) from the TLS cert against what hsm_sim derives.
     // We can't compare full certs because ECDSA signatures are non-deterministic.
-    let hsm_url = nginx.hsm_sim_url().await?;
-    let mut hsm_client =
-        hsm_sim::proto::hsm_proxy_service_client::HsmProxyServiceClient::connect(hsm_url).await?;
+    let mut hsm_client = nginx.hsm_sim_client().await?;
 
     let pub_resp = hsm_client
         .get_public_key(hsm_sim::proto::GetPublicKeyRequest {
@@ -1607,9 +1606,14 @@ async fn asl_no_absolute_inner(
         match response {
             AslResponse::Error(err) => {
                 assert!(err.error_code == 101);
-                assert!(err.error_message.starts_with(&format!(
-                    "bad request: error resolving request target: {inner_url} is not relative to"
-                )));
+                // "… is not in origin-form" or "… is not relative to …"
+                assert!(
+                    err.error_message.starts_with(&format!(
+                        "bad request: error resolving request target: {inner_url} is not "
+                    )),
+                    "{}",
+                    err.error_message
+                );
             }
             response => bail!("unexpected: {response:?}"),
         }
@@ -1665,5 +1669,202 @@ async fn asl_no_redirects(
 
     echo_server.abort();
     let _ = echo_server.await;
+    Ok(())
+}
+
+/// The client-chosen inner Host must not reach the loopback hop (it feeds e.g. nginx's directory
+/// redirect Location); the outer request's Host is used instead.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn asl_inner_host_pinned(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    nginx.wait_ready().await?;
+
+    let target = nginx.url().await?;
+    let outer_host = format!(
+        "{}:{}",
+        target.host_str().context("host_str")?,
+        target
+            .port_or_known_default()
+            .context("port_or_known_default")?
+    );
+
+    let token_dispenser = context.token_dispenser().await?;
+    let tokens = token_dispenser.tokens().await?;
+
+    let mut asl_session = asl_handshake(&tokens, target.clone()).await?;
+
+    let url = target.join("host")?;
+    let dpop = tokens.valid_dpop_proof("GET", url.as_str())?;
+    let inner = format!(
+        "GET {} HTTP/1.1\r\nhost: attacker.invalid\r\nauthorization: DPoP {}\r\ndpop: {dpop}\r\n\r\n",
+        url.path(),
+        tokens.access_token
+    )
+    .into_bytes();
+
+    match valid_asl_request(&tokens, &mut asl_session, target.clone(), &inner, None).await? {
+        AslResponse::Body(body) => assert_eq!(String::from_utf8(body)?, outer_host),
+        response => bail!("want body, got {response:?}"),
+    }
+
+    Ok(())
+}
+
+/// An origin-form inner target whose path looks like an absolute URL must still be sent to this
+/// PEP's own listener, never to the host named in the path. The echo server is reachable at
+/// http://127.0.0.1:{echo_port}/ directly; if the PEP resolved "/http://127.0.0.1:{echo_port}/"
+/// to that URL, the echo JSON would come back through the tunnel.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn asl_inner_target_stays_local(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    let echo_server = nginx.start_echo_server().await;
+    nginx.wait_ready().await?;
+
+    let target = nginx.url().await?;
+    let port = target.port_or_known_default().context("port")?;
+    let echo_port = port + 100; // see NginxLease::start_echo_server
+    let host_port = format!("{}:{port}", target.host_str().context("host_str")?);
+
+    let token_dispenser = context.token_dispenser().await?;
+    let tokens = token_dispenser.tokens().await?;
+
+    let mut asl_session = asl_handshake(&tokens, target.clone()).await?;
+
+    for path in [
+        format!("/http://127.0.0.1:{echo_port}/"),
+        format!("/http:127.0.0.1:{echo_port}/"),
+    ] {
+        // nginx merges slashes in $uri (merge_slashes), and the PEP checks the DPoP htu against
+        // that normalized URI — sign what it will compare, so the request passes the PEP and
+        // reaches nginx's own (non-matching) location handling.
+        let htu = target.join(&path.replace("//", "/"))?;
+        let dpop = tokens.valid_dpop_proof("GET", htu.as_str())?;
+        let inner = format!(
+            "GET {path} HTTP/1.1\r\nhost: {host_port}\r\nauthorization: DPoP {}\r\ndpop: {dpop}\r\n\r\n",
+            tokens.access_token
+        )
+        .into_bytes();
+
+        match valid_asl_request(&tokens, &mut asl_session, target.clone(), &inner, None).await {
+            Ok(AslResponse::Body(body)) => bail!(
+                "{path}: inner request escaped the PEP's own listener: {}",
+                String::from_utf8_lossy(&body)
+            ),
+            // no location matches the path on the own listener
+            Err(err) => assert!(
+                err.to_string().contains("inner status: 404"),
+                "{path}: want inner 404, got {err:#}"
+            ),
+            Ok(response) => bail!("{path}: want inner 404, got {response:?}"),
+        }
+    }
+
+    echo_server.abort();
+    let _ = echo_server.await;
+    Ok(())
+}
+
+/// Sends a request whose client IP differs from the token's and expects the no-travel rejection.
+async fn trigger_impossible_travel(
+    nginx: &NginxLease,
+    jar: &Jar,
+    tokens: &Tokens,
+    client_ip: &str,
+) -> Result<()> {
+    nginx.wait_ready().await?;
+    let target = nginx.url().await?.join("empty.json")?;
+
+    let resp = tokens
+        .request_builder(
+            Method::GET,
+            jar,
+            target.clone(),
+            &tokens.valid_dpop_proof("GET", target.as_str())?,
+            Some(client_ip),
+        )?
+        .send()
+        .await?;
+    assert!(resp.status() == 401);
+    let error: HttpZetaErrorResponse = resp.json().await?;
+    assert!(error.error == "ImpossibleTravel");
+    Ok(())
+}
+
+/// A_25484-03: an impossible-travel rejection is logged with `attackDetection.type` and the
+/// `user.roles` the KPI is split by. Asserted on the nginx stdout log.
+async fn assert_impossible_travel_logged(
+    nginx: &NginxLease,
+    jar: &Jar,
+    tokens: &Tokens,
+    client_ip: &str,
+    user_roles: &str,
+) -> Result<()> {
+    trigger_impossible_travel(nginx, jar, tokens, client_ip).await?;
+
+    let line = common::attack_log_line(client_ip).await?;
+    assert!(
+        line.contains("attackDetection.type=\"impossible_travel\""),
+        "{line}"
+    );
+    assert!(
+        line.contains(&format!("user.roles=\"{user_roles}\"")),
+        "{line}"
+    );
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn impossible_travel_logged_with_user_roles(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    let tokens = context.tokens().await?;
+    assert_impossible_travel_logged(
+        &nginx,
+        &context.jar,
+        &tokens,
+        "198.51.100.1",
+        "Leistungserbringer",
+    )
+    .await
+}
+
+/// A_25484-03: what the PEP *exports* over OTLP (received by the in-process receiver in
+/// `common::otlp`): the attack log record carries `attackDetection.type` and `user.roles`, and the
+/// `zeta.impossible_travel_count` counter is split by `user.roles`.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn impossible_travel_exported_via_otlp(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    let client_ip = "198.51.100.3";
+    let tokens = context.tokens().await?;
+    trigger_impossible_travel(&nginx, &context.jar, &tokens, client_ip).await?;
+
+    let record = common::otlp::wait_for_attack_log(client_ip).await?;
+    assert_eq!(
+        common::otlp::attr(&record.attributes, "attackDetection.type"),
+        Some("impossible_travel")
+    );
+    assert_eq!(
+        common::otlp::attr(&record.attributes, "user.roles"),
+        Some("Leistungserbringer")
+    );
+
+    let count = common::otlp::wait_for_counter(
+        "zeta.impossible_travel_count",
+        "user.roles",
+        "Leistungserbringer",
+    )
+    .await?;
+    assert!(count >= 1, "count {count}");
     Ok(())
 }

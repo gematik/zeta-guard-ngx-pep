@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use tokio::signal::unix::SignalKind;
-use tonic::transport::Server;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 use hsm_sim::proto::hsm_proxy_service_server::HsmProxyServiceServer;
 use hsm_sim::{CacheDir, CertAuthority, HsmProxyServiceImpl};
@@ -39,9 +39,42 @@ struct Cli {
     #[arg(long, env = "HSM_SIM_KEYS", default_value = "keys")]
     keys_dir: PathBuf,
 
-    /// gRPC listen address
+    /// gRPC listen address; serves TLS if --tls-cert is given, plaintext otherwise
     #[arg(long, default_value = "[::1]:50051")]
     listen: String,
+
+    /// PEM file with the server certificate (chain); enables TLS on --listen
+    #[arg(long, env = "HSM_SIM_TLS_CERT", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM file with the server certificate's private key
+    #[arg(long, env = "HSM_SIM_TLS_KEY", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+
+    /// PEM file with the CA(s) client certificates must chain to; makes a client
+    /// certificate mandatory on --listen (mTLS)
+    #[arg(long, env = "HSM_SIM_TLS_CLIENT_CA", requires = "tls_cert")]
+    tls_client_ca: Option<PathBuf>,
+
+    /// Additional plaintext gRPC listen address next to the TLS one, for clients
+    /// without TLS support
+    #[arg(long, env = "HSM_SIM_PLAINTEXT_LISTEN", requires = "tls_cert")]
+    plaintext_listen: Option<String>,
+}
+
+impl Cli {
+    fn tls_config(&self) -> Result<Option<ServerTlsConfig>, Box<dyn std::error::Error>> {
+        let (Some(cert), Some(key)) = (&self.tls_cert, &self.tls_key) else {
+            return Ok(None);
+        };
+        let read =
+            |path: &PathBuf| std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()));
+        let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(read(cert)?, read(key)?));
+        if let Some(client_ca) = &self.tls_client_ca {
+            tls = tls.client_ca_root(Certificate::from_pem(read(client_ca)?));
+        }
+        Ok(Some(tls))
+    }
 }
 
 async fn termination_signal() -> std::io::Result<()> {
@@ -82,7 +115,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let addr = cli.listen.parse()?;
-    eprintln!("[hsm_sim] Listening on {}", addr);
+    let plaintext_addr = cli
+        .plaintext_listen
+        .as_deref()
+        .map(str::parse)
+        .transpose()?;
+    let tls = cli.tls_config()?;
+    eprintln!(
+        "[hsm_sim] Listening on {addr} ({})",
+        match (&tls, &cli.tls_client_ca) {
+            (None, _) => "plaintext",
+            (Some(_), None) => "TLS",
+            (Some(_), Some(_)) => "TLS, client certificate required",
+        }
+    );
+    if let Some(plaintext_addr) = plaintext_addr {
+        eprintln!("[hsm_sim] Listening on {plaintext_addr} (plaintext)");
+    }
 
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(hsm_sim::proto::FILE_DESCRIPTOR_SET)
@@ -93,14 +142,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_serving::<HsmProxyServiceServer<HsmProxyServiceImpl>>()
         .await;
 
-    let server = Server::builder()
-        .add_service(health_service)
-        .add_service(reflection)
-        .add_service(HsmProxyServiceServer::new(service))
-        .serve_with_shutdown(addr, async {
-            termination_signal().await.ok();
-            eprintln!("[hsm_sim] shutting down…");
-        });
+    let hsm_service = HsmProxyServiceServer::new(service);
+    let serve = |mut builder: Server, addr| {
+        builder
+            .add_service(health_service.clone())
+            .add_service(reflection.clone())
+            .add_service(hsm_service.clone())
+            .serve_with_shutdown(addr, async {
+                termination_signal().await.ok();
+                eprintln!("[hsm_sim] shutting down…");
+            })
+    };
+
+    let builder = match tls {
+        Some(tls) => Server::builder().tls_config(tls)?,
+        None => Server::builder(),
+    };
+    let main_listener = serve(builder, addr);
+    let plaintext_listener = async {
+        match plaintext_addr {
+            Some(addr) => serve(Server::builder(), addr).await,
+            None => Ok(()),
+        }
+    };
+    let server = async { tokio::try_join!(main_listener, plaintext_listener).map(|_| ()) };
 
     // serve_with_shutdown can hang due to ”half-dead” clients, e.g. when ossl_hsm connected
     // pre-fork, and didn't reconnect yet.

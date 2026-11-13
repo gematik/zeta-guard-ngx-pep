@@ -47,26 +47,52 @@ struct HttpCacheMeta {
     max_age: Option<Duration>,
     /// Monotonic instant for freshness checks
     fetched_at: Option<Instant>,
+    /// Monotonic instant of the last full (non-304) response
+    installed_at: Option<Instant>,
     /// Wall-clock epoch seconds for logging
     fetched_at_epoch: u64,
 }
 
 impl HttpCacheMeta {
-    fn is_fresh(&self) -> bool {
+    /// True once the content is older than `max_lifetime`, however often it
+    /// was revalidated since: it must then be fetched again in full.
+    fn must_reinstall(&self, max_lifetime: Duration) -> bool {
+        self.installed_at
+            .is_none_or(|at| at.elapsed() >= max_lifetime)
+    }
+
+    fn is_fresh(&self, max_lifetime: Duration) -> bool {
+        if self.must_reinstall(max_lifetime) {
+            return false;
+        }
         match (self.fetched_at, self.max_age) {
             (Some(at), Some(max_age)) => at.elapsed() < max_age,
             _ => false,
         }
     }
 
+    /// Metadata to derive the next request's validators from: none once
+    /// [`Self::must_reinstall`] holds, so the server cannot answer 304.
+    fn validators(&self, max_lifetime: Duration) -> Self {
+        if self.must_reinstall(max_lifetime) {
+            Self::default()
+        } else {
+            self.clone()
+        }
+    }
+
     /// True if the cache is still trustworthy enough to use even when the
     /// most recent refresh attempt failed: within `max_age + grace` of the
     /// last successful fetch. `max_age` defaults to 0 if the server didn't
-    /// say (so the trust window is just `grace`).
-    fn trustworthy(&self, grace: Duration) -> bool {
-        match self.fetched_at {
-            Some(at) => at.elapsed() < self.max_age.unwrap_or_default() + grace,
-            None => false,
+    /// say (so the trust window is just `grace`). Never beyond
+    /// `max_lifetime + grace` of the last full response.
+    fn trustworthy(&self, grace: Duration, max_lifetime: Duration) -> bool {
+        match (self.fetched_at, self.installed_at) {
+            (Some(fetched), Some(installed)) => {
+                fetched.elapsed() < self.max_age.unwrap_or_default().saturating_add(grace)
+                    && installed.elapsed() < max_lifetime.saturating_add(grace)
+            }
+            _ => false,
         }
     }
 
@@ -79,6 +105,7 @@ impl HttpCacheMeta {
                 .map(Into::into),
             max_age: Self::parse_max_age(h),
             fetched_at: Some(Instant::now()),
+            installed_at: Some(Instant::now()),
             fetched_at_epoch: jsonwebtoken::get_current_timestamp(),
         }
     }
@@ -237,6 +264,7 @@ mod prod {
         meta: &HttpCacheMeta,
         forwarded_for: Option<&str>,
         origin: Option<&ForwardedOrigin>,
+        max_lifetime: Duration,
     ) -> anyhow::Result<(StatusCode, HeaderMap, Bytes)> {
         let method = Method::GET;
         let url: Url = url.parse()?;
@@ -268,6 +296,20 @@ mod prod {
         // (fresh) or 304 (cache hit) — anything else is a fetch failure.
         if !status.is_success() && status != StatusCode::NOT_MODIFIED {
             bail!("unexpected status {status}");
+        }
+        if status == StatusCode::NOT_MODIFIED && meta.etag.is_none() && meta.last_modified.is_none()
+        {
+            bail!("304 in response to an unconditional request");
+        }
+        if let Some(max_age) = HttpCacheMeta::parse_max_age(&headers)
+            && max_age > max_lifetime
+        {
+            warn!(
+                %url,
+                max_age = max_age.as_secs(),
+                max_lifetime = max_lifetime.as_secs(),
+                "max-age exceeds pep_jwks_max_lifetime, limited to the latter"
+            );
         }
         Ok((status, headers, body))
     }
@@ -321,6 +363,8 @@ mod prod {
     struct JwkStore {
         keys: HashMap<String, Jwk>, // put into map for faster access
         meta: HttpCacheMeta,
+        /// URI the keys were fetched from
+        source: String,
     }
 
     trait JwksOps {
@@ -345,6 +389,9 @@ mod prod {
         popp_entity: RwLock<Option<EntityCacheEntry>>,
         popp_jwks: RwLock<Option<JwkStore>>,
         refresh_interval: Duration,
+        /// Upper bound for how long any cached document is used without a
+        /// full refetch, regardless of what the server's cache headers say.
+        max_lifetime: Duration,
     }
 
     impl JwkCache {
@@ -361,6 +408,7 @@ mod prod {
                 popp_entity: Default::default(),
                 popp_jwks: Default::default(),
                 refresh_interval: conf.jwks_refresh_interval,
+                max_lifetime: conf.jwks_max_lifetime,
             });
             spawn_compat(cache.cache_worker()).detach();
         }
@@ -410,7 +458,7 @@ mod prod {
                 let mut jwks_guard = self.pdp_jwks.write().await;
                 let trustworthy = jwks_guard
                     .as_ref()
-                    .is_some_and(|s| s.meta.trustworthy(grace));
+                    .is_some_and(|s| s.meta.trustworthy(grace, self.max_lifetime));
                 if trustworthy {
                     warn!(error = %e, "refresh failed (in grace, cache kept)");
                     outcome = "err_in_grace";
@@ -449,7 +497,7 @@ mod prod {
                 let mut jwks_guard = self.popp_jwks.write().await;
                 let trustworthy = jwks_guard
                     .as_ref()
-                    .is_some_and(|s| s.meta.trustworthy(grace));
+                    .is_some_and(|s| s.meta.trustworthy(grace, self.max_lifetime));
                 if trustworthy {
                     warn!(error = %e, "refresh failed (in grace, cache kept)");
                     outcome = "err_in_grace";
@@ -495,17 +543,30 @@ mod prod {
             // --- Step 1: resolve JWKS URI via OIDC discovery ---
             let jwks_uri = {
                 let cached = self.pdp_oidc.read().await;
-                if !force && cached.as_ref().is_some_and(|c| c.meta.is_fresh()) {
+                if !force
+                    && cached
+                        .as_ref()
+                        .is_some_and(|c| c.meta.is_fresh(self.max_lifetime))
+                {
                     cached.as_ref().unwrap().jwks_uri.clone()
                 } else {
-                    let old_meta = cached.as_ref().map(|c| c.meta.clone()).unwrap_or_default();
+                    let old_meta = cached
+                        .as_ref()
+                        .map(|c| c.meta.validators(self.max_lifetime))
+                        .unwrap_or_default();
                     drop(cached);
 
                     let well_known = format!("{fetch_base}/.well-known/openid-configuration");
 
-                    let (status, headers, body) =
-                        conditional_get(client, &well_known, &old_meta, forwarded_for, origin)
-                            .await?;
+                    let (status, headers, body) = conditional_get(
+                        client,
+                        &well_known,
+                        &old_meta,
+                        forwarded_for,
+                        origin,
+                        self.max_lifetime,
+                    )
+                    .await?;
 
                     let mut pdp_oidc = self.pdp_oidc.write().await;
                     if status == StatusCode::NOT_MODIFIED {
@@ -545,17 +606,35 @@ mod prod {
 
             // --- Step 2: fetch JWKS ---
             let old_meta = {
-                let cached = self.pdp_jwks.read().await;
-                if !force && cached.as_ref().is_some_and(|s| s.meta.is_fresh()) {
+                let mut cached = self.pdp_jwks.write().await;
+                if cached.as_ref().is_some_and(|s| s.source != jwks_uri) {
+                    warn!(jwks_uri, "pdp: jwks_uri changed, cached keys dropped");
+                    *cached = None;
+                }
+                if !force
+                    && cached
+                        .as_ref()
+                        .is_some_and(|s| s.meta.is_fresh(self.max_lifetime))
+                {
                     debug!("JWKS still fresh, skipping fetch");
                     return Ok(());
                 }
 
-                cached.as_ref().map(|s| s.meta.clone()).unwrap_or_default()
+                cached
+                    .as_ref()
+                    .map(|s| s.meta.validators(self.max_lifetime))
+                    .unwrap_or_default()
             };
 
-            let (status, headers, body) =
-                conditional_get(client, &jwks_uri, &old_meta, forwarded_for, origin).await?;
+            let (status, headers, body) = conditional_get(
+                client,
+                &jwks_uri,
+                &old_meta,
+                forwarded_for,
+                origin,
+                self.max_lifetime,
+            )
+            .await?;
 
             let mut pdp_jwks = self.pdp_jwks.write().await;
             if status == StatusCode::NOT_MODIFIED {
@@ -569,6 +648,7 @@ mod prod {
                 let jwk_set: JwkSet = serde_json::from_slice(&body).context("parse JWKS")?;
                 let mut jwks = JwkStore {
                     meta,
+                    source: jwks_uri.clone(),
                     ..Default::default()
                 };
                 for jwk in jwk_set.keys {
@@ -608,13 +688,19 @@ mod prod {
                     // --- Step 1: resolve signed_jwks_uri + entity JWKS via entity statement ---
                     let (entity_jwks, signed_jwks_url) = {
                         let cached = self.popp_entity.read().await;
-                        if !force && cached.as_ref().is_some_and(|c| c.meta.is_fresh()) {
+                        if !force
+                            && cached
+                                .as_ref()
+                                .is_some_and(|c| c.meta.is_fresh(self.max_lifetime))
+                        {
                             let c = cached.as_ref().unwrap();
                             (c.jwks.clone(), c.signed_jwks_uri.clone())
                         } else {
                             let entity_url = format!("{issuer}/.well-known/openid-federation");
-                            let old_meta =
-                                cached.as_ref().map(|c| c.meta.clone()).unwrap_or_default();
+                            let old_meta = cached
+                                .as_ref()
+                                .map(|c| c.meta.validators(self.max_lifetime))
+                                .unwrap_or_default();
 
                             drop(cached);
 
@@ -624,6 +710,7 @@ mod prod {
                                 &old_meta,
                                 forwarded_for,
                                 None,
+                                self.max_lifetime,
                             )
                             .await?;
 
@@ -687,17 +774,37 @@ mod prod {
 
                     // --- Step 2: fetch signed JWKS ---
                     let old_meta = {
-                        let cached = self.popp_jwks.read().await;
-                        if !force && cached.as_ref().is_some_and(|s| s.meta.is_fresh()) {
+                        let mut cached = self.popp_jwks.write().await;
+                        if cached.as_ref().is_some_and(|s| s.source != signed_jwks_url) {
+                            warn!(
+                                signed_jwks_url,
+                                "popp: signed_jwks_uri changed, cached keys dropped"
+                            );
+                            *cached = None;
+                        }
+                        if !force
+                            && cached
+                                .as_ref()
+                                .is_some_and(|s| s.meta.is_fresh(self.max_lifetime))
+                        {
                             debug!("signed JWKS still fresh, skipping fetch");
                             return Ok(());
                         }
-                        cached.as_ref().map(|s| s.meta.clone()).unwrap_or_default()
+                        cached
+                            .as_ref()
+                            .map(|s| s.meta.validators(self.max_lifetime))
+                            .unwrap_or_default()
                     };
 
-                    let (status, headers, body) =
-                        conditional_get(client, &signed_jwks_url, &old_meta, forwarded_for, None)
-                            .await?;
+                    let (status, headers, body) = conditional_get(
+                        client,
+                        &signed_jwks_url,
+                        &old_meta,
+                        forwarded_for,
+                        None,
+                        self.max_lifetime,
+                    )
+                    .await?;
 
                     let mut popp_jwks = self.popp_jwks.write().await;
 
@@ -731,6 +838,7 @@ mod prod {
 
                         let mut jwks = JwkStore {
                             meta,
+                            source: signed_jwks_url.clone(),
                             ..Default::default()
                         };
                         for jwk in signed_jwks.jwks.keys {
@@ -804,6 +912,212 @@ mod prod {
     pub fn jwk_cache() -> &'static impl JwkCacheOps {
         JWK_CACHE.get().expect("JwkCache not initialized")
     }
+
+    #[cfg(test)]
+    mod tests {
+        use std::convert::Infallible;
+        use std::sync::{Arc, Mutex};
+
+        use http_body_util::Full;
+        use hyper::body::Incoming;
+        use hyper::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH};
+        use hyper::service::service_fn;
+        use hyper::{Request, Response};
+        use hyper_util::rt::TokioIo;
+        use tokio::net::TcpListener;
+
+        use super::*;
+
+        const MAX_LIFETIME: Duration = Duration::from_secs(60);
+        const TEN_YEARS: u64 = 315_360_000;
+
+        struct Pdp {
+            issuer: String,
+            jwks_path: &'static str,
+            kids: Vec<&'static str>,
+            etag: &'static str,
+            max_age: u64,
+            /// answer 200 even to a matching `If-None-Match`
+            ignore_validators: bool,
+            jwks_200: usize,
+            jwks_304: usize,
+        }
+
+        impl Pdp {
+            fn handle(&mut self, req: &Request<Incoming>) -> Response<Full<Bytes>> {
+                let path = req.uri().path();
+                if path == "/.well-known/openid-configuration" {
+                    let body = serde_json::json!({
+                        "issuer": self.issuer,
+                        "jwks_uri": format!("{}{}", self.issuer, self.jwks_path),
+                    });
+                    return Response::new(Full::new(body.to_string().into()));
+                }
+                if path != self.jwks_path {
+                    return Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Full::default())
+                        .unwrap();
+                }
+                let response = Response::builder()
+                    .header(ETAG, self.etag)
+                    .header(CACHE_CONTROL, format!("max-age={}", self.max_age));
+                let matches = req
+                    .headers()
+                    .get(IF_NONE_MATCH)
+                    .is_some_and(|v| v.as_bytes() == self.etag.as_bytes());
+                if matches && !self.ignore_validators {
+                    self.jwks_304 += 1;
+                    return response
+                        .status(StatusCode::NOT_MODIFIED)
+                        .body(Full::default())
+                        .unwrap();
+                }
+                self.jwks_200 += 1;
+                let keys: Vec<_> = self
+                    .kids
+                    .iter()
+                    .map(|kid| {
+                        serde_json::json!({
+                            "kty": "EC", "crv": "P-256", "kid": kid, "x": "AA", "y": "AA",
+                        })
+                    })
+                    .collect();
+                let body = serde_json::json!({ "keys": keys });
+                response.body(Full::new(body.to_string().into())).unwrap()
+            }
+        }
+
+        async fn start_pdp() -> (Arc<Mutex<Pdp>>, JwkCache) {
+            CLIENT.get_or_init(reqwest::Client::new);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let issuer = format!("http://{}", listener.local_addr().unwrap());
+            let pdp = Arc::new(Mutex::new(Pdp {
+                issuer: issuer.clone(),
+                jwks_path: "/certs",
+                kids: vec!["pdp"],
+                etag: "\"v1\"",
+                max_age: 60,
+                ignore_validators: false,
+                jwks_200: 0,
+                jwks_304: 0,
+            }));
+            let state = pdp.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let state = state.clone();
+                    let service = service_fn(move |req| {
+                        let response = state.lock().unwrap().handle(&req);
+                        async move { Ok::<_, Infallible>(response) }
+                    });
+                    tokio::spawn(
+                        hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service),
+                    );
+                }
+            });
+            let cache = JwkCache {
+                pdp_issuer: issuer.clone(),
+                pdp_url: issuer,
+                pdp_oidc: Default::default(),
+                pdp_jwks: Default::default(),
+                popp_issuer: None,
+                popp_entity: Default::default(),
+                popp_jwks: Default::default(),
+                refresh_interval: Duration::from_secs(300),
+                max_lifetime: MAX_LIFETIME,
+            };
+            (pdp, cache)
+        }
+
+        async fn inject(pdp: &Mutex<Pdp>, cache: &JwkCache) {
+            {
+                let mut pdp = pdp.lock().unwrap();
+                pdp.kids = vec!["pdp", "attacker"];
+                pdp.max_age = TEN_YEARS;
+                pdp.ignore_validators = true;
+            }
+            cache
+                .get_jwk_pdp("attacker".into(), None)
+                .await
+                .expect("injected key");
+            let mut pdp = pdp.lock().unwrap();
+            pdp.kids = vec!["pdp"];
+            pdp.max_age = 60;
+            pdp.ignore_validators = false;
+        }
+
+        /// Let `max_lifetime` pass for the cached key set.
+        async fn expire(cache: &JwkCache) {
+            let mut jwks = cache.pdp_jwks.write().await;
+            let meta = &mut jwks.as_mut().expect("store").meta;
+            meta.installed_at = Some(
+                Instant::now()
+                    .checked_sub(MAX_LIFETIME)
+                    .expect("monotonic clock older than MAX_LIFETIME"),
+            );
+        }
+
+        #[tokio::test]
+        async fn injected_key_set_is_replaced_after_max_lifetime() {
+            let (pdp, cache) = start_pdp().await;
+            cache.fetch_pdp().await.expect("initial fetch");
+            assert!(cache.get_jwk_pdp("attacker".into(), None).await.is_err());
+
+            inject(&pdp, &cache).await;
+            let (ok, not_modified) = {
+                let pdp = pdp.lock().unwrap();
+                (pdp.jwks_200, pdp.jwks_304)
+            };
+
+            // within the lifetime the injected response's headers still rule:
+            // the periodic refresh skips the fetch, a forced one gets a 304
+            cache.fetch_pdp().await.expect("periodic refresh");
+            assert!(cache.get_jwk_pdp("unknown".into(), None).await.is_err());
+            assert!(cache.pdp_jwks.get_key("attacker").await.is_some());
+            assert_eq!(pdp.lock().unwrap().jwks_200, ok);
+            assert_eq!(pdp.lock().unwrap().jwks_304, not_modified + 1);
+
+            expire(&cache).await;
+            cache.fetch_pdp().await.expect("periodic refresh");
+            assert!(cache.pdp_jwks.get_key("attacker").await.is_none());
+            assert!(cache.pdp_jwks.get_key("pdp").await.is_some());
+            assert_eq!(pdp.lock().unwrap().jwks_200, ok + 1);
+            assert_eq!(pdp.lock().unwrap().jwks_304, not_modified + 1);
+        }
+
+        #[tokio::test]
+        async fn revalidation_does_not_extend_max_lifetime() {
+            let (pdp, cache) = start_pdp().await;
+            cache.fetch_pdp().await.expect("initial fetch");
+            inject(&pdp, &cache).await;
+            expire(&cache).await;
+
+            // would be answered 304 if the stored ETag were sent
+            assert!(cache.get_jwk_pdp("unknown".into(), None).await.is_err());
+            assert!(cache.pdp_jwks.get_key("attacker").await.is_none());
+            assert_eq!(pdp.lock().unwrap().jwks_304, 0);
+        }
+
+        #[tokio::test]
+        async fn changed_jwks_uri_drops_cached_keys() {
+            let (pdp, cache) = start_pdp().await;
+            cache.fetch_pdp().await.expect("initial fetch");
+            assert!(cache.pdp_jwks.get_key("pdp").await.is_some());
+
+            // same ETag at the new location: a conditional request gets a 304
+            {
+                let mut pdp = pdp.lock().unwrap();
+                pdp.jwks_path = "/elsewhere";
+                pdp.kids = vec!["other"];
+            }
+            cache.fetch_pdp().await.expect("refresh from new jwks_uri");
+            assert!(cache.pdp_jwks.get_key("pdp").await.is_none());
+            assert!(cache.pdp_jwks.get_key("other").await.is_some());
+            assert_eq!(pdp.lock().unwrap().jwks_304, 0);
+        }
+    }
 }
 #[cfg(not(test))]
 pub use prod::*;
@@ -871,28 +1185,32 @@ mod tests {
             last_modified: lm.map(Into::into),
             max_age: max_age.map(Duration::from_secs),
             fetched_at: Some(Instant::now()),
+            installed_at: Some(Instant::now()),
             fetched_at_epoch: 1744300000,
         }
     }
+
+    const LIFETIME: Duration = Duration::from_hours(24);
+    const GRACE: Duration = Duration::from_secs(60);
 
     // --- is_fresh ---
 
     #[test]
     fn fresh_when_within_max_age() {
         let meta = meta_with(None, None, Some(300));
-        assert!(meta.is_fresh());
+        assert!(meta.is_fresh(LIFETIME));
     }
 
     #[test]
     fn stale_when_max_age_zero() {
         let meta = meta_with(None, None, Some(0));
-        assert!(!meta.is_fresh());
+        assert!(!meta.is_fresh(LIFETIME));
     }
 
     #[test]
     fn stale_when_no_max_age() {
         let meta = meta_with(Some("\"abc\""), None, None);
-        assert!(!meta.is_fresh());
+        assert!(!meta.is_fresh(LIFETIME));
     }
 
     #[test]
@@ -901,12 +1219,55 @@ mod tests {
             max_age: Some(Duration::from_secs(300)),
             ..Default::default()
         };
-        assert!(!meta.is_fresh());
+        assert!(!meta.is_fresh(LIFETIME));
     }
 
     #[test]
     fn stale_when_default() {
-        assert!(!HttpCacheMeta::default().is_fresh());
+        assert!(!HttpCacheMeta::default().is_fresh(LIFETIME));
+    }
+
+    // --- max lifetime ---
+
+    const TEN_YEARS: u64 = 315_360_000;
+
+    #[test]
+    fn stale_past_max_lifetime_despite_max_age() {
+        let meta = meta_with(None, None, Some(TEN_YEARS));
+        assert!(meta.is_fresh(LIFETIME));
+        assert!(!meta.is_fresh(Duration::ZERO));
+    }
+
+    #[test]
+    fn revalidation_does_not_extend_lifetime() {
+        let mut meta = meta_with(Some("\"abc\""), None, Some(TEN_YEARS));
+        let installed_at = meta.installed_at;
+        meta.merge_headers(&HeaderMap::new());
+        assert_eq!(meta.installed_at, installed_at);
+    }
+
+    #[test]
+    fn validators_withheld_past_max_lifetime() {
+        let meta = meta_with(Some("\"abc\""), Some("Thu, 02 Apr 2026 13:10:18 GMT"), None);
+        let v = meta.validators(LIFETIME);
+        assert_eq!(v.etag, meta.etag);
+        assert_eq!(v.last_modified, meta.last_modified);
+        let v = meta.validators(Duration::ZERO);
+        assert_eq!(v.etag, None);
+        assert_eq!(v.last_modified, None);
+    }
+
+    #[test]
+    fn untrustworthy_past_max_lifetime_despite_max_age() {
+        let meta = meta_with(None, None, Some(TEN_YEARS));
+        assert!(meta.trustworthy(GRACE, LIFETIME));
+        assert!(!meta.trustworthy(Duration::ZERO, Duration::ZERO));
+    }
+
+    #[test]
+    fn trustworthy_survives_max_age_overflow() {
+        let meta = meta_with(None, None, Some(u64::MAX));
+        assert!(meta.trustworthy(GRACE, LIFETIME));
     }
 
     // --- trustworthy ---
@@ -914,7 +1275,7 @@ mod tests {
     #[test]
     fn trustworthy_within_max_age() {
         let meta = meta_with(None, None, Some(300));
-        assert!(meta.trustworthy(Duration::from_secs(60)));
+        assert!(meta.trustworthy(GRACE, LIFETIME));
     }
 
     #[test]
@@ -922,13 +1283,13 @@ mod tests {
         // Server didn't send Cache-Control: max_age defaults to 0, but grace
         // alone keeps the cache trustworthy briefly past last fetch.
         let meta = meta_with(Some("\"abc\""), None, None);
-        assert!(meta.trustworthy(Duration::from_secs(60)));
+        assert!(meta.trustworthy(GRACE, LIFETIME));
     }
 
     #[test]
     fn trustworthy_within_grace_when_max_age_zero() {
         let meta = meta_with(None, None, Some(0));
-        assert!(meta.trustworthy(Duration::from_secs(60)));
+        assert!(meta.trustworthy(GRACE, LIFETIME));
     }
 
     #[test]
@@ -937,19 +1298,19 @@ mod tests {
             max_age: Some(Duration::from_secs(300)),
             ..Default::default()
         };
-        assert!(!meta.trustworthy(Duration::from_secs(60)));
+        assert!(!meta.trustworthy(GRACE, LIFETIME));
     }
 
     #[test]
     fn untrustworthy_with_zero_grace_and_zero_max_age() {
         // max_age=0 + grace=0 → window is 0, immediately stale
         let meta = meta_with(None, None, Some(0));
-        assert!(!meta.trustworthy(Duration::ZERO));
+        assert!(!meta.trustworthy(Duration::ZERO, LIFETIME));
     }
 
     #[test]
     fn untrustworthy_when_default() {
-        assert!(!HttpCacheMeta::default().trustworthy(Duration::from_secs(60)));
+        assert!(!HttpCacheMeta::default().trustworthy(GRACE, LIFETIME));
     }
 
     // --- parse_max_age ---
@@ -1015,6 +1376,7 @@ mod tests {
             last_modified: Some("Thu, 02 Apr 2026 13:10:18 GMT".into()),
             max_age: Some(Duration::from_secs(300)),
             fetched_at: Some(Instant::now()),
+            installed_at: Some(Instant::now()),
             fetched_at_epoch: 1744300000, // 2025-04-10 some time
         };
         let s = meta.to_string();

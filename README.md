@@ -115,14 +115,90 @@ Some usage examples:
     cargo nextest run access
 ```
 
-To run the integration tests, the following environment variables must be set:
+### running the integration tests
 
-|env               |example                                                                         |
-|---               |---                                                                             |
-|IT_HOST           |zeta-cd.westeurope.cloudapp.azure.com                                           |
-|IT_AUTH           |https://zeta-cd.westeurope.cloudapp.azure.com/auth                              |
-|IT_P12            |../smb-keystore.p12                                                             |
-|IT_P12_PASS       |ichangedit                                                                      |
+The PEP under test does **not** have to be deployed anywhere: the tests spawn their own nginx
+(with the freshly built module), an echo server as upstream, an HSM simulator, an OCSP
+responder and a PDP revocation mock, all on localhost. Only the token side is remote: the tests
+register a client at a ZETA environment (Keycloak/PDP, realm `zeta-guard`) and exchange
+access tokens there. That environment must be reachable and must be the one the local test
+nginx trusts as issuer. Note that every run registers a new client on it.
+
+The following environment variables must be set (`TestContext` in `tests/common/mod.rs`
+panics with `environment variable not found` otherwise). Put them into `.envrc.local` in the
+repo root instead of exporting them by hand, see "Environment file" below:
+
+|env               |meaning                                                                          |example                                            |
+|---               |---                                                                              |---                                                |
+|IT_HOST           |host of the ZETA environment                                                     |zeta-cd.westeurope.cloudapp.azure.com              |
+|IT_AUTH           |base URL of its auth server (Keycloak); registration, nonce and token URLs derive from it|https://zeta-cd.westeurope.cloudapp.azure.com/auth|
+|IT_P12            |PKCS#12 file with the SMC-B identity (certificate and key)                       |../smcb.p12                                        |
+|IT_P12_PASS       |password of `IT_P12` (get it from 1Password)                                                 |                                                   |
+|IT_POPP_P12       |PKCS#12 file with the PoPP signing key                                           |misc/popp-token-Server-Sim-nist-komp61.p12         |
+|IT_POPP_P12_PASS  |password of `IT_POPP_P12`                                                        |                                                 |
+|IT_POPP_P12_ALIAS |alias of the key inside `IT_POPP_P12`                                            |alias                                              |
+
+(The PoPP values are the ones the load-dispenser uses for `misc/popp-token-Server-Sim-nist-komp61.p12`.)
+
+#### SMC-B keystore
+
+The SMC-B keystore and its password are kept in 1Password. The keystore is a base64-encoded
+PKCS#12 (the same format as the `*.b64` files the load-dispenser reads), so decode it to a file
+outside the repo. Save the two 1Password values as `../smb_keystore` (base64 text) and
+`../smb_keystore_pw` (password), then:
+
+```sh
+base64 -d < ../smb_keystore > ../smcb.p12   # note the "<": macOS base64 has no file argument
+```
+
+`IT_P12` and `IT_P12_PASS` then go into `.envrc.local` (below). Check that the keystore opens
+(should print a TEST-ONLY SMC-B subject):
+
+```sh
+openssl pkcs12 -in ../smcb.p12 -passin "pass:$(cat ../smb_keystore_pw)" -nokeys -clcerts | openssl x509 -noout -subject -enddate
+```
+
+Don't commit the keystore or the password, neither the base64 nor the decoded file.
+
+#### Environment file
+
+`.envrc.local` is git-ignored, so it is the place for the `IT_*` variables (and the keystore
+password) that must not be committed. Use absolute paths, the tests run with the crate root as
+working directory:
+
+```sh
+# .envrc.local
+export IT_HOST=zeta-cd.westeurope.cloudapp.azure.com
+export IT_AUTH=https://zeta-cd.westeurope.cloudapp.azure.com/auth
+export IT_P12=/path/to/smcb.p12
+export IT_P12_PASS="$(cat /path/to/smb_keystore_pw)"
+export IT_POPP_P12=/path/to/ngx_pep/misc/popp-token-Server-Sim-nist-komp61.p12
+export IT_POPP_P12_PASS=<password>
+export IT_POPP_P12_ALIAS=alias
+```
+
+With direnv, `.envrc` loads `.envrc.local` automatically (see the direnv note above). Without it,
+load the file into the current shell with `set -a; . ./.envrc.local; set +a`.
+
+#### Running
+
+```sh
+# with the variables from .envrc.local loaded (see above)
+
+# all integration tests
+cargo nextest run -p ngx_pep --test it
+# a single one
+cargo nextest run -p ngx_pep --test it sending_and_receiving_blocks
+```
+
+nextest first runs the setup script (`misc/nextest-setup`), which builds the nginx module and
+`ossl_hsm`; the first run takes a while. All nginx instances log to `prefix/test.log`, look there
+first when a test fails. The tests bind local ports (see below) and need network access to the
+ZETA environment, so they don't work in an environment that blocks either.
+
+The test nginx exports its telemetry (OTLP) to an in-process receiver
+(`tests/common/otlp.rs`), so tests can assert on the exported logs and metrics, see
+`impossible_travel_exported_via_otlp`.
 
 For easier usage of the `purl` tool, these can also be defined:
 
@@ -144,9 +220,10 @@ registration locally. See also `misc/nginx.conf.tpl` and `build.rs` for template
 
 For technical reasons the integration tests spawn multiple nginx processes on unique
 ports and with unique temporary directories. The configurations get written to
-`prefix/conf/test-{port}.conf` by build.rs. The port range `8003..=8006` is provisioned
-like this currently, and the "max-threads" sempahore is set to 4 in
-`.config/nextest.toml` accordingly.
+`prefix/conf/test-{port}.conf` by build.rs. The port range `8003..=8010` is provisioned
+like this currently. The "max-threads" semaphore in `.config/nextest.toml` is set to 4, half
+the number of ports, because the ports of a test that just finished can stay busy for a
+moment.
 
 All logs (nginx access and error logs, stdout, stderr) are merged to a single log file
 `prefix/test.log`
@@ -214,8 +291,14 @@ docker run --tty --interactive --rm \
   --publish 8080:8080 \
   --publish 8443:8443 \
   --env HSM_PROXY_ADDR=http://10.0.2.2:50051 \
+  --env HSM_PROXY_ALLOW_PLAINTEXT=1 \
     ngx_pep:latest
 ```
+
+The HSM simulator serves plaintext here, and the provider only connects in plaintext to a
+loopback address unless `HSM_PROXY_ALLOW_PLAINTEXT=1` is set; see below for the provider's
+settings, and [the hsm-sim README.md](./hsm_sim/README.md) for running the simulator with TLS
+and client certificates.
 
 `http://10.0.2.2:50051` must be reachable from within the container. For rootless
 docker, this can be achieved by passing the environment variable
@@ -244,6 +327,7 @@ docker run --tty --interactive --rm \
   --publish 8080:8080 \
   --publish 8443:8443 \
   --env HSM_PROXY_ADDR=http://10.0.2.2:50051 \
+  --env HSM_PROXY_ALLOW_PLAINTEXT=1 \
     ngx_pep:latest
 ```
 
@@ -325,6 +409,25 @@ spec:
         pathType: Prefix
 ```
 
+The provider is configured through the environment:
+
+|Variable|Meaning|
+|---|---|
+|`HSM_PROXY_ADDR`|`https://host[:port]` of the HSM proxy (default port 50051). `http://` is only accepted for a loopback address; default `http://[::1]:50051`.|
+|`HSM_PROXY_CA`|PEM file with the CA certificate(s) the proxy's certificate must chain to. Unset: the system trust store. `https://` only.|
+|`HSM_PROXY_CLIENT_CERT`, `HSM_PROXY_CLIENT_KEY`|PEM files with the certificate (chain) and private key the provider authenticates with (mTLS). Both or neither; `https://` only.|
+|`HSM_PROXY_ALLOW_PLAINTEXT`|`1` accepts `http://` to a non-loopback address. The provider then neither encrypts nor authenticates the connection itself: only for local testing, or when something else secures the link, e.g. a service mesh sidecar doing mTLS.|
+
+The proxy's certificate must be valid for the host name in `HSM_PROXY_ADDR`. When the address
+asks for plaintext to a remote host the provider does not load, and nginx fails to start if
+it is configured with a `store:hsm:` key.
+
+The HSM proxy decides who may use which key. Give the provider a client certificate so the
+proxy can tell it apart from anything else that reaches it, and keep network access to the
+proxy restricted as well. The files are read once when nginx starts; replacing them takes a
+restart, a reload is not enough. Certificates and keys must use RSA, NIST P-256/P-384 or
+Ed25519.
+
 For this to work, you must define env `HSM_PROXY_ADDR`, and mount certificate files to
 `/etc/nginx/certs`, e.g. with the `oci://ghcr.io/nginx/charts/nginx-ingress` Helm chart:
 
@@ -339,7 +442,7 @@ controller:
   ## The additional environment variables to be set on the Ingress Controller pods.
   env:
   - name: HSM_PROXY_ADDR
-    value: your-hsm:50051
+    value: https://your-hsm:50051
 
   ## The volumes of the Ingress Controller pods.
   volumes:

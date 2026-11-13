@@ -142,7 +142,7 @@ pub fn install_config() -> Result<()> {
     // configuration for a range of ports. This allows starting multiple tests in parallel.
     //
     // see also: tests/common/mod.rs
-    for port in 8003..=8006 {
+    for port in 8003..=8010 {
         let mut test_config = ConfigFile::new();
         test_config.name = format!("test-{port}");
         test_config.variant = "test".to_string();

@@ -32,6 +32,7 @@ use crate::conf::{LocationConfig, MainConfig};
 use crate::jwk_cache::reset_jwk_cache_mock;
 use crate::request_ops::*;
 use crate::request_ops::{ConfigOps, RequestOps};
+use crate::user_role::UserRole;
 
 #[derive(Delegate)]
 #[delegate(RequestOps, target = "request")]
@@ -97,6 +98,8 @@ pub async fn request_mock() -> RequestMock {
     mock.request
         .expect_set_zeta_upstream_header()
         .returning(|_slot, _value| ());
+    // `set_user_role` is deliberately not mocked here: tests that reach token validation
+    // must state which role they expect (see `pep::tests::sets_user_role_*`).
 
     mock
 }

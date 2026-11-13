@@ -51,10 +51,12 @@ use ngx_pep::client::{ClientRegistration, register_client};
 
 use crate::common::echo::echo_server;
 use crate::common::ocsp::ocsp_responder;
+use crate::common::otlp::otlp_server;
 use crate::common::revocation::revocation_server;
 
 pub mod echo;
 pub mod ocsp;
+pub mod otlp;
 pub mod revocation;
 
 #[allow(dead_code, clippy::all)]
@@ -114,6 +116,8 @@ pub fn reserve_port(prefix: &Path, range: RangeInclusive<u16>) -> Result<PortLoc
             TcpListener::bind(("127.0.0.1", port + 300)),
             // pdp revocation mock
             TcpListener::bind(("127.0.0.1", port + 400)),
+            // OTLP receiver
+            TcpListener::bind(("127.0.0.1", port + 500)),
         ) {
             (
                 Ok(listener_nginx),
@@ -121,6 +125,7 @@ pub fn reserve_port(prefix: &Path, range: RangeInclusive<u16>) -> Result<PortLoc
                 Ok(listener_hsm_sim),
                 Ok(listener_ocsp),
                 Ok(listener_revocation),
+                Ok(listener_otlp),
             ) => {
                 // ports are bindable, drop sockets so nginx and echo server can bind on it
                 drop(listener_nginx);
@@ -128,6 +133,7 @@ pub fn reserve_port(prefix: &Path, range: RangeInclusive<u16>) -> Result<PortLoc
                 drop(listener_hsm_sim);
                 drop(listener_ocsp);
                 drop(listener_revocation);
+                drop(listener_otlp);
                 return Ok(lock);
             }
             _ => {
@@ -147,8 +153,10 @@ struct State {
     started: bool,
     port_lock: PortLock,
     hsm_sim: Option<JoinHandle<()>>,
+    hsm_pki: Option<Arc<hsm_sim::tests::TestPki>>,
     ocsp_responder: Option<JoinHandle<()>>,
     revocation_mock: Option<JoinHandle<()>>,
+    otlp_mock: Option<JoinHandle<()>>,
 }
 
 struct NginxManager {
@@ -163,7 +171,7 @@ fn manager() -> Manager {
     let prefix = Path::new("./prefix").to_path_buf();
 
     // see build.rs for range
-    let port_lock = reserve_port(&prefix, 8003..=8006).expect("port");
+    let port_lock = reserve_port(&prefix, 8003..=8010).expect("port");
 
     MANAGER
         .get_or_init(|| {
@@ -182,8 +190,10 @@ fn manager() -> Manager {
                     started: false,
                     port_lock,
                     hsm_sim: None,
+                    hsm_pki: None,
                     ocsp_responder: None,
                     revocation_mock: None,
+                    otlp_mock: None,
                 }),
                 leases: AtomicUsize::new(0),
                 pid: AtomicI32::new(0),
@@ -204,11 +214,22 @@ impl Manager {
 
         let port = state.port_lock.port;
         let hsm_sim_addr = format!("127.0.0.1:{}", port + 200);
-        let hsm_sim_url = format!("http://{hsm_sim_addr}");
+        let hsm_sim_url = format!("https://{hsm_sim_addr}");
+
+        // nginx reaches hsm_sim over mTLS; the provider reads these files at startup
+        let pki = Arc::new(hsm_sim::tests::TestPki::generate().context("hsm_sim test PKI")?);
+        let hsm_tls_dir = fs::canonicalize(&state.prefix)
+            .context("prefix")?
+            .join(format!("test-{port}/hsm-tls"));
+        fs::create_dir_all(&hsm_tls_dir).context("hsm-tls dir")?;
+        fs::write(hsm_tls_dir.join("ca.pem"), &pki.ca_cert)?;
+        fs::write(hsm_tls_dir.join("client.pem"), &pki.client_cert)?;
+        fs::write(hsm_tls_dir.join("client.key"), &pki.client_key)?;
+        state.hsm_pki = Some(pki.clone());
 
         let hsm_sim_addr_clone = hsm_sim_addr.clone();
         let hsm_sim_task = tokio::spawn(async move {
-            let _ = hsm_sim::tests::start_server(&hsm_sim_addr_clone).await;
+            let _ = hsm_sim::tests::start_mtls_server(&hsm_sim_addr_clone, &pki).await;
         });
 
         let old_handle = state.hsm_sim.replace(hsm_sim_task);
@@ -282,9 +303,37 @@ impl Manager {
         .await
         .context("revocation mock did not become ready")?;
 
+        // Start OTLP receiver, the PEP exports its telemetry here
+        let otlp_port = port + 500;
+        let otlp_task =
+            tokio::spawn(async move { otlp_server(otlp_port).await.expect("otlp_server") });
+
+        let old_otlp = state.otlp_mock.replace(otlp_task);
+        if let Some(handle) = old_otlp {
+            handle.abort();
+        }
+
+        let otlp_addr = format!("127.0.0.1:{otlp_port}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if tokio::net::TcpStream::connect(&otlp_addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("otlp receiver did not become ready")?;
+
         let mut cmd = Command::new(state.prefix.join("sbin/nginx"));
         cmd.args(["-c", &format!("conf/test-{port}.conf")]);
         cmd.env("HSM_PROXY_ADDR", &hsm_sim_url);
+        cmd.env("HSM_PROXY_CA", hsm_tls_dir.join("ca.pem"));
+        cmd.env("HSM_PROXY_CLIENT_CERT", hsm_tls_dir.join("client.pem"));
+        cmd.env("HSM_PROXY_CLIENT_KEY", hsm_tls_dir.join("client.key"));
+        cmd.env("OTEL_EXPORTER_OTLP_ENDPOINT", format!("http://{otlp_addr}"));
+        // don't wait the default 60s for the first metrics export
+        cmd.env("OTEL_METRIC_EXPORT_INTERVAL", "500");
 
         // Redirect stdout/stderr to the shared test log file.
         // All nginx instances + their ossl_hsm provider output go to one file for easier debugging.
@@ -324,6 +373,9 @@ impl Manager {
             handle.abort();
         }
         if let Some(handle) = state.ocsp_responder.take() {
+            handle.abort();
+        }
+        if let Some(handle) = state.otlp_mock.take() {
             handle.abort();
         }
 
@@ -387,9 +439,17 @@ impl NginxLease {
         Url::parse(&format!("https://127.0.0.1:2{port}")).context("url parse")
     }
 
-    pub async fn hsm_sim_url(&self) -> Result<String> {
-        let port = self.mgr.0.state.lock().await.port_lock.port;
-        Ok(format!("http://127.0.0.1:{}", port + 200))
+    /// Client for this nginx's hsm_sim, authenticated like the provider.
+    pub async fn hsm_sim_client(
+        &self,
+    ) -> Result<
+        hsm_sim::proto::hsm_proxy_service_client::HsmProxyServiceClient<tonic::transport::Channel>,
+    > {
+        let state = self.mgr.0.state.lock().await;
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], state.port_lock.port + 200));
+        let pki = state.hsm_pki.as_ref().context("hsm_sim not started")?;
+        let channel = pki.connect(addr).await?;
+        Ok(hsm_sim::proto::hsm_proxy_service_client::HsmProxyServiceClient::new(channel))
     }
 
     pub async fn revocation_url(&self) -> Result<String> {
@@ -573,4 +633,23 @@ pub async fn context() -> &'static TestContext {
             rt.block_on(async { TestContext::get().await.expect("TestContext") })
         })
     })
+}
+
+/// Waits for the attack-detection line of a request from `client_ip` in the shared nginx test
+/// log and returns it. The PEP writes its logs to stdout in `PepStdoutFormat` (also when it
+/// exports to OTLP, see `src/otel.rs`).
+pub async fn attack_log_line(client_ip: &str) -> Result<String> {
+    let needle = format!("attackDetection.clientIP=\"{client_ip}\"");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(log) = fs::read_to_string("./prefix/test.log")
+                && let Some(line) = log.lines().rev().find(|l| l.contains(&needle))
+            {
+                return line.to_string();
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("no attack-detection log line for {client_ip} in prefix/test.log"))
 }

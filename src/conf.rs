@@ -134,6 +134,7 @@ pub struct MainConfig {
     pub revocation_url: Option<Url>,
     pub popp_issuer: Option<String>,
     pub jwks_refresh_interval: Duration,
+    pub jwks_max_lifetime: Duration,
     pub http_client_connect_timeout: Duration,
     pub http_client_timeout: Duration,
     pub http_client_accept_invalid_certs: bool,
@@ -146,6 +147,12 @@ pub struct MainConfig {
     pub asl_root_ca: Option<String>,
     pub asl_ocsp: OcspMode,
     pub asl_ocsp_ttl: Duration,
+    /// Size of the shared ASL session cache zone in bytes.
+    pub asl_session_cache_size: usize,
+    /// Lifetime of an established ASL session.
+    pub asl_session_ttl: Duration,
+    /// Lifetime of an unfinished ASL handshake (M1 seen, M3 outstanding).
+    pub asl_handshake_ttl: Duration,
     pub session_cache_zone: *mut ngx_shm_zone_t,
     pub block_list_zone: *mut ngx_shm_zone_t,
 }
@@ -158,6 +165,7 @@ impl Default for MainConfig {
             revocation_url: None,
             popp_issuer: None,
             jwks_refresh_interval: Duration::from_secs(300), // NOTE: not exposed as directive r.n.
+            jwks_max_lifetime: Duration::from_hours(24),
             http_client_connect_timeout: Duration::from_secs(2),
             http_client_timeout: Duration::from_secs(10),
             http_client_accept_invalid_certs: false,
@@ -170,6 +178,9 @@ impl Default for MainConfig {
             asl_root_ca: None,
             asl_ocsp: Default::default(),
             asl_ocsp_ttl: Duration::from_hours(24), // A_24624-01 #1
+            asl_session_cache_size: 100 << 20,
+            asl_session_ttl: Duration::from_hours(24),
+            asl_handshake_ttl: Duration::from_mins(5),
             session_cache_zone: ptr::null_mut(),
             block_list_zone: ptr::null_mut(),
         }
@@ -335,6 +346,31 @@ fn parse_duration(def: char, val: &str) -> anyhow::Result<Duration> {
     Ok(duration)
 }
 
+/// Smallest accepted session cache zone; nginx itself needs at least 8 pages.
+const MIN_SESSION_CACHE_SIZE: usize = 1 << 20;
+// guards against typos like 100000g, which would only fail later in nginx with an obscure error
+const MAX_SESSION_CACHE_SIZE: usize = 16 << 30;
+
+// parse a size spec of the form 512k, 100m or 1g, as nginx does; plain numbers are bytes
+fn parse_size(val: &str) -> anyhow::Result<usize> {
+    let spec = val.trim();
+    if spec.is_empty() {
+        return Err(anyhow!("empty value"));
+    }
+    let (amount, shift) = match spec.chars().last().unwrap().to_ascii_lowercase() {
+        'k' => (&spec[..spec.len() - 1], 10),
+        'm' => (&spec[..spec.len() - 1], 20),
+        'g' => (&spec[..spec.len() - 1], 30),
+        _ => (spec, 0),
+    };
+    let amount: usize = amount
+        .parse()
+        .map_err(|_| anyhow!("invalid number in size {val:?}"))?;
+    amount
+        .checked_mul(1 << shift)
+        .ok_or_else(|| anyhow!("size {val:?} too large"))
+}
+
 conf_handler!(pep_asl_signer_cert, MainConfig, |conf: &mut MainConfig,
                                                 val: &str|
  -> anyhow::Result<
@@ -408,6 +444,57 @@ conf_handler!(pep_asl_ocsp_ttl, MainConfig, |conf: &mut MainConfig,
     conf.asl_ocsp_ttl = parse_duration('m', val)?;
     Ok(ngx::core::NGX_CONF_OK)
 });
+
+conf_handler!(
+    pep_asl_session_cache_size,
+    MainConfig,
+    |conf: &mut MainConfig, val: &str| -> anyhow::Result<*mut c_char> {
+        let size = parse_size(val)?;
+        if size < MIN_SESSION_CACHE_SIZE {
+            anyhow::bail!("{val:?} is too small, minimum is 1m");
+        }
+        if size > MAX_SESSION_CACHE_SIZE {
+            anyhow::bail!("{val:?} is too large, maximum is 16g");
+        }
+        conf.asl_session_cache_size = size;
+        Ok(ngx::core::NGX_CONF_OK)
+    }
+);
+
+conf_handler!(pep_asl_session_ttl, MainConfig, |conf: &mut MainConfig,
+                                                val: &str|
+ -> anyhow::Result<
+    *mut c_char,
+> {
+    let ttl = parse_duration('m', val)?;
+    if ttl.is_zero() {
+        anyhow::bail!("must be greater than zero");
+    }
+    conf.asl_session_ttl = ttl;
+    Ok(ngx::core::NGX_CONF_OK)
+});
+
+conf_handler!(
+    pep_asl_handshake_ttl,
+    MainConfig,
+    |conf: &mut MainConfig, val: &str| -> anyhow::Result<*mut c_char> {
+        let ttl = parse_duration('m', val)?;
+        if ttl.is_zero() {
+            anyhow::bail!("must be greater than zero");
+        }
+        conf.asl_handshake_ttl = ttl;
+        Ok(ngx::core::NGX_CONF_OK)
+    }
+);
+
+conf_handler!(
+    pep_jwks_max_lifetime,
+    MainConfig,
+    |conf: &mut MainConfig, val: &str| -> anyhow::Result<*mut c_char> {
+        conf.jwks_max_lifetime = parse_duration('m', val)?;
+        Ok(ngx::core::NGX_CONF_OK)
+    }
+);
 
 conf_handler!(pep_asl_testing, MainConfig, |conf: &mut MainConfig,
                                             val: &str|
@@ -704,11 +791,12 @@ conf_handler!(
     }
 );
 
-pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 27] = [
+pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 31] = [
     main_command!("pep_pdp_issuer", pep_pdp_issuer),
     main_command!("pep_pdp_url", pep_pdp_url),
     main_command!("pep_revocation_url", pep_revocation_url),
     main_command!("pep_popp_issuer", pep_popp_issuer),
+    main_command!("pep_jwks_max_lifetime", pep_jwks_max_lifetime),
     main_command!(
         "pep_http_client_connect_timeout",
         pep_http_client_connect_timeout
@@ -727,6 +815,9 @@ pub(crate) static mut NGX_HTTP_PEP_COMMANDS: [ngx_command_t; 27] = [
     main_command!("pep_asl_root_ca", pep_asl_root_ca),
     main_command!("pep_asl_ocsp", pep_asl_ocsp),
     main_command!("pep_asl_ocsp_ttl", pep_asl_ocsp_ttl),
+    main_command!("pep_asl_session_cache_size", pep_asl_session_cache_size),
+    main_command!("pep_asl_session_ttl", pep_asl_session_ttl),
+    main_command!("pep_asl_handshake_ttl", pep_asl_handshake_ttl),
     loc_command!("pep", pep),
     loc_command!("pep_require_aud", pep_require_aud),
     loc_command!("pep_require_scope", pep_require_scope),
@@ -912,5 +1003,19 @@ mod tests {
             );
             assert!(!msg.is_empty());
         }
+    }
+
+    #[test]
+    fn parse_size_understands_nginx_suffixes() {
+        use crate::conf::parse_size;
+
+        assert_eq!(parse_size("4096").unwrap(), 4096);
+        assert_eq!(parse_size("512k").unwrap(), 512 << 10);
+        assert_eq!(parse_size("100M").unwrap(), 100 << 20);
+        assert_eq!(parse_size(" 1g ").unwrap(), 1 << 30);
+        assert!(parse_size("").is_err());
+        assert!(parse_size("m").is_err());
+        assert!(parse_size("10x").is_err());
+        assert!(parse_size("99999999999999999999g").is_err());
     }
 }

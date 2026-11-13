@@ -63,6 +63,7 @@ use crate::typify::{
     AccessTokenPayload, AccessTokenPayloadAud, AccessTokenPayloadPlatform, ClientData,
     ClientDataPlatform, DPoPProofJwtPayload, ZetaUserInfo,
 };
+use crate::user_role::UserRole;
 use crate::{CLIENT, Module, ModuleCtx, zeta_anyhow};
 use crate::{
     ZETA_VAR_CLIENT_ADDRESS, ZETA_VAR_CLIENT_ID, ZETA_VAR_PRODUCT_ID, ZETA_VAR_PRODUCT_VERSION,
@@ -456,12 +457,15 @@ async fn send_revocation(revocation_url: &Url, access_token: &str) -> anyhow::Re
     Ok(())
 }
 
-#[instrument(skip(access_token))]
+/// A_25484-03: `user_role` (Versicherter|Leistungserbringer|Unbekannt) is the breakdown the
+/// impossible-travel counter is split by, same as `user.roles` of the attack-detection log.
+#[instrument(skip(access_token, user_role), fields(user.roles = user_role.as_str()))]
 async fn verify_client_ip(
     revocation_url: Option<Url>,
     access_token: &str,
     token_ip: &str,
     request_ip: Option<&str>,
+    user_role: UserRole,
 ) -> ZetaResult<()> {
     let client_ip = request_ip.ok_or_else(|| {
         ZetaError::Internal(anyhow!(
@@ -469,7 +473,13 @@ async fn verify_client_ip(
         ))
     })?;
     if client_ip != token_ip {
-        crate::metrics::IMPOSSIBLE_TRAVEL_COUNT.add(1, &[]);
+        crate::metrics::IMPOSSIBLE_TRAVEL_COUNT.add(
+            1,
+            &[opentelemetry::KeyValue::new(
+                "user.roles",
+                user_role.as_str(),
+            )],
+        );
         warn!("client_ip {client_ip} != token_ip {token_ip}");
         if let Some(revocation_url) = revocation_url
             && let Err(err) = send_revocation(&revocation_url, access_token).await
@@ -547,6 +557,11 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
     )
     .await?;
 
+    // A_25484-03: from here on, attack detections are attributable to the token's subject. The
+    // same role is reported by the impossible-travel counter below.
+    let user_role = UserRole::from_profession_oid(&access_token_data.claims.profession_oid);
+    request.set_user_role(user_role);
+
     let dpop = request
         .get_header_in("dpop")
         .context("missing DPoP header")
@@ -580,6 +595,7 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
             &access_token,
             &access_token_data.claims.ip_address,
             request.get_client_ip(),
+            user_role,
         )
         .await?;
     }
@@ -697,12 +713,24 @@ pub fn handler(request: &mut Request) -> Status {
                     let detail = tracing::field::display(&err);
                     let origin = "pep";
                     let client_ip = request.get_client_ip();
+                    // A_25484-03, impossible-travel KPI: the telemetry gateway counts these
+                    // events by `type`, not by CAPEC ID, so the KPI does not depend on *which*
+                    // CAPEC an error maps to. It does depend on `zeta_capec` returning one at
+                    // all: this event is only logged for errors with a CAPEC mapping. The
+                    // breakdown (Versicherter|Leistungserbringer|Unbekannt) is `user.roles`.
+                    // `type` is only set for impossible travel; for other errors it is `None`
+                    // and tracing omits the field.
+                    let attack_type = matches!(err, ZetaError::ImpossibleTravel(_))
+                        .then_some("impossible_travel");
+                    let user_roles = ModuleCtx::user_role(request).as_str();
                     error!(
                         attackDetection.capecId=%capec_id,
                         attackDetection.capecName=%capec_name,
                         attackDetection.detail=detail,
                         attackDetection.origin=origin,
                         attackDetection.clientIP=client_ip,
+                        attackDetection.type=attack_type,
+                        user.roles=user_roles,
                         "possible attack detected: {err}"
                     );
                 }
@@ -812,10 +840,101 @@ mod tests {
             .times(1)
             .returning(|| Err(anyhow!("No token")));
 
+        // A_25484-03: no validated token, no role — it stays `Unbekannt`
+        request_mock.request.expect_set_user_role().never();
+
         let result = pep_handler(&mut request_mock).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No token"));
+    }
+
+    /// Serve the test signing key from the (mocked) PDP JWKS.
+    async fn mock_pdp_jwk() {
+        let jwk = Jwk::from_encoding_key(&EC_PRIVATE_KEY, Algorithm::ES256).expect("jwk");
+        with_jwk_cache_mock(|mock| {
+            mock.expect_get_jwk_pdp()
+                .with(eq("kid".to_string()), mockall::predicate::always())
+                .returning(move |_, _| Ok(jwk.clone()));
+        })
+        .await;
+    }
+
+    /// A_25484-03: once the access token is validated, `pep_handler` records the role derived
+    /// from its `profession_oid` — before the DPoP check, so a DPoP failure (here: no `DPoP`
+    /// header) is logged with the token subject's role.
+    #[rstest]
+    #[case::versicherter("1.2.276.0.76.4.49", UserRole::Versicherter)]
+    #[case::leistungserbringer("1.2.276.0.76.4.50", UserRole::Leistungserbringer)]
+    #[case::kostentraeger("1.2.276.0.76.4.59", UserRole::Unbekannt)]
+    #[tokio::test]
+    #[serial] // jwk cache
+    async fn sets_user_role_after_token_validation(
+        #[future(awt)] mut request_mock: RequestMock,
+        #[case] profession_oid: &str,
+        #[case] expected: UserRole,
+    ) {
+        mock_pdp_jwk().await;
+        let token = make_jwt(
+            Header::new(Algorithm::ES256),
+            AccessTokenPayload {
+                profession_oid: profession_oid.to_string(),
+                ..Default::default()
+            },
+        );
+        request_mock
+            .request
+            .expect_get_authorization_token()
+            .returning(move || Ok(token.clone()));
+        request_mock
+            .request
+            .expect_set_user_role()
+            .with(eq(expected))
+            .times(1)
+            .return_const(());
+        request_mock
+            .request
+            .expect_get_header_in()
+            .with(eq("dpop"))
+            .returning(|_| None);
+
+        let result = pep_handler(&mut request_mock).await;
+
+        assert!(
+            matches!(result, Err(ZetaError::DPoP(_))),
+            "expected the DPoP check to fail, got {result:?}"
+        );
+    }
+
+    /// A_25484-03: claims of a token that fails validation can't be trusted, so no role is
+    /// recorded and attack detections stay `Unbekannt`.
+    #[rstest]
+    #[tokio::test]
+    #[serial] // jwk cache
+    async fn keeps_user_role_unknown_on_invalid_token(
+        #[future(awt)] mut request_mock: RequestMock,
+    ) {
+        mock_pdp_jwk().await;
+        let token = make_jwt(
+            Header::new(Algorithm::ES256),
+            AccessTokenPayload {
+                iss: "untrusted_issuer".to_string(),
+                profession_oid: "1.2.276.0.76.4.49".to_string(),
+                ..Default::default()
+            },
+        );
+        request_mock
+            .request
+            .expect_get_authorization_token()
+            .returning(move || Ok(token.clone()));
+        request_mock.request.expect_set_user_role().never();
+
+        let result = pep_handler(&mut request_mock).await;
+
+        assert!(
+            matches!(result, Err(ZetaError::AccessTokenInvalid(_))),
+            "expected token validation to fail, got {result:?}"
+        );
     }
 
     #[rstest]
@@ -1356,15 +1475,16 @@ mod tests {
     #[tokio::test]
     // NOTE: updating the block list is tested in IT
     async fn verifies_client_ip() {
-        let result = verify_client_ip(None, "stub", "192.168.1.1", Some("192.168.1.1")).await;
+        let role = UserRole::Leistungserbringer;
+        let result = verify_client_ip(None, "stub", "192.168.1.1", Some("192.168.1.1"), role).await;
         assert!(result.is_ok());
 
         // mismatch
-        let result = verify_client_ip(None, "stub", "192.168.1.1", Some("127.0.0.1")).await;
+        let result = verify_client_ip(None, "stub", "192.168.1.1", Some("127.0.0.1"), role).await;
         assert!(result.is_err_and(|err| err.to_string().contains("Impossible Travel")));
 
         // missing client IP
-        let result = verify_client_ip(None, "stub", "192.168.1.1", None).await;
+        let result = verify_client_ip(None, "stub", "192.168.1.1", None, role).await;
         assert!(result.is_err_and(|err| err.to_string().contains("client IP address unavailable")));
     }
 

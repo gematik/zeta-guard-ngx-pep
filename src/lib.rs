@@ -74,6 +74,7 @@ mod response;
 #[cfg_attr(test, allow(unused))]
 pub mod revocation;
 mod session_cache;
+mod user_role;
 mod zeta_cause;
 
 #[cfg(test)]
@@ -178,6 +179,10 @@ struct PepCtx {
     // so `proxy_set_header` omits the header. Re-populated on each access-phase run (the ctx is
     // cleared on internal redirect), and read at content-phase time by `pep_zeta_variable`.
     zeta_vars: [Option<ngx_str_t>; ZETA_VAR_COUNT],
+    // A_25484-03: role of the validated access token's subject, for the `user.roles` attribute
+    // of attack-detection logs (pep re-entry and the ASL content phase). Stays `Unbekannt`
+    // until the token has been validated.
+    user_role: user_role::UserRole,
 }
 
 impl ModuleCtx {
@@ -228,6 +233,14 @@ impl ModuleCtx {
         // SAFETY: `request.pool()` is the live request pool; `from_str` copies `value` into it.
         let s = unsafe { ngx_str_t::from_str(request.pool().as_ptr(), value) };
         Self::get(request).pep.borrow_mut().zeta_vars[slot] = Some(s);
+    }
+
+    pub fn set_user_role(request: &Request, role: user_role::UserRole) {
+        Self::get(request).pep.borrow_mut().user_role = role;
+    }
+
+    pub fn user_role(request: &Request) -> user_role::UserRole {
+        Self::get(request).pep.borrow().user_role
     }
 
     fn zeta_var(request: &Request, slot: usize) -> Option<ngx_str_t> {
@@ -376,7 +389,7 @@ impl http::HttpModule for Module {
             // This is required in handle_subrequest — a nginx Request doesn't know the original
             // server port (easily), but we want to send inner to the same server that handles
             // outer.
-            let mut asl_self_url = ngx_string!("http://localhost:$server_port");
+            let mut asl_self_url = ngx_string!("http://127.0.0.1:$server_port");
             let mut ccv: ngx_http_compile_complex_value_t = std::mem::zeroed();
             ccv.cf = cf;
             ccv.value = &mut asl_self_url;
@@ -507,9 +520,12 @@ mod prod {
 
         CLIENT.get_or_init(|| client_builder(conf).build().expect("reqwest client"));
 
+        // ASL inner requests only ever target this PEP's own listener: never follow a redirect
+        // off it, never route the loopback hop through a proxy.
         ASL_CLIENT.get_or_init(|| {
             client_builder(conf)
                 .redirect(Policy::none())
+                .no_proxy()
                 .build()
                 .expect("ASL reqwest client")
         });

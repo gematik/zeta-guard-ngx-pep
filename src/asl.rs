@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, OnceLock};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use asl::{
     AslError, Environment, SESSION_OVERHEAD, decrypt_request, encrypt_response, finish_handshake,
     initiate_handshake,
@@ -118,15 +118,27 @@ async fn handle_m3(request: &mut Request, cid: String, body: &[u8]) -> ZetaAslRe
     ))
 }
 
-// join path to given base URL
-// contrary to [`Url::join`], this function errors if given an absolute URL
-fn join_path(base: Url, rel: &str) -> Result<Url> {
-    let combined = base.join(rel).context("parse error")?;
-    let relative = base
-        .make_relative(&combined)
-        .context(format!("{combined} is not relative to {base}"))?;
-    base.join(&relative)
-        .context(format!("can't join {relative} to {base}"))
+// Resolve an inner request target against this PEP's own listener (base).
+// Only origin-form (RFC 9112 §3.2.1: absolute-path [ "?" query ]) is accepted, and the resolved
+// URL must keep the base's scheme, userinfo, host and port. The resolved URL is used as-is: it is
+// never turned back into a relative reference and re-parsed — that round trip let a target like
+// "/http://internal:9090/secret" resolve to http://internal:9090/secret.
+fn join_path(base: Url, target: &str) -> Result<Url> {
+    if !target.starts_with('/') || target.starts_with("//") {
+        bail!("{target} is not in origin-form");
+    }
+    let url = base.join(target).context("parse error")?;
+    // WHATWG parsing treats e.g. "/\host" or "/\t/host" as scheme-relative for http(s), which the
+    // prefix check above can't see; the resolved authority must still be the base's.
+    if url.scheme() != base.scheme()
+        || url.username() != base.username()
+        || url.password() != base.password()
+        || url.host() != base.host()
+        || url.port_or_known_default() != base.port_or_known_default()
+    {
+        bail!("{url} is not relative to {base}");
+    }
+    Ok(url)
 }
 
 // initialized in ngx_http_pep_init_worker, after fork
@@ -213,8 +225,17 @@ async fn handle_subrequest(
             // encrypted inner request — we want our handle_subrequest span to
             // be the parent on the loopback hop, not whatever the client set.
             "traceparent" | "tracestate" => {}
+            // The client-chosen inner Host must not steer the loopback hop (e.g. nginx builds a
+            // directory redirect's Location from it); it is pinned to the outer Host below.
+            "host" => {}
             _ => subrequest = subrequest.header(header.name, header.value),
         };
+    }
+
+    // The outer Host already selected this server block, so the inner request lands on the same
+    // one. Without an outer Host, reqwest derives it from the loopback URL.
+    if let Some(host) = request.get_header_in("host") {
+        subrequest = subrequest.header("host", host);
     }
 
     // A_28439: emit this PEP's RFC 7239 Forwarded element.
@@ -370,12 +391,15 @@ pub fn handler(request: &mut Request) -> Status {
                     let detail = tracing::field::display(&err);
                     let origin = "pep";
                     let client_ip = request.get_client_ip();
+                    // Set by the access phase when `pep on` validated a token for this request.
+                    let user_roles = ModuleCtx::user_role(request).as_str();
                     error!(
                         attackDetection.capecId=%capec_id,
                         attackDetection.capecName=%capec_name,
                         attackDetection.detail=detail,
                         attackDetection.origin=origin,
                         attackDetection.clientIP=client_ip,
+                        user.roles=user_roles,
                         "possible attack detected: {err}"
                     );
                 }
@@ -421,21 +445,84 @@ mod tests {
 
     use crate::asl::join_path;
 
-    #[test]
-    fn join_path_only_relative() -> Result<()> {
-        let base: Url = Url::parse("http://localhost:8003")?;
-        assert!(
-            join_path(base.clone(), "rel").is_ok_and(|r| r.as_str() == "http://localhost:8003/rel")
-        );
-        assert!(
-            join_path(base.clone(), "/abs")
-                .is_ok_and(|r| r.as_str() == "http://localhost:8003/abs")
-        );
-        assert!(join_path(base.clone(), "https://example.com").is_err());
-        assert!(join_path(base.clone(), "//example.com").is_err());
-        assert!(join_path(base.clone(), "\\\\unc\\le").is_err());
-        assert!(join_path(base.clone(), "file://localhost:8003/file").is_err());
+    // same shape as SELF_URL_CV
+    fn base() -> Url {
+        Url::parse("http://127.0.0.1:8003").expect("base url")
+    }
 
+    #[test]
+    fn join_path_accepts_origin_form() -> Result<()> {
+        for (target, want) in [
+            ("/", "http://127.0.0.1:8003/"),
+            ("/abs", "http://127.0.0.1:8003/abs"),
+            ("/abs?q=1&r=/x", "http://127.0.0.1:8003/abs?q=1&r=/x"),
+            ("/a/../b", "http://127.0.0.1:8003/b"),
+        ] {
+            assert_eq!(join_path(base(), target)?.as_str(), want, "{target}");
+        }
         Ok(())
+    }
+
+    /// A target whose path looks like an absolute URL must stay on the base: it used to be
+    /// resolved, made relative again ("http://internal:9090/secret") and re-joined into an
+    /// absolute URL pointing at the host named in the path.
+    #[test]
+    fn join_path_absolute_url_in_path_stays_local() -> Result<()> {
+        for (target, want) in [
+            (
+                "/http://internal:9090/secret",
+                "http://127.0.0.1:8003/http://internal:9090/secret",
+            ),
+            (
+                "/https://internal:9090/secret",
+                "http://127.0.0.1:8003/https://internal:9090/secret",
+            ),
+            (
+                "/https:evil.example/",
+                "http://127.0.0.1:8003/https:evil.example/",
+            ),
+            (
+                "/http:/internal/x",
+                "http://127.0.0.1:8003/http:/internal/x",
+            ),
+            (
+                "/file:///etc/passwd",
+                "http://127.0.0.1:8003/file:///etc/passwd",
+            ),
+        ] {
+            let url = join_path(base(), target)?;
+            assert_eq!(url.as_str(), want, "{target}");
+            assert_eq!(url.host_str(), Some("127.0.0.1"), "{target}");
+            assert_eq!(url.port(), Some(8003), "{target}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn join_path_rejects_non_origin_form() {
+        for target in [
+            "",
+            "rel",
+            "*",
+            "https://example.com",
+            "http://127.0.0.1:8003/",
+            "//example.com",
+            "//127.0.0.1:8003/",
+            "\\\\unc\\le",
+            "file://localhost:8003/file",
+            "unix:/tmp",
+            // WHATWG: a backslash counts as a slash for http(s), tab/newline are stripped
+            "/\\evil.example/",
+            "/\t/evil.example/",
+            "/\n/evil.example/",
+            // same host and port, but userinfo
+            "/\\user:pass@127.0.0.1:8003/",
+        ] {
+            assert!(
+                join_path(base(), target).is_err(),
+                "{target:?} → {:?}",
+                join_path(base(), target)
+            );
+        }
     }
 }

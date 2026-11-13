@@ -28,27 +28,37 @@ use std::io::{self, Read};
 use std::os::unix::prelude::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::time::Duration;
 
 use flate2::read::GzDecoder;
 use tar::Archive;
 
 const NGINX_DOWNLOAD_URL: &str = "https://nginx.org/download";
-// HTTPS endpoints for fetching PGP keys — avoids dirmngr/HKP protocol issues on macOS
+// nginx.org publishes the maintainers' keys itself (https://nginx.org/keys/<name>.key). It is
+// reachable wherever the tarball is, which keyserver.ubuntu.com is not (CI), and keys.openpgp.org
+// lacks most of the keys. Tried first for the keys that are published there.
+const NGINX_ORG_KEYS_URL: &str = "https://nginx.org/keys";
+// HTTPS endpoints for fetching PGP keys by fingerprint — avoids dirmngr/HKP protocol issues on
+// macOS
 const KEY_FETCH_URLS: &[&str] = &[
     "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x",
     "https://keys.openpgp.org/vks/v1/by-fingerprint/",
 ];
+// a dead key source must not hold up the build for minutes
+const KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 // see ngx-rust/nginx-src/src/download.rs
-const NGINX_SIGNING_KEYS: &[&str] = &[
+// (fingerprint, file name below NGINX_ORG_KEYS_URL if published there). The fingerprints are the
+// trust anchor: a fetched key is only accepted if its primary key has exactly this fingerprint.
+const NGINX_SIGNING_KEYS: &[(&str, Option<&str>)] = &[
     // Key 1: Konstantin Pavlov's public key. For Nginx 1.25.3 and earlier
-    "13C82A63B603576156E30A4EA0EA981B66B0D967",
+    ("13C82A63B603576156E30A4EA0EA981B66B0D967", Some("thresh")),
     // Key 2: Sergey Kandaurov's public key. For Nginx 1.25.4
-    "D6786CE303D9A9022998DC6CC8464D549AF75C0A",
-    // Key 3: Maxim Dounin's public key. At least used for Nginx 1.18.0
-    "B0F4253373F8F6F510D42178520A9993A1C052F8",
+    ("D6786CE303D9A9022998DC6CC8464D549AF75C0A", Some("pluknet")),
+    // Key 3: Maxim Dounin's public key. At least used for Nginx 1.18.0 (not on nginx.org)
+    ("B0F4253373F8F6F510D42178520A9993A1C052F8", None),
     // Key 4: Roman Arutyunyan's public key. For Nginx 1.25.5
-    "43387825DDB1BB97EC36BA5D007C8D7C15D87369",
+    ("43387825DDB1BB97EC36BA5D007C8D7C15D87369", Some("arut")),
 ];
 
 fn project_root() -> PathBuf {
@@ -88,6 +98,47 @@ fn download(url: &str, dest: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Fingerprints of the primary keys in `gpg --with-colons` output. A `pub` record is followed by
+/// the `fpr` record of that key (fingerprint in field 10); subkeys (`sub`) have their own `fpr`
+/// records, which must not count.
+fn primary_fingerprints(colons: &str) -> Vec<&str> {
+    let mut found = vec![];
+    let mut after_pub = false;
+    for line in colons.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        match fields.first().copied() {
+            Some("pub") => after_pub = true,
+            Some("fpr") if after_pub => {
+                if let Some(fingerprint) = fields.get(9) {
+                    found.push(*fingerprint);
+                }
+                after_pub = false;
+            }
+            Some("sub" | "ssb") => after_pub = false,
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Whether the armored key block contains a primary key with exactly this fingerprint.
+fn has_primary_fingerprint(gpg_home: &Path, armored: &str, fingerprint: &str) -> bool {
+    let candidate = gpg_home.join("candidate-key.asc");
+    if fs::write(&candidate, armored).is_err() {
+        return false;
+    }
+    let out = Command::new("gpg")
+        .arg("--homedir")
+        .arg(gpg_home)
+        .args(["--batch", "--show-keys", "--with-colons"])
+        .arg(&candidate)
+        .output();
+    let _ = fs::remove_file(&candidate);
+    out.is_ok_and(|out| {
+        primary_fingerprints(&String::from_utf8_lossy(&out.stdout)).contains(&fingerprint)
+    })
+}
+
 fn verify_gpg(tarball: &Path, signature: &Path) -> bool {
     let gpg_home = tarball.parent().unwrap().join(".gnupg");
     fs::create_dir_all(&gpg_home).ok();
@@ -100,11 +151,23 @@ fn verify_gpg(tarball: &Path, signature: &Path) -> bool {
     // Fetch keys via HTTPS to avoid dirmngr/HKP protocol issues (e.g. on macOS)
     let keys_file = gpg_home.join("nginx-keys.asc");
     let mut all_keys = String::new();
-    for fingerprint in NGINX_SIGNING_KEYS {
-        let fetched = KEY_FETCH_URLS.iter().any(|base_url| {
-            let url = format!("{base_url}{fingerprint}");
-            eprintln!("  fetching key {fingerprint} from {base_url}...");
-            match ureq::get(&url).call() {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(KEY_FETCH_TIMEOUT))
+        .build()
+        .into();
+    for (fingerprint, nginx_org_name) in NGINX_SIGNING_KEYS {
+        let urls: Vec<String> = nginx_org_name
+            .map(|name| format!("{NGINX_ORG_KEYS_URL}/{name}.key"))
+            .into_iter()
+            .chain(
+                KEY_FETCH_URLS
+                    .iter()
+                    .map(|base_url| format!("{base_url}{fingerprint}")),
+            )
+            .collect();
+        let fetched = urls.iter().any(|url| {
+            eprintln!("  fetching key {fingerprint} from {url}...");
+            match agent.get(url).call() {
                 Ok(resp) => {
                     let mut body = String::new();
                     if resp
@@ -114,9 +177,16 @@ fn verify_gpg(tarball: &Path, signature: &Path) -> bool {
                         .is_ok()
                         && body.contains("BEGIN PGP")
                     {
-                        all_keys.push_str(&body);
-                        all_keys.push('\n');
-                        true
+                        if has_primary_fingerprint(&gpg_home, &body, fingerprint) {
+                            all_keys.push_str(&body);
+                            all_keys.push('\n');
+                            true
+                        } else {
+                            eprintln!(
+                                "  warning: key from {url} does not have fingerprint {fingerprint}, ignoring it"
+                            );
+                            false
+                        }
                     } else {
                         false
                     }
@@ -405,4 +475,41 @@ fn check() -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::primary_fingerprints;
+
+    // `gpg --show-keys --with-colons` of a key with one subkey
+    const COLONS: &str = "\
+pub:-:3072:1:A0EA981B66B0D967:1456516560:::-:::scESC::::::23::0:
+fpr:::::::::13C82A63B603576156E30A4EA0EA981B66B0D967:
+uid:-::::1456516560::0123456789ABCDEF0123456789ABCDEF01234567::Konstantin Pavlov <thresh@nginx.com>::::::::::0:
+sub:-:3072:1:5FC4A1B3E9F00123:1456516560::::::e::::::23:
+fpr:::::::::D7CBD7C1A25E5D31EB5D28BCEC67AEFF1281B785:
+";
+
+    #[test]
+    fn primary_fingerprints_ignore_subkeys() {
+        assert_eq!(
+            primary_fingerprints(COLONS),
+            ["13C82A63B603576156E30A4EA0EA981B66B0D967"]
+        );
+    }
+
+    #[test]
+    fn primary_fingerprints_of_several_keys() {
+        let two = format!(
+            "{COLONS}pub:-:3072:1:AAAA:1::::::::::\nfpr:::::::::D6786CE303D9A9022998DC6CC8464D549AF75C0A:\n"
+        );
+        assert_eq!(
+            primary_fingerprints(&two),
+            [
+                "13C82A63B603576156E30A4EA0EA981B66B0D967",
+                "D6786CE303D9A9022998DC6CC8464D549AF75C0A"
+            ]
+        );
+        assert!(primary_fingerprints("").is_empty());
+    }
 }

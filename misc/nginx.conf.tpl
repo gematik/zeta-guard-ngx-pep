@@ -14,6 +14,10 @@ env NO_PROXY;
 env http_proxy;
 env https_proxy;
 env no_proxy;
+# OTLP export of the test nginx to the in-process receiver, see tests/common/otlp.rs
+env OTEL_EXPORTER_OTLP_ENDPOINT;
+env OTEL_SERVICE_NAME;
+env OTEL_METRIC_EXPORT_INTERVAL;
 
 daemon off;
 
@@ -175,6 +179,11 @@ http \{
           default_type application/json;
           alias html/empty.json;
           pep_require_popp on;
+        }
+        ## see asl_inner_host_pinned: reflects the Host header the loopback hop arrived with
+        location = /host \{
+          default_type text/plain;
+          return 200 "$http_host";
         }
 
         ## see tests/common/echo.rs

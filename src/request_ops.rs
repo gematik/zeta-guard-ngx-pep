@@ -24,6 +24,7 @@
 
 use crate::conf::{LocationConfig, MainConfig};
 use crate::proxy_conf::pep_headers_applied;
+use crate::user_role::UserRole;
 use crate::{Module, ModuleCtx};
 use anyhow::{Result, anyhow, bail};
 use http::Uri;
@@ -48,6 +49,8 @@ pub trait RequestOps {
     // proxy_headers.conf (which also drops any client-supplied copy); the A_28783 SIEM vars
     // (CLIENT_ID / CLIENT_ADDRESS) are instead read by `otel_span_attr`.
     fn set_zeta_upstream_header(&self, slot: usize, value: &str);
+    /// A_25484-03: remember the validated token's user role for attack-detection logs.
+    fn set_user_role(&self, role: UserRole);
     // additional *response* headers, will be added to response headers from upstream
     fn ensure_header_out(&mut self, name: &str, value: &str) -> anyhow::Result<()>;
     fn acceptable(&self, content_type: &str) -> anyhow::Result<bool>;
@@ -304,6 +307,10 @@ impl RequestOps for ngx::http::Request {
 
     fn set_zeta_upstream_header(&self, slot: usize, value: &str) {
         ModuleCtx::set_zeta_var(self, slot, value);
+    }
+
+    fn set_user_role(&self, role: UserRole) {
+        ModuleCtx::set_user_role(self, role);
     }
 
     fn ensure_header_out(&mut self, name: &str, value: &str) -> Result<()> {

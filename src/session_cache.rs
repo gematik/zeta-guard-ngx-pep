@@ -22,6 +22,7 @@
  * #L%
  */
 
+use std::collections::BinaryHeap;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::path::Path;
@@ -39,7 +40,7 @@ use ngx::core::{NgxString, SlabPool, Status};
 use ngx::http::HttpModuleMainConf;
 use ngx::ngx_string;
 use ngx::sync::RwLock;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::Module;
 use crate::asl_keys::{AslConfig, asl_file_path, create_asl_config};
@@ -47,17 +48,21 @@ use crate::conf::MainConfig;
 use crate::error::ZetaAslResult;
 use crate::ngx_http_pep_module;
 
-const SESSION_CACHE_SIZE: usize = 100 << 20;
+/// Minimum time between two background cleanup runs.
+#[cfg_attr(feature = "its", allow(dead_code))]
+const CLEANUP_INTERVAL_SECS: u64 = 10;
+/// Entries removed per write-lock acquisition during cleanup, so that the lock is
+/// released regularly and request handling is not stalled by a long removal.
+const CLEANUP_CHUNK: usize = 256;
+/// Lower bound for the number of entries evicted when the zone is full.
+const MIN_EVICTION_BATCH: usize = 64;
+/// Tries to insert into a full zone: once, then after each of two reclaim rounds.
+const RECLAIM_ATTEMPTS: usize = 3;
 
 pub struct ShmHandshakeState<A: Allocator + Clone> {
     pub ss_e: [u8; 64],
     pub transcript: Vec<u8, A>,
-}
-
-fn copy_to_pool<T: Clone>(v: &[T], pool: SlabPool) -> Vec<T, SlabPool> {
-    let mut nv = Vec::with_capacity_in(v.len(), pool.clone());
-    nv.extend_from_slice(v);
-    nv
+    pub expires: u64,
 }
 
 fn copy_to_global<T: Clone>(v: &Vec<T, SlabPool>) -> std::vec::Vec<T> {
@@ -67,11 +72,19 @@ fn copy_to_global<T: Clone>(v: &Vec<T, SlabPool>) -> std::vec::Vec<T> {
 }
 
 impl ShmHandshakeState<SlabPool> {
-    fn from_global(value: &HandshakeState, pool: SlabPool) -> Self {
-        ShmHandshakeState {
+    /// Copy into the shared zone. Fallible: a full zone is reported as an error rather than
+    /// aborting the worker.
+    fn try_from_global(value: &HandshakeState, expires: u64, pool: SlabPool) -> Result<Self> {
+        let mut transcript = Vec::new_in(pool);
+        transcript
+            .try_reserve_exact(value.transcript.len())
+            .map_err(|e| anyhow!("session cache full: {e:?}"))?;
+        transcript.extend_from_slice(&value.transcript);
+        Ok(ShmHandshakeState {
             ss_e: value.ss_e,
-            transcript: copy_to_pool(&value.transcript, pool),
-        }
+            transcript,
+            expires,
+        })
     }
 }
 
@@ -125,13 +138,98 @@ type Map = RbTreeMap<NgxString<SlabPool>, ShmConnectionState<SlabPool>, SlabPool
 struct Shared {
     config: MaybeUninit<Config>,
     map: RwLock<Map>,
+    // Counters are kept next to the map so that the metrics reader never has to
+    // lock or scan it.
+    handshakes: AtomicU64,
+    sessions: AtomicU64,
+    alloc_failures: AtomicU64,
+    evictions: AtomicU64,
+    #[cfg_attr(feature = "its", allow(dead_code))]
+    last_cleanup: AtomicU64,
     #[cfg(feature = "its")]
     always_expire: std::sync::atomic::AtomicBool,
+}
+
+/// Point-in-time view of the cache, read without taking the map lock.
+#[cfg_attr(test, allow(dead_code))]
+pub struct CacheStats {
+    pub handshakes: u64,
+    pub sessions: u64,
+    pub used_bytes: u64,
+    pub size_bytes: u64,
+    /// Inserts that failed with the zone full, before any reclaim attempt.
+    pub alloc_failures: u64,
+    /// Live entries dropped to make room.
+    pub evictions: u64,
+}
+
+fn dec(counter: &AtomicU64) {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+}
+
+/// Eviction rank: expired entries first, then handshakes (small TTL, cheap to retry), then
+/// sessions, each oldest first.
+fn eviction_rank(entry: &ShmConnectionState<SlabPool>, now: u64) -> (u8, u64) {
+    match entry {
+        ShmConnectionState::Handshaking(h) => (u8::from(h.expires > now), h.expires),
+        ShmConnectionState::Established(s) => (if s.expires > now { 2 } else { 0 }, s.expires),
+    }
+}
+
+fn is_expired(entry: &ShmConnectionState<SlabPool>, now: u64) -> bool {
+    match entry {
+        ShmConnectionState::Handshaking(h) => h.expires <= now,
+        ShmConnectionState::Established(s) => s.expires <= now,
+    }
+}
+
+/// Keys are copied to the process heap: collecting them as `NgxString`s would allocate from
+/// the very zone we are trying to free up.
+fn expired_keys(map: &Map, now: u64) -> std::vec::Vec<String> {
+    map.iter()
+        .filter(|(_, v)| is_expired(v, now))
+        .map(|(k, _)| k.to_string())
+        .collect()
+}
+
+/// Picks the entries to drop from `(cid, rank)` pairs, see [`eviction_rank`]: all expired
+/// ones, topped up with the oldest live ones to at most `n` in total. Returns
+/// `(expired, live)`. Memory use is bounded by `n` plus the number of expired entries.
+fn select_victims<K: std::fmt::Display>(
+    entries: impl Iterator<Item = (K, (u8, u64))>,
+    n: usize,
+) -> (std::vec::Vec<String>, std::vec::Vec<String>) {
+    let mut expired = std::vec::Vec::new();
+    let mut heap: BinaryHeap<((u8, u64), String)> = BinaryHeap::with_capacity(n + 1);
+    for (k, rank) in entries {
+        if rank.0 == 0 {
+            expired.push(k.to_string());
+        } else if heap.len() < n {
+            heap.push((rank, k.to_string()));
+        } else if heap.peek().is_some_and(|(worst, _)| rank < *worst) {
+            heap.pop();
+            heap.push((rank, k.to_string()));
+        }
+    }
+    let room = n.saturating_sub(expired.len());
+    let live = heap
+        .into_sorted_vec()
+        .into_iter()
+        .take(room)
+        .map(|(_, k)| k)
+        .collect();
+    (expired, live)
 }
 
 pub struct ShmSessionCache {
     pool: SlabPool,
     shared: &'static Shared,
+    // The TTLs are process-local, taken from the current configuration: a reload keeps the
+    // zone but starts new workers, which pick up changed values.
+    /// Lifetime of established sessions, in seconds.
+    session_ttl: u64,
+    /// Lifetime of unfinished handshakes, in seconds.
+    handshake_ttl: u64,
 }
 
 impl ShmSessionCache {
@@ -146,73 +244,191 @@ impl ShmSessionCache {
                 .context("as_ref")?
         };
 
-        Ok(Self { pool, shared })
+        let main_conf = unsafe { shm_zone.data.cast::<MainConfig>().as_ref() }
+            .context("session_cache_zone: main_conf")?;
+
+        Ok(Self {
+            pool,
+            shared,
+            session_ttl: main_conf.asl_session_ttl.as_secs(),
+            handshake_ttl: main_conf.asl_handshake_ttl.as_secs(),
+        })
     }
 
     pub fn server_config(&self) -> &Config {
         unsafe { self.shared.config.assume_init_ref() }
     }
 
-    pub async fn init_handshake(&'static self, state: HandshakeState) -> Result<String> {
-        let cid = new_cid();
-
-        let key = NgxString::try_from_bytes_in(&cid, self.pool.clone())?;
-        let value = ShmConnectionState::Handshaking(ShmHandshakeState::from_global(
-            &state,
-            self.pool.clone(),
-        ));
-
-        let mut map = self.shared.map.write();
-        if map.get(&key).is_some() {
-            bail!("conflict: {cid}");
+    /// Insert a new entry and count it. When the zone is full, reclaim space and retry:
+    /// expired entries go first, then the oldest live ones are evicted. Only when that does
+    /// not help either is the failure reported.
+    ///
+    /// The map lock is taken per attempt: reclaiming scans under the read lock and removes in
+    /// small chunks, so readers are not stalled by the scan.
+    fn insert_reclaiming(
+        &self,
+        cid: &str,
+        make: impl Fn() -> Result<ShmConnectionState<SlabPool>>,
+    ) -> Result<()> {
+        for attempt in 0..RECLAIM_ATTEMPTS {
+            let result = {
+                let mut map = self.shared.map.write();
+                if map.get::<[u8]>(cid.as_bytes()).is_some() {
+                    bail!("conflict: {cid}");
+                }
+                // A failed attempt drops key and state, which returns their zone memory, so
+                // building them anew per attempt never accumulates.
+                (|| -> Result<()> {
+                    let key = NgxString::try_from_bytes_in(cid, self.pool.clone())?;
+                    let state = make()?;
+                    let counter = match state {
+                        ShmConnectionState::Handshaking(_) => &self.shared.handshakes,
+                        ShmConnectionState::Established(_) => &self.shared.sessions,
+                    };
+                    map.try_insert(key, state)?;
+                    // under the lock, so a concurrent removal never sees an uncounted entry
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                })()
+            };
+            let Err(err) = result else {
+                return Ok(());
+            };
+            if attempt == 0 {
+                self.shared.alloc_failures.fetch_add(1, Ordering::Relaxed);
+            }
+            if attempt + 1 == RECLAIM_ATTEMPTS {
+                return Err(err.context("session cache full"));
+            }
+            let freed = self.reclaim();
+            warn!(
+                attempt,
+                freed,
+                handshakes = self.shared.handshakes.load(Ordering::Relaxed),
+                sessions = self.shared.sessions.load(Ordering::Relaxed),
+                "session cache full, reclaimed entries"
+            );
         }
-        map.try_insert(key, value)?;
+        unreachable!()
+    }
+
+    /// Drop expired entries and, if that is not enough, evict the oldest live ones. Returns
+    /// the number of entries removed.
+    fn reclaim(&self) -> usize {
+        let now = utc_now();
+        let total = self.shared.handshakes.load(Ordering::Relaxed)
+            + self.shared.sessions.load(Ordering::Relaxed);
+        let batch = MIN_EVICTION_BATCH.max(total as usize / 100);
+        let (expired, live) = {
+            let map = self.shared.map.read();
+            select_victims(map.iter().map(|(k, v)| (k, eviction_rank(v, now))), batch)
+        };
+        let mut freed = 0;
+        for chunk in expired.chunks(CLEANUP_CHUNK) {
+            let mut map = self.shared.map.write();
+            freed += self.remove_keys(&mut map, chunk.iter().map(String::as_str));
+        }
+        let mut evicted = 0;
+        for chunk in live.chunks(CLEANUP_CHUNK) {
+            let mut map = self.shared.map.write();
+            evicted += self.remove_keys(&mut map, chunk.iter().map(String::as_str));
+        }
+        self.shared
+            .evictions
+            .fetch_add(evicted as u64, Ordering::Relaxed);
+        freed + evicted
+    }
+
+    /// Remove the given keys, keeping the counters in sync. Returns the number removed.
+    fn remove_keys<'a>(&self, map: &mut Map, keys: impl Iterator<Item = &'a str>) -> usize {
+        let mut removed = 0;
+        for cid in keys {
+            // look up by borrowed bytes: allocating a key here would fail on an exhausted zone
+            match map.remove::<[u8]>(cid.as_bytes()) {
+                Some(ShmConnectionState::Handshaking(_)) => dec(&self.shared.handshakes),
+                Some(ShmConnectionState::Established(_)) => dec(&self.shared.sessions),
+                None => continue,
+            }
+            removed += 1;
+        }
+        removed
+    }
+
+    pub async fn init_handshake(&'static self, state: HandshakeState) -> Result<String> {
+        self.maybe_cleanup_expired_sessions();
+        let cid = new_cid();
+        let expires = utc_now() + self.handshake_ttl;
+
+        self.insert_reclaiming(&cid, || {
+            Ok(ShmConnectionState::Handshaking(
+                ShmHandshakeState::try_from_global(&state, expires, self.pool.clone())?,
+            ))
+        })?;
         Ok(cid)
     }
 
-    pub async fn finish_handshake(&'static self, cid: &str) -> Result<HandshakeState> {
-        let key = NgxString::try_from_bytes_in(cid, self.pool.clone())?;
-
+    pub async fn finish_handshake(&'static self, cid: &str) -> ZetaAslResult<HandshakeState> {
         let mut map = self.shared.map.write();
-        match map.remove(&key).context(format!("missing: {key}"))? {
-            ShmConnectionState::Handshaking(ref state) => Ok(state.into()),
-            ShmConnectionState::Established(_) => Err(anyhow!("not handshaking: {key}")),
+        // A_26924: a handshake that is unknown, expired or evicted is "unknown CID" (403,
+        // code 9), so the client knows to run a new handshake.
+        match map.get::<[u8]>(cid.as_bytes()) {
+            None => {
+                debug!(%cid, "unknown cid");
+                return Err(AslError::UnknownCID);
+            }
+            // an M3 must not be able to destroy a live session: leave it in place
+            Some(ShmConnectionState::Established(_)) => {
+                return Err(AslError::InternalError(anyhow!("not handshaking: {cid}")));
+            }
+            Some(ShmConnectionState::Handshaking(_)) => {}
         }
+        let Some(ShmConnectionState::Handshaking(state)) = map.remove::<[u8]>(cid.as_bytes())
+        else {
+            unreachable!("checked above, under the same lock");
+        };
+        dec(&self.shared.handshakes);
+        if state.expires <= utc_now() {
+            debug!(%cid, "handshake expired");
+            return Err(AslError::UnknownCID);
+        }
+        Ok((&state).into())
     }
 
+    /// Drop expired handshakes and sessions. The scan only holds the read lock; removal
+    /// happens in small chunks so the write lock is never held for long.
     #[instrument(skip(self))]
     fn cleanup_expired(&'static self) {
-        let mut map = self.shared.map.write();
-        let now = utc_now();
-        let to_remove: Vec<_> = map
-            .iter()
-            .filter_map(|(k, v)| {
-                match v {
-                    ShmConnectionState::Handshaking(_shm_handshake_state) => None, // TODO: store timestamp/expiration?
-                    ShmConnectionState::Established(shm_session_state) => {
-                        if shm_session_state.expires > now {
-                            None
-                        } else {
-                            debug!(cid = %k, "expire");
-                            Some(k.clone())
-                        }
-                    }
-                }
-            })
-            .collect();
-        for key in to_remove {
-            map.remove(&key);
+        let expired = {
+            let map = self.shared.map.read();
+            expired_keys(&map, utc_now())
+        };
+        for chunk in expired.chunks(CLEANUP_CHUNK) {
+            let mut map = self.shared.map.write();
+            for cid in chunk {
+                debug!(%cid, "expire");
+            }
+            self.remove_keys(&mut map, chunk.iter().map(String::as_str));
         }
     }
 
     fn maybe_cleanup_expired_sessions(&'static self) {
         #[cfg(not(feature = "its"))]
-        // run the cleanup routine with 1% probability, in a background thread.
-        if fastrand::u8(0..100) == 0 {
-            tokio::task::spawn_blocking(move || {
-                self.cleanup_expired();
-            });
-        };
+        // run the cleanup routine at most every CLEANUP_INTERVAL_SECS, in a background thread.
+        {
+            let now = utc_now();
+            let last = self.shared.last_cleanup.load(Ordering::Relaxed);
+            if now >= last + CLEANUP_INTERVAL_SECS
+                && self
+                    .shared
+                    .last_cleanup
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                tokio::task::spawn_blocking(move || {
+                    self.cleanup_expired();
+                });
+            }
+        }
 
         #[cfg(feature = "its")]
         // either always or never expire, blockingly; can be toggled with test control client
@@ -221,17 +437,17 @@ impl ShmSessionCache {
         };
     }
 
-    pub async fn start_session(&'static self, cid: &str, state: SessionState) -> Result<()> {
+    pub async fn start_session(&'static self, cid: &str, mut state: SessionState) -> Result<()> {
         self.maybe_cleanup_expired_sessions();
 
-        let key = NgxString::try_from_bytes_in(cid, self.pool.clone())?;
-        let value = ShmConnectionState::Established(ShmSessionState::from_global(&state));
+        // the ASL crate sets the protocol limit; the configured TTL may only shorten it
+        state.expires = state.expires.min(utc_now() + self.session_ttl);
 
-        let mut map = self.shared.map.write();
-        if map.get(&key).is_some() {
-            bail!("conflict — {key}");
-        }
-        map.try_insert(key, value)?;
+        self.insert_reclaiming(cid, || {
+            Ok(ShmConnectionState::Established(
+                ShmSessionState::from_global(&state),
+            ))
+        })?;
         Ok(())
     }
 
@@ -243,7 +459,12 @@ impl ShmSessionCache {
 
         let result = {
             let map = self.shared.map.read();
-            let entry = map.get(&key).context(format!("missing — {key}"))?;
+            // A_26924: unknown, expired-and-cleaned or evicted sessions are "unknown CID"
+            // (403, code 9), so the client knows to run a new handshake.
+            let Some(entry) = map.get(&key) else {
+                debug!(cid = %key, "unknown cid");
+                return Err(AslError::UnknownCID);
+            };
 
             match entry {
                 ShmConnectionState::Established(state) => {
@@ -260,7 +481,9 @@ impl ShmSessionCache {
             Ok((Some(session), _)) => Ok(session),
             Ok((None, expired)) => {
                 let mut map = self.shared.map.write();
-                let _ = map.remove(&key);
+                if map.remove(&key).is_some() {
+                    dec(&self.shared.sessions);
+                }
 
                 debug!(cid = %key, expired, "expire");
                 Err(AslError::SessionExpired(key.to_string(), expired))
@@ -269,13 +492,36 @@ impl ShmSessionCache {
         }
     }
 
-    /// Number of entries (handshakes + established sessions) in the shared
-    /// cache. Called from the metrics PeriodicReader thread: the shm rwlock is
-    /// atomics-based and thread-agnostic, so a brief read lock from off the
-    /// event loop is safe.
+    /// Counters and zone fill. Called from the metrics PeriodicReader thread: nothing here
+    /// takes the map lock or the slab mutex, so it is O(1) and cannot contend with request
+    /// handling. The fill level counts whole pages, a page leaves the free list as soon as a
+    /// size class takes it, and is read without the slab mutex: a slightly stale value is
+    /// fine for a gauge.
     #[cfg_attr(test, allow(dead_code))]
-    pub fn session_count(&'static self) -> u64 {
-        self.shared.map.read().iter().count() as u64
+    pub fn stats(&'static self) -> CacheStats {
+        let pool = ptr::from_ref(self.pool.as_ref());
+        // SAFETY: `start` and `end` never change after the zone is set up. `pfree` is updated
+        // by workers under the slab mutex, which we don't take: the volatile read keeps the
+        // compiler from caching it, the value itself is a best-effort snapshot.
+        let (start, end, pfree) = unsafe {
+            (
+                (*pool).start,
+                (*pool).end,
+                (&raw const (*pool).pfree).read_volatile(),
+            )
+        };
+        let size = (end as usize).saturating_sub(start as usize);
+        // nginx's ngx_pagesize is getpagesize(); the symbol itself only exists inside nginx
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
+        let free = pfree * page_size;
+        CacheStats {
+            handshakes: self.shared.handshakes.load(Ordering::Relaxed),
+            sessions: self.shared.sessions.load(Ordering::Relaxed),
+            used_bytes: size.saturating_sub(free) as u64,
+            size_bytes: size as u64,
+            alloc_failures: self.shared.alloc_failures.load(Ordering::Relaxed),
+            evictions: self.shared.evictions.load(Ordering::Relaxed),
+        }
     }
 
     #[cfg(feature = "its")]
@@ -296,7 +542,10 @@ impl ShmSessionCache {
             ShmConnectionState::Established(shm_session_state) => shm_session_state,
         };
         state.expires = 0;
-        map.try_insert(key, ShmConnectionState::Established(state))?;
+        if let Err(e) = map.try_insert(key, ShmConnectionState::Established(state)) {
+            dec(&self.shared.sessions);
+            return Err(e.into());
+        }
         Ok(())
     }
 }
@@ -328,7 +577,7 @@ pub(crate) fn init(cf: *mut ngx_conf_t) -> ngx_int_t {
         let Some(shm_zone) = ngx_shared_memory_add(
             cf,
             &mut ngx_string!("session_cache"),
-            SESSION_CACHE_SIZE,
+            main_conf.asl_session_cache_size,
             ptr::addr_of_mut!(ngx_http_pep_module).cast(),
         )
         .as_mut() else {
@@ -381,6 +630,11 @@ extern "C" fn shared_zone_init(shm_zone: *mut ngx_shm_zone_t, _data: *mut c_void
         let shared = Shared {
             map,
             config,
+            handshakes: AtomicU64::new(0),
+            sessions: AtomicU64::new(0),
+            alloc_failures: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            last_cleanup: AtomicU64::new(0),
             #[cfg(feature = "its")]
             always_expire: std::sync::atomic::AtomicBool::new(false),
         };
@@ -391,6 +645,44 @@ extern "C" fn shared_zone_init(shm_zone: *mut ngx_shm_zone_t, _data: *mut c_void
             .cast();
         Status::NGX_OK.into()
     } else {
-        Status::NGX_ERROR.into()
+        // Non-null data means nginx handed us the zone of the previous cycle (a reload with
+        // the same name, tag and size), `Shared` still in place. Failing here would abort
+        // the reload.
+        Status::NGX_OK.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_victims;
+
+    // rank as in `eviction_rank`: (0, _) expired, (1, _) handshake, (2, _) session
+    #[test]
+    fn expired_entries_are_all_selected() {
+        let entries = vec![("a", (0, 5)), ("b", (2, 90)), ("c", (0, 7)), ("d", (1, 50))];
+        let (expired, live) = select_victims(entries.into_iter(), 2);
+        assert_eq!(expired, ["a", "c"]);
+        assert!(live.is_empty(), "expired fill the batch already");
+    }
+
+    #[test]
+    fn live_entries_top_up_oldest_handshakes_first() {
+        let entries = vec![
+            ("s1", (2, 10)),
+            ("h2", (1, 60)),
+            ("h1", (1, 50)),
+            ("e", (0, 1)),
+        ];
+        let (expired, live) = select_victims(entries.into_iter(), 3);
+        assert_eq!(expired, ["e"]);
+        assert_eq!(live, ["h1", "h2"]);
+    }
+
+    #[test]
+    fn batch_bounds_live_selection() {
+        let entries = (0..100).map(|i| (format!("k{i}"), (2, i)));
+        let (expired, live) = select_victims(entries, 5);
+        assert!(expired.is_empty());
+        assert_eq!(live, ["k0", "k1", "k2", "k3", "k4"]);
     }
 }

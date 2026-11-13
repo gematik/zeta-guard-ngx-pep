@@ -144,7 +144,10 @@ unsafe extern "C" fn OSSL_provider_init(
     init_logging();
     info!("[ossl_hsm] init");
 
-    grpc_client::init();
+    if let Err(e) = grpc_client::init() {
+        eprintln!("[ossl_hsm] init failed: {e}");
+        return 0;
+    }
 
     hsm_ec::init_algorithms();
     hsm_store::init_algorithms();

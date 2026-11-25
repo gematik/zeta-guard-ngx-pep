@@ -148,7 +148,8 @@ async fn echo_service(
             *response.status_mut() = StatusCode::OK;
             Ok(response)
         }
-        (&Method::GET, "/") => {
+        // POST too, to see the framing headers of a request that carries a body
+        (&Method::GET | &Method::POST, "/") => {
             let response = echo_response(&req)?;
             let response = serde_json::to_string_pretty(&response)?;
             Ok(Response::new(full(response)))

@@ -100,6 +100,24 @@ impl ZetaError {
         }
     }
 
+    // A_29850: errors raised by the PEP carry `zeta-error-origin: pep`, so the ZETA-Client can tell
+    // them apart from errors of the resource server — but only if the ZETA-Client is the one to
+    // act on them. PoPP errors (missing or invalid token) are addressed to the caller, who supplies
+    // the token: the client must hand them on instead of re-authenticating.
+    fn carries_error_origin(&self) -> bool {
+        match self {
+            Self::PoPP(_) | Self::PoPPMissing | Self::PoPPInvalidActor { .. } => false,
+            Self::AccessToken(_)
+            | Self::AccessTokenInvalid(_)
+            | Self::DPoP(_)
+            | Self::ImpossibleTravel(_)
+            | Self::RevokedSession
+            | Self::Proxy(_)
+            | Self::ProxyHeadersMissing
+            | Self::Internal(_) => true,
+        }
+    }
+
     pub fn response(&self, base: Uri) -> anyhow::Result<Response> {
         let mut parts = base.into_parts();
         parts.path_and_query = Some(format!("/doc/errors/{}.html", self.as_ref()).parse()?);
@@ -110,11 +128,16 @@ impl ZetaError {
         };
 
         let body = serde_json::to_string_pretty(&error_response)?;
+        let extra_headers = if self.carries_error_origin() {
+            HashMap::from([("zeta-error-origin".to_string(), "pep".to_string())])
+        } else {
+            HashMap::new()
+        };
         Ok(Response::new_with_body_and_extra_header(
             HTTPStatus(self.http_code()),
             "application/json",
             body.into_bytes(),
-            HashMap::from([("zeta-error-origin".to_string(), "pep".to_string())]),
+            extra_headers,
         ))
     }
 }
@@ -168,12 +191,6 @@ mod tests {
             ZetaError::AccessToken(anyhow!("expired")),
             ZetaError::AccessTokenInvalid(anyhow!("bad sig")),
             ZetaError::DPoP(anyhow!("missing")),
-            ZetaError::PoPP(anyhow!("invalid")),
-            ZetaError::PoPPMissing,
-            ZetaError::PoPPInvalidActor {
-                access_token_sub: "a".into(),
-                actor_id: "b".into(),
-            },
             ZetaError::ImpossibleTravel(anyhow!("too fast")),
             ZetaError::Proxy(anyhow!("upstream died")),
             ZetaError::Internal(anyhow!("oops")),
@@ -182,9 +199,35 @@ mod tests {
         for error in variants {
             let response = error.response("http://base".parse()?)?;
             assert_eq!(
-                response.extra_headers.get("zeta-error-origin").map(String::as_str),
+                response
+                    .extra_headers
+                    .get("zeta-error-origin")
+                    .map(String::as_str),
                 Some("pep"),
                 "ZetaError::{} must set zeta-error-origin: pep",
+                error.as_ref()
+            );
+        }
+        Ok(())
+    }
+
+    // A_29850: PoPP errors are addressed to the caller, not the ZETA-Client.
+    #[test]
+    fn popp_error_response_has_no_zeta_error_origin_header() -> Result<()> {
+        let variants: Vec<ZetaError> = vec![
+            ZetaError::PoPP(anyhow!("invalid")),
+            ZetaError::PoPPMissing,
+            ZetaError::PoPPInvalidActor {
+                access_token_sub: "a".into(),
+                actor_id: "b".into(),
+            },
+        ];
+
+        for error in variants {
+            let response = error.response("http://base".parse()?)?;
+            assert!(
+                !response.extra_headers.contains_key("zeta-error-origin"),
+                "ZetaError::{} must not set zeta-error-origin",
                 error.as_ref()
             );
         }

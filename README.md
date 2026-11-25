@@ -144,9 +144,10 @@ registration locally. See also `misc/nginx.conf.tpl` and `build.rs` for template
 
 For technical reasons the integration tests spawn multiple nginx processes on unique
 ports and with unique temporary directories. The configurations get written to
-`prefix/conf/test-{port}.conf` by build.rs. The port range `8003..=8006` is provisioned
-like this currently, and the "max-threads" sempahore is set to 4 in
-`.config/nextest.toml` accordingly.
+`prefix/conf/test-{port}.conf` by build.rs. The port range `8003..=8010` is provisioned
+like this currently. The "max-threads" semaphore in `.config/nextest.toml` is set to 4, half
+the number of ports, because the ports of a test that just finished can stay busy for a
+moment.
 
 All logs (nginx access and error logs, stdout, stderr) are merged to a single log file
 `prefix/test.log`
@@ -214,8 +215,14 @@ docker run --tty --interactive --rm \
   --publish 8080:8080 \
   --publish 8443:8443 \
   --env HSM_PROXY_ADDR=http://10.0.2.2:50051 \
+  --env HSM_PROXY_ALLOW_PLAINTEXT=1 \
     ngx_pep:latest
 ```
+
+The HSM simulator serves plaintext here, and the provider only connects in plaintext to a
+loopback address unless `HSM_PROXY_ALLOW_PLAINTEXT=1` is set; see below for the provider's
+settings, and [the hsm-sim README.md](./hsm_sim/README.md) for running the simulator with TLS
+and client certificates.
 
 `http://10.0.2.2:50051` must be reachable from within the container. For rootless
 docker, this can be achieved by passing the environment variable
@@ -244,6 +251,7 @@ docker run --tty --interactive --rm \
   --publish 8080:8080 \
   --publish 8443:8443 \
   --env HSM_PROXY_ADDR=http://10.0.2.2:50051 \
+  --env HSM_PROXY_ALLOW_PLAINTEXT=1 \
     ngx_pep:latest
 ```
 
@@ -325,6 +333,25 @@ spec:
         pathType: Prefix
 ```
 
+The provider is configured through the environment:
+
+|Variable|Meaning|
+|---|---|
+|`HSM_PROXY_ADDR`|`https://host[:port]` of the HSM proxy (default port 50051). `http://` is only accepted for a loopback address; default `http://[::1]:50051`.|
+|`HSM_PROXY_CA`|PEM file with the CA certificate(s) the proxy's certificate must chain to. Unset: the system trust store. `https://` only.|
+|`HSM_PROXY_CLIENT_CERT`, `HSM_PROXY_CLIENT_KEY`|PEM files with the certificate (chain) and private key the provider authenticates with (mTLS). Both or neither; `https://` only.|
+|`HSM_PROXY_ALLOW_PLAINTEXT`|`1` accepts `http://` to a non-loopback address. The provider then neither encrypts nor authenticates the connection itself: only for local testing, or when something else secures the link, e.g. a service mesh sidecar doing mTLS.|
+
+The proxy's certificate must be valid for the host name in `HSM_PROXY_ADDR`. When the address
+asks for plaintext to a remote host the provider does not load, and nginx fails to start if
+it is configured with a `store:hsm:` key.
+
+The HSM proxy decides who may use which key. Give the provider a client certificate so the
+proxy can tell it apart from anything else that reaches it, and keep network access to the
+proxy restricted as well. The files are read once when nginx starts; replacing them takes a
+restart, a reload is not enough. Certificates and keys must use RSA, NIST P-256/P-384 or
+Ed25519.
+
 For this to work, you must define env `HSM_PROXY_ADDR`, and mount certificate files to
 `/etc/nginx/certs`, e.g. with the `oci://ghcr.io/nginx/charts/nginx-ingress` Helm chart:
 
@@ -339,7 +366,7 @@ controller:
   ## The additional environment variables to be set on the Ingress Controller pods.
   env:
   - name: HSM_PROXY_ADDR
-    value: your-hsm:50051
+    value: https://your-hsm:50051
 
   ## The volumes of the Ingress Controller pods.
   volumes:

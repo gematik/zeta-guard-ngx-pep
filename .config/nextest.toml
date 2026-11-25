@@ -21,7 +21,8 @@ capture-stdout = false
 capture-stderr = false
 
 [test-groups]
-# semaphore because we only provision 4 nginx prefix dirs in build.rs
+# semaphore because we only provision 8 nginx prefix dirs in build.rs; half as many
+# threads, since a finished test's ports can stay busy for a moment
 integration = { max-threads = 4 }
 
 [[profile.default.overrides]]

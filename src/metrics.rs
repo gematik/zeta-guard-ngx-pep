@@ -136,7 +136,52 @@ pub fn register_observables() {
         .u64_observable_gauge("zeta.asl.sessions.active")
         .with_description("Entries (handshakes + sessions) in the shared ASL session cache")
         .with_callback(move |observer| {
-            observer.observe(session_cache.session_count(), &[]);
+            let stats = session_cache.stats();
+            observer.observe(stats.handshakes + stats.sessions, &[]);
+        })
+        .build();
+    let _handshakes = meter
+        .u64_observable_gauge("zeta.asl.sessions.handshaking")
+        .with_description(
+            "Unfinished handshakes in the shared ASL session cache, part of sessions.active",
+        )
+        .with_callback(move |observer| {
+            observer.observe(session_cache.stats().handshakes, &[]);
+        })
+        .build();
+    let _cache_used = meter
+        .u64_observable_gauge("zeta.asl.session_cache.used")
+        .with_unit("By")
+        .with_description("Bytes in use in the shared ASL session cache zone (page granular)")
+        .with_callback(move |observer| {
+            observer.observe(session_cache.stats().used_bytes, &[]);
+        })
+        .build();
+    let _cache_size = meter
+        .u64_observable_gauge("zeta.asl.session_cache.size")
+        .with_unit("By")
+        .with_description(
+            "Size of the shared ASL session cache zone, see pep_asl_session_cache_size",
+        )
+        .with_callback(move |observer| {
+            observer.observe(session_cache.stats().size_bytes, &[]);
+        })
+        .build();
+    // Alert on any increase: the zone ran full, even if reclaiming made room again.
+    let _alloc_failures = meter
+        .u64_observable_counter("zeta.asl.session_cache.alloc_failures")
+        .with_description(
+            "Inserts into the ASL session cache that failed because the zone was full",
+        )
+        .with_callback(move |observer| {
+            observer.observe(session_cache.stats().alloc_failures, &[]);
+        })
+        .build();
+    let _evictions = meter
+        .u64_observable_counter("zeta.asl.session_cache.evictions")
+        .with_description("Live ASL cache entries evicted to make room in a full zone")
+        .with_callback(move |observer| {
+            observer.observe(session_cache.stats().evictions, &[]);
         })
         .build();
 

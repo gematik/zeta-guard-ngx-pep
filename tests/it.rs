@@ -40,13 +40,13 @@ use ngx_pep::client::asl::{
     encode_valid_http_request, valid_asl_request,
 };
 use reqwest::Url;
-use reqwest::cookie::Jar;
+use reqwest::cookie::{CookieStore, Jar};
 use rstest::rstest;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use ngx_pep::client::token_dispenser::{Tokens, create_dpop_proof, create_popp_token};
-use ngx_pep::client::{SHARED_CLIENT, admission_from_x509, test_client_builder};
+use ngx_pep::client::{SHARED_CLIENT, admission_from_x509, send_retry_stale, test_client_builder};
 use ngx_pep::revocation::parse_event;
 mod common;
 use common::{NginxLease, TestContext, context, nginx};
@@ -213,12 +213,10 @@ async fn popp_and_upstream_headers(
         .await?;
 
     assert!(resp.status() == 400);
+    // A_29850: PoPP errors are addressed to the caller, not the ZETA-Client.
     assert!(
-        resp.headers()
-            .get("zeta-error-origin")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v == "pep"),
-        "PoPPMissing error must carry zeta-error-origin: pep"
+        resp.headers().get("zeta-error-origin").is_none(),
+        "PoPPMissing error must not carry zeta-error-origin"
     );
 
     let error: HttpZetaErrorResponse = resp.json().await?;
@@ -232,13 +230,13 @@ async fn popp_and_upstream_headers(
         .await?;
 
     assert!(resp.status() == 403);
+    // A_29850: an invalid PoPP token must not be flagged as a PEP error.
     assert!(
-        resp.headers()
-            .get("zeta-error-origin")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v == "pep"),
-        "invalid PoPP error must carry zeta-error-origin: pep"
+        resp.headers().get("zeta-error-origin").is_none(),
+        "invalid PoPP error must not carry zeta-error-origin"
     );
+    let error: HttpZetaErrorResponse = resp.json().await?;
+    assert!(error.error == "PoPP");
 
     // valid
 
@@ -370,12 +368,10 @@ async fn popp_and_upstream_headers(
         .await?;
 
     assert!(resp.status() == 403);
+    // A_29850: an invalid PoPP token must not be flagged as a PEP error.
     assert!(
-        resp.headers()
-            .get("zeta-error-origin")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v == "pep"),
-        "PoPPInvalidActor error must carry zeta-error-origin: pep"
+        resp.headers().get("zeta-error-origin").is_none(),
+        "PoPPInvalidActor error must not carry zeta-error-origin"
     );
     let error: HttpZetaErrorResponse = resp.json().await?;
     assert!(error.error == "PoPPInvalidActor");
@@ -581,6 +577,125 @@ async fn asl(#[future(awt)] context: &TestContext, #[future(awt)] nginx: NginxLe
 
     assert!(response.is_err_and(|e| e.to_string() == "inner status: 401 Unauthorized"));
 
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn asl_short_m3_is_rejected_not_fatal(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    nginx.wait_ready().await?;
+
+    let target = nginx.url().await?;
+    let tokens = context.tokens().await?;
+
+    let jar = Jar::default();
+    let (_state, m1) = asl::client::initiate_handshake(asl::Environment::Testing)?;
+    let response = send_retry_stale(
+        tokens
+            .valid_post(&jar, target.join("ASL/")?)?
+            .header("content-type", "application/cbor")
+            .body(m1),
+    )
+    .await?;
+    jar.set_cookies(
+        &mut response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter(),
+        &target,
+    );
+    let cid = response
+        .headers()
+        .get("zeta-asl-cid")
+        .context("no cid on M1 response")?
+        .to_str()?
+        .to_string();
+
+    let m3 = serde_cbor::to_vec(&asl::Message3 {
+        message_type: asl::MESSAGE_TYPE_3.to_string(),
+        aead_ct: vec![0u8; 5],
+        aead_ct_key_confirmation: vec![0u8; 5],
+    })?;
+    let response = send_retry_stale(
+        tokens
+            .valid_post(&jar, target.join(&cid)?)?
+            .header("content-type", "application/cbor")
+            .body(m3),
+    )
+    .await?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/cbor"),
+    );
+    let body = response.bytes().await?;
+    let err: asl::ErrorResponse = serde_cbor::from_slice(&body)?;
+    assert_eq!(err.message_type, "Error");
+    assert_eq!(
+        err.error_code, 3,
+        "want DecryptionFailure (3) for short M3, got {err:?}"
+    );
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn asl_short_session_request_is_rejected_not_fatal(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    nginx.wait_ready().await?;
+
+    let target = nginx.url().await?;
+    let tokens = context.tokens().await?;
+    let mut asl_session = asl_handshake(&tokens, target.clone()).await?;
+
+    // 1 and 70 used to underflow the inner buffer size; 71 (== overhead) has no ciphertext
+    for len in [1, 70, 71] {
+        let response = send_retry_stale(
+            tokens
+                .valid_post(&asl_session.jar, target.join(&asl_session.cid)?)?
+                .header("content-type", "application/octet-stream")
+                .body(vec![0u8; len]),
+        )
+        .await?;
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "body of {len} bytes"
+        );
+        let body = response.bytes().await?;
+        let err: asl::ErrorResponse = serde_cbor::from_slice(&body)?;
+        assert_eq!(
+            err.error_code, 6,
+            "want BadFormat (6) for {len} byte body, got {err:?}"
+        );
+    }
+
+    // the worker survived and the session is still usable
+    let inner = encode_valid_http_request(
+        &tokens,
+        Method::GET,
+        target.join("empty.json")?.as_str().parse()?,
+        None,
+    )?;
+    let response =
+        valid_asl_request(&tokens, &mut asl_session, target.clone(), &inner, None).await?;
+    match response {
+        AslResponse::Body(body) => {
+            let result: Value = serde_json::from_slice(&body)?;
+            assert!(result == json!({}));
+        }
+        response => bail!("unexpected: {response:?}"),
+    }
     Ok(())
 }
 
@@ -873,8 +988,8 @@ async fn cid_expiry(
     // During integration tests this auto-cleanup is *not* random — it is either never or always,
     // defaulting to never on startup, and blocking.
     //
-    // The observable difference is subtle — the error message mentions "expired" in the on access
-    // case, and "missing" in the auto-cleanup case, but it is enough to test both cases here.
+    // The observable difference: on access, the error is AslSessionExpired (403, "expired"); after
+    // auto-cleanup the cid is simply unknown (403, code 9, A_26924). Both cases are tested here.
 
     // expire cid and try otherwise valid request
     control_client
@@ -900,8 +1015,9 @@ async fn cid_expiry(
     match response {
         AslResponse::Error(err) => {
             assert!(err.message_type == "Error");
-            assert!(err.error_code == 102);
-            assert!(err.error_message == format!("internal error: missing — {}", asl_session.cid));
+            // A_26924: unknown CID
+            assert!(err.error_code == 9);
+            assert!(err.error_message == "unknown CID");
         }
         response => bail!("unexpected: {response:?}"),
     };
@@ -925,10 +1041,10 @@ async fn cid_expiry(
     match response {
         AslResponse::Error(err) => {
             assert!(err.message_type == "Error");
-            assert!(err.error_code == 102);
             // should be removed by cleanup_expired, not on access cleanup → we skip the "expired",
             // see above.
-            assert!(err.error_message == format!("internal error: missing — {}", asl_session.cid));
+            assert!(err.error_code == 9);
+            assert!(err.error_message == "unknown CID");
         }
         response => bail!("unexpected: {response:?}"),
     };
@@ -1164,12 +1280,10 @@ async fn error_responses(
         .await?;
 
     assert!(resp.status() == 400);
+    // A_29850: PoPP errors are addressed to the caller, not the ZETA-Client.
     assert!(
-        resp.headers()
-            .get("zeta-error-origin")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v == "pep"),
-        "pep-originated error must carry zeta-error-origin: pep"
+        resp.headers().get("zeta-error-origin").is_none(),
+        "PoPPMissing error must not carry zeta-error-origin"
     );
     assert!(
         resp.headers()
@@ -1268,9 +1382,7 @@ async fn hsm_proxy_tls(#[future(awt)] nginx: NginxLease) -> Result<()> {
 
     // Compare the SPKI (public key) from the TLS cert against what hsm_sim derives.
     // We can't compare full certs because ECDSA signatures are non-deterministic.
-    let hsm_url = nginx.hsm_sim_url().await?;
-    let mut hsm_client =
-        hsm_sim::proto::hsm_proxy_service_client::HsmProxyServiceClient::connect(hsm_url).await?;
+    let mut hsm_client = nginx.hsm_sim_client().await?;
 
     let pub_resp = hsm_client
         .get_public_key(hsm_sim::proto::GetPublicKeyRequest {
@@ -1587,6 +1699,138 @@ async fn asl_inner_target_stays_local(
         }
     }
 
+    echo_server.abort();
+    let _ = echo_server.await;
+    Ok(())
+}
+
+/// CWE-444: the relay used to copy an inner request's `Content-Length`
+/// although it sends only the body that follows the inner head. An inner request that announces
+/// a body and carries none went out with a length and no body. nginx answers a missing file under
+/// /doc/ itself and then discards the announced number of bytes from whatever arrives next on
+/// that pooled connection — the next inner request, which is then not answered at all (and in
+/// the attack, the attacker's own bytes in it are read as requests).
+///
+/// Each round sends such an inner request (answered 404 by nginx), then an ordinary one. The
+/// second must be answered at once; unfixed, nginx waits for the announced bytes (up to
+/// `lingering_timeout`, 5 s), which the 3 s timeout here catches. Several rounds, because the two
+/// requests have to meet on the same pooled connection of the same nginx worker.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn asl_inner_content_length_without_body_is_not_smuggled(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    nginx.wait_ready().await?;
+
+    let target = nginx.url().await?;
+    let token_dispenser = context.token_dispenser().await?;
+    let tokens = token_dispenser.tokens().await?;
+    let mut asl_session = asl_handshake(&tokens, target.clone()).await?;
+
+    // announces 4096 bytes of body and sends none
+    let doc_url = target.join("doc/none")?;
+    let mut announce = HashMap::new();
+    announce.insert("content-length", "4096".to_string());
+    let planted = encode_http_request(
+        &tokens.access_token,
+        &tokens.valid_dpop_proof("GET", doc_url.as_str())?,
+        Method::GET,
+        doc_url.as_str().parse()?,
+        Some(announce),
+    )?;
+
+    let ready_url = target.join("ready/")?;
+    let ordinary = encode_http_request(
+        &tokens.access_token,
+        &tokens.valid_dpop_proof("GET", ready_url.as_str())?,
+        Method::GET,
+        ready_url.as_str().parse()?,
+        None,
+    )?;
+
+    for round in 0..12 {
+        // nginx's own 404 for the missing file: the helper reports a non-2xx inner status as Err
+        let err = valid_asl_request(&tokens, &mut asl_session, target.clone(), &planted, None)
+            .await
+            .expect_err("a missing file under /doc/ must be answered 404");
+        assert!(
+            err.to_string().contains("inner status: 404"),
+            "round {round}: {err:#}"
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            valid_asl_request(&tokens, &mut asl_session, target.clone(), &ordinary, None),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "round {round}: the next inner request was not answered — the announced \
+                 Content-Length swallowed it on the pooled connection"
+            )
+        })??;
+        assert!(
+            matches!(response, AslResponse::Body(_)),
+            "round {round}: {response:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The relay frames the loopback request from the body it sends instead of copying the inner
+/// request's `Content-Length`: an inner request that does carry a body
+/// must still arrive with exactly that body's length, whether the client stated it or not.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn asl_inner_request_with_body_arrives_with_its_length(
+    #[future(awt)] context: &TestContext,
+    #[future(awt)] nginx: NginxLease,
+) -> Result<()> {
+    let echo_server = nginx.start_echo_server().await;
+    nginx.wait_ready().await?;
+
+    let target = nginx.url().await?;
+    let token_dispenser = context.token_dispenser().await?;
+    let tokens = token_dispenser.tokens().await?;
+    let mut asl_session = asl_handshake(&tokens, target.clone()).await?;
+
+    let echo_url = target.join("echo/")?;
+    let payload = b"hello, relay";
+
+    // the client states the length, or leaves it out: nginx must see the real one either way
+    for stated in [Some(payload.len().to_string()), None] {
+        let headers = stated
+            .clone()
+            .map(|len| HashMap::from([("content-length", len)]));
+        let mut inner = encode_http_request(
+            &tokens.access_token,
+            &tokens.valid_dpop_proof("POST", echo_url.as_str())?,
+            Method::POST,
+            echo_url.as_str().parse()?,
+            headers,
+        )?;
+        inner.extend_from_slice(payload);
+
+        let response =
+            valid_asl_request(&tokens, &mut asl_session, target.clone(), &inner, None).await?;
+        let AslResponse::Body(body) = response else {
+            bail!("unexpected: {response:?}");
+        };
+        let echo: Echo = serde_json::from_slice(&body)?;
+        assert_eq!(echo.method, "POST");
+        assert_eq!(
+            echo.headers.get("content-length").map(String::as_str),
+            Some(payload.len().to_string().as_str()),
+            "client stated {stated:?}: {:?}",
+            echo.headers
+        );
+        assert!(
+            !echo.headers.contains_key("transfer-encoding"),
+            "{:?}",
+            echo.headers
+        );
+    }
     echo_server.abort();
     let _ = echo_server.await;
     Ok(())

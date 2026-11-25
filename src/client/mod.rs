@@ -462,7 +462,7 @@ pub static SHARED_CLIENT: LazyLock<Client> = LazyLock::new(|| {
         .pool_idle_timeout(Duration::from_secs(65)) // < NIC keepalive-timeout (default=75s)
         .tcp_keepalive(Duration::from_secs(30))
         .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(6))
         .build()
         .expect("SHARED_CLIENT")
 });
@@ -502,7 +502,10 @@ mod tests {
 
         assert!(jwk.common.key_algorithm.is_none(), "jwk.alg must be absent");
         assert!(jwk.common.key_id.is_none(), "jwk.kid must be absent");
-        assert!(jwk.common.public_key_use.is_none(), "jwk.use must be absent");
+        assert!(
+            jwk.common.public_key_use.is_none(),
+            "jwk.use must be absent"
+        );
         assert_eq!(
             jwk.thumbprint(ThumbprintHash::SHA256),
             expected_thumbprint,

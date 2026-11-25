@@ -22,7 +22,7 @@ variable "BASE_IMAGE_RUST" {
   default = "${EXT_IMAGE_PREFIX}rust:${RUST_VERSION}-slim-trixie"
 }
 variable "BASE_IMAGE_NGINX" {
-  default = "${EXT_IMAGE_PREFIX}nginxinc/nginx-unprivileged:${NGINX_VERSION}-trixie-otel"
+  default = "${EXT_IMAGE_PREFIX}nginx/nginx-unprivileged:${NGINX_VERSION}-trixie-otel"
 }
 variable "BASE_IMAGE_NGINX_INGRESS" {
   default = "${EXT_IMAGE_PREFIX}nginx/nginx-ingress:${NGINX_INGRESS_VERSION}"

@@ -14,7 +14,7 @@ libc = "0.2"
 anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-aws-lc", "tls-native-roots"] }
 prost = "0.14"
 tonic-prost = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread"] }
@@ -29,6 +29,7 @@ tokio-stream = "0.1"
 tonic = "0.14"
 tempfile = "3"
 anyhow = "1"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

@@ -2,6 +2,105 @@
 
 # Release Notes ZETA PEP
 
+## Release 1.3.6
+
+### fixed
+
+- ASL (CWE-444, HTTP request smuggling): the relay no longer copies the
+  `Content-Length` and `Transfer-Encoding` of an inner request to the loopback hop but frames it
+  from the body it sends. An inner request announcing a body it doesn't carry used to go out
+  with a length and no body, and nginx took the announced bytes from the next request on the
+  pooled connection.
+- Bumps:
+  - rust 1.100.0
+  - nginx 1.31.9 (NOTE: image ref changes from nginxinc/nginx-unprivileged to
+    nginx/nginx-unprivileged due to an upstream naming scheme change)
+  - nginx-ingress 5.8.0
+  - headers-more-nginx-module v0.42
+
+## Release 1.3.5
+
+### fixed
+
+- ASL: don't panic on short M3
+- ASL: session requests shorter than the session overhead are rejected (`BadFormat`)
+  instead of underflowing. Resolves ANFTI2-968
+- response with 403 instead of 500 on requests with missing actorId
+- ASL: a full session cache no longer answers new handshakes with HTTP 500 (`ngx_slab_alloc()
+  failed: no memory`). Unfinished handshakes now expire (`pep_asl_handshake_ttl`, default 5m,
+  previously never), expired entries are cleaned up at least every 10s without holding the
+  write lock for a full scan, and a failing insert drops expired entries, tops up with the
+  oldest live ones (handshakes before sessions) and retries. The scan for that runs under the
+  read lock, removal happens in small chunks.
+- ASL: an M3 carrying the cid of an established session no longer deletes that session.
+- DSA-6572-1: the compromised emSign (eMudhra) root CAs are now explicitly
+  distrusted in the `pep` and `nginx-ingress` runtime images (ca-certificates is
+  upgraded and the emSign roots are removed from the system trust store)
+- **BREAKING** `ossl_hsm`: the provider honours the scheme of `HSM_PROXY_ADDR`. Previously
+  every address was dialed in plaintext, `https://` included. `https://` now connects with
+  TLS and verifies the proxy's certificate against the configured host name, using the system
+  trust store or the CA file named by the new `HSM_PROXY_CA`. `http://` (or no scheme) is only
+  accepted for a loopback address; for any other address the provider fails to initialise and
+  nginx, when configured with a `store:hsm:` key, does not start.
+  `HSM_PROXY_ALLOW_PLAINTEXT=1` restores plaintext to a remote address, for local testing or
+  when the link is secured by other means such as a service mesh, and logs a warning at every
+  start. A `SignResponse` whose `key_id` is empty or differs from the requested one is
+  rejected; HSM proxy implementations must return the `key_id` they signed with. Deployments that configured `https://` need a proxy that
+  actually serves TLS; deployments that configured `http://host` must switch to `https://`
+  (with thanks to Machine Spirits UG)
+- PDP/PoPP key cache: fetched keys and discovery documents are used for at most
+  `pep_jwks_max_lifetime` (default `24h`) before they are fetched again in full, without
+  `If-None-Match`/`If-Modified-Since`. Previously the response's `Cache-Control: max-age`
+  alone decided, and every `304` renewed it, so a key set accepted once with a long `max-age`
+  and the server's current `ETag` stayed in use until the next restart. Cached keys are also
+  dropped when discovery names a different `jwks_uri` than the one they were fetched from, a
+  `304` to an unconditional request is treated as a failed fetch, and an oversized `max-age`
+  can no longer overflow the grace-period calculation. The cache is held per worker
+  process; `nginx -s reload` replaces the workers and thereby purges it
+
+### added
+
+- `pep_pdp_url`: optional internal base URL for OIDC discovery and the JWKS fetch.
+  `pep_pdp_issuer` stays the trust identity (the expected `iss`), so the PDP can be
+  reached over an in-cluster address while tokens keep carrying the public issuer.
+  The `jwks_uri` advertised by discovery is rewritten from the issuer prefix onto
+  `pep_pdp_url`; a `jwks_uri` outside the issuer is fetched as advertised and logged.
+  Unset (default) keeps the previous behaviour. Resolves ANFTI2-477
+- directives `pep_asl_session_cache_size` (default 100m, min 1m, max 16g), `pep_asl_session_ttl`
+  (default 24h, capped at the 24h of the ASL protocol) and `pep_asl_handshake_ttl` (default 5m).
+  The cache is per pod. TTL changes apply on reload. The ASL certificates, roots and testing
+  flag are read when the zone is created: a reload keeps the zone, its sessions and these
+  settings, unless the size changed, in which case it starts over with an empty cache.
+- metrics `zeta.asl.sessions.handshaking` (part of `sessions.active`),
+  `zeta.asl.session_cache.used`/`.size` (bytes), `zeta.asl.session_cache.alloc_failures` and
+  `.evictions`; alert on any increase of `alloc_failures`.
+
+### changed
+
+- A_29850: PoPP errors (`PoPPMissing` 400, `PoPP` and `PoPPInvalidActor` 403) no longer carry
+  the header `zeta-error-origin: pep`. They are addressed to the caller, who supplies the PoPP
+  token, so the ZETA-Client hands them on instead of re-authenticating. Resolves ANFTI2-891
+- ASL: a request for a cid that is not (or no longer) in the session cache, e.g. after cleanup
+  or eviction, is answered with `403`/error code 9 `unknown CID` (gemSpec_Krypt A_26924)
+  instead of `500`/102 `internal error: missing`, so clients know to run a new handshake. This
+  applies to established sessions as well as to the handshake (M3); an expired handshake is
+  answered the same way. Clients matching on error code 102 for this case need to be adapted.
+- metric `zeta.asl.sessions.active` keeps its meaning (handshakes + sessions), but is an O(1)
+  counter now.
+- Before performance runs, restart the PEP pod to start with an empty session cache.
+- Bumps nginx version to 1.31.7
+- Bumps nginx-ingress version to 5.7.0
+- Bumps rust version to 1.99.1
+- `hsm_sim`: optional TLS. `--tls-cert`/`--tls-key` serve TLS on `--listen`,
+  `--tls-client-ca` additionally demands a client certificate (mTLS), and `--plaintext-listen`
+  opens a second, plaintext listener for clients without TLS support. All four can be set
+  through `HSM_SIM_TLS_CERT`, `HSM_SIM_TLS_KEY`, `HSM_SIM_TLS_CLIENT_CA` and
+  `HSM_SIM_PLAINTEXT_LISTEN`. Without them the simulator serves plaintext as before.
+- `ossl_hsm`: the provider can authenticate to the HSM proxy with a client certificate
+  (mTLS, A_28830). `HSM_PROXY_CLIENT_CERT` and `HSM_PROXY_CLIENT_KEY` name PEM files with the
+  certificate (chain) and its private key; they are read once at start and require an
+  `https://` address.
+
 ## Release 1.3.4
 
 ### fixed
@@ -45,6 +144,7 @@
 ## Release 1.3.0
 
 ### fixed
+
 - DPoP proofs whose embedded `jwk` omits the optional `alg`/`kid`/`use` members are now accepted;
   previously a missing `jwk` `alg` was rejected with HTTP 401. An explicit `jwk` `alg` other than
   `ES256` is still rejected.
@@ -52,6 +152,7 @@
   mechanism as elsewhere (forwarded → x-forwarded-for → x-real-ip → socket addr)
 
 ### added
+
 - Session revocation (ZETAP-1010): with `pep_revocation_url` set, the PEP reports the
   offending access token to the PDP when it detects an impossible-travel violation
   (`ip_address` claim != client ip), and subscribes to the PDP's block list as
@@ -72,6 +173,7 @@
 - logging indications of possible attacks. This logs are enriched with capec categorization. (A_25404)
 
 ### changed
+
 - Bumps nginx version to 1.31.3
 - Bumps nginx-ingress version to 5.5.4
 - Bumps rust version to 1.97.1

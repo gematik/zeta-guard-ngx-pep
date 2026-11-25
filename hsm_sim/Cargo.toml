@@ -13,7 +13,7 @@ name = "hsm_sim"
 path = "src/main.rs"
 
 [dependencies]
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-aws-lc"] }
 tonic-health = "0.14"
 tonic-reflection = "0.14"
 tonic-prost = "0.14"
@@ -24,6 +24,9 @@ openssl = "0.10"
 tempfile = "3"
 clap = { version = "4", features = ["derive", "env"] }
 tokio-stream = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["process"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

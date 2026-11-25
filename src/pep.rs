@@ -63,8 +63,9 @@ use crate::typify::{
     ClientDataPlatform, DPoPProofJwtPayload, ZetaUserInfo,
 };
 use crate::{CLIENT, Module, ModuleCtx, zeta_anyhow};
-use crate::{ZETA_VAR_CLIENT_ADDRESS, ZETA_VAR_CLIENT_ID, ZETA_VAR_PRODUCT_ID, ZETA_VAR_PRODUCT_VERSION,
-            ZETA_VAR_PROFESSION_OID, zeta_bail
+use crate::{
+    ZETA_VAR_CLIENT_ADDRESS, ZETA_VAR_CLIENT_ID, ZETA_VAR_PRODUCT_ID, ZETA_VAR_PRODUCT_VERSION,
+    ZETA_VAR_PROFESSION_OID, zeta_bail,
 };
 
 use crate::{
@@ -276,7 +277,7 @@ async fn verify_popp(
 
     let actor_id = token_data.claims["actorId"]
         .as_str()
-        .context("actorId missing")?
+        .ok_or_else(|| ZetaError::PoPP(anyhow::anyhow!("actorId missing")))?
         .to_string();
 
     if access_token_sub != actor_id {
@@ -572,7 +573,10 @@ async fn pep_handler<R: RequestOps + ConfigOps>(request: &mut R) -> ZetaResult<(
     // A_27496: client monitoring data on the nginx-otel SERVER span (via $zeta_* vars +
     // otel_span_attr). Same mechanism as CLIENT_ID / CLIENT_ADDRESS (A_28783).
     request.set_zeta_upstream_header(ZETA_VAR_PRODUCT_ID, &access_token_claims.product_id);
-    request.set_zeta_upstream_header(ZETA_VAR_PRODUCT_VERSION, &access_token_claims.product_version);
+    request.set_zeta_upstream_header(
+        ZETA_VAR_PRODUCT_VERSION,
+        &access_token_claims.product_version,
+    );
     request.set_zeta_upstream_header(ZETA_VAR_PROFESSION_OID, &access_token_claims.profession_oid);
 
     let require_popp = location_config.require_popp.unwrap_or(false);
@@ -1259,6 +1263,16 @@ mod tests {
         // actorId must still match access_token_sub
         let result = verify_popp(&request_mock.lcfg, "other", &popp, now, None).await;
         assert!(matches!(result, Err(ZetaError::PoPPInvalidActor { .. })));
+
+        // missing actorId → PoPP error (403), not Internal (500)
+        let mut header = Header::new(Algorithm::ES256);
+        header.typ = Some("vnd.telematik.popp+jwt".to_string());
+        let no_actor = make_jwt(header, serde_json::json!({"iat": iat}));
+        let result = verify_popp(&request_mock.lcfg, "sub", &no_actor, now, None).await;
+        assert!(
+            matches!(result, Err(ZetaError::PoPP(_))),
+            "missing actorId, got {result:?}"
+        );
     }
 
     #[rstest]

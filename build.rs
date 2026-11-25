@@ -142,7 +142,7 @@ pub fn install_config() -> Result<()> {
     // configuration for a range of ports. This allows starting multiple tests in parallel.
     //
     // see also: tests/common/mod.rs
-    for port in 8003..=8006 {
+    for port in 8003..=8010 {
         let mut test_config = ConfigFile::new();
         test_config.name = format!("test-{port}");
         test_config.variant = "test".to_string();
@@ -395,11 +395,15 @@ fn generate_proxy_binding() -> Result<()> {
 }
 
 fn generate_openssl_cnf() -> Result<()> {
-    let target_dir = PathBuf::from(env::var("OUT_DIR")?)
-        .join("..")
-        .join("..")
-        .join("..")
-        .canonicalize()?;
+    // OUT_DIR is <profile dir>/build/<pkg>-<hash>/out, or since cargo 1.100
+    // <profile dir>/build/<pkg>/<hash>/out
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?).canonicalize()?;
+    let target_dir = out_dir
+        .ancestors()
+        .find(|dir| dir.file_name().is_some_and(|name| name == "build"))
+        .and_then(Path::parent)
+        .with_context(|| format!("no build directory above {}", out_dir.display()))?
+        .to_path_buf();
     #[cfg(target_os = "macos")]
     let libsuff = "dylib";
     #[cfg(not(target_os = "macos"))]
@@ -410,6 +414,13 @@ fn generate_openssl_cnf() -> Result<()> {
         \n\
         [openssl_init]\n\
         providers = provider_sect\n\
+        alg_section = alg_sect\n\
+        \n\
+        [alg_sect]\n\
+        # Both providers register EC/ECDSA; without a preference OpenSSL 4 may pick ossl_hsm for\n\
+        # software keys, which then fail to sign. HSM keys are unaffected: their keymgmt is\n\
+        # bound to ossl_hsm.\n\
+        default_properties = ?provider=default\n\
         \n\
         [provider_sect]\n\
         ossl_hsm = ossl_hsm_sect\n\

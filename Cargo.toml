@@ -37,7 +37,7 @@ members = [
 exclude = ["xtask"]
 
 [workspace.package]
-version = "1.3.4"
+version = "1.3.6"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -135,6 +135,7 @@ tarpc = { version = "0.37", features = ["tokio1", "serde-transport", "unix", "se
 tokio-serde = { version = "0.9", features = ["json"] }
 tokio-stream = { version = "0.1", features = ["sync"]}
 hsm_sim = { path = "./hsm_sim/" }
+tonic = "0.14"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"

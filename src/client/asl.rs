@@ -315,7 +315,11 @@ pub async fn asl_request(
             content_type == "application/octet-stream",
             "unexpected content-type; want \"application/octet-stream\", got \"{content_type}\""
         );
-        let mut decrypted_bitez = vec![0u8; response_bitez.len() - SESSION_OVERHEAD];
+        let plain_len = response_bitez
+            .len()
+            .checked_sub(SESSION_OVERHEAD)
+            .context("ASL response shorter than session overhead")?;
+        let mut decrypted_bitez = vec![0u8; plain_len];
         decrypt_response(
             &asl_session.state,
             asl_session.reg_ctr,

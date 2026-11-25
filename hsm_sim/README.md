@@ -54,6 +54,29 @@ cargo run -p hsm_sim -- --listen 0.0.0.0:50051 --keys-dir /path/to/keys
 HSM_SIM_KEYS=/path/to/keys cargo run -p hsm_sim
 ```
 
+### TLS and client certificates
+
+Without further options the simulator serves plaintext gRPC, as before. With a server
+certificate it serves TLS on `--listen` instead; with a client CA it also demands a client
+certificate issued by that CA (mTLS):
+
+```sh
+cargo run -p hsm_sim -- --listen 0.0.0.0:50051 \
+  --tls-cert server.pem --tls-key server.key \
+  --tls-client-ca client-ca.pem
+```
+
+|Option|Environment|Meaning|
+|---|---|---|
+|`--tls-cert`|`HSM_SIM_TLS_CERT`|PEM file with the server certificate (chain). Enables TLS on `--listen`.|
+|`--tls-key`|`HSM_SIM_TLS_KEY`|PEM file with the server certificate's private key.|
+|`--tls-client-ca`|`HSM_SIM_TLS_CLIENT_CA`|PEM file with the CA(s) that client certificates must chain to. Unset: no client certificate is asked for.|
+|`--plaintext-listen`|`HSM_SIM_PLAINTEXT_LISTEN`|Additional plaintext listen address next to the TLS one, for clients without TLS support. Anything that can reach it bypasses the client certificate check.|
+
+The server certificate must be valid for the host name clients use to reach the simulator.
+The simulator does not restrict keys per client: every accepted client may use every
+`key_id`.
+
 ### gRPC reflection
 
 The server exposes gRPC server reflection, so you can explore with `grpcurl`:

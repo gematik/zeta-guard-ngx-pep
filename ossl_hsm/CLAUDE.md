@@ -129,7 +129,7 @@ nginx/sbin/nginx -s stop
 - **hsm_sim convention only**: the simulator expects asymmetric key_ids ending in `.p256`/`.p384`/`.bp256`/`.bp384`/`.bp512` so it can derive a deterministic EC key for that curve via HKDF-SHA256. Symmetric keys can be any string (AES-256 derived via HKDF-SHA256). This is purely an hsm_sim implementation detail — it is not part of the protocol contract.
 - **Certificates**: hsm_sim generates leaf certs on the fly, signed by `keys/ca.{key,crt}`. Fixed validity: notBefore = Unix epoch, notAfter = 2337-01-01. Certs are cached atomically on disk.
 - **Logging**: use `eprintln!("[ossl_hsm] ...")` in provider code. The `log` crate macros produce no output in provider context (no logger backend).
-- **gRPC address**: provider reads `HSM_PROXY_ADDR` env var, defaults to `http://[::1]:50051`.
+- **gRPC address**: provider reads `HSM_PROXY_ADDR` env var, defaults to `http://[::1]:50051`. `https://` gives TLS (rustls, aws-lc-rs), verified against the configured host name with the system roots or `HSM_PROXY_CA`; `HSM_PROXY_CLIENT_CERT`/`HSM_PROXY_CLIENT_KEY` add a client identity (mTLS). All files are read once at provider init (pre-fork). `http://` to a non-loopback address fails provider init unless `HSM_PROXY_ALLOW_PLAINTEXT=1`.
 
 ## Design Decisions
 

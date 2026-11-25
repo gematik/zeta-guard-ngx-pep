@@ -39,7 +39,7 @@ use ngx_tickle::RequestSpawn;
 use reqwest::{Client, Url};
 use tracing::{Instrument, debug, error, instrument};
 
-use crate::capec::{asl_capec, zeta_capec};
+use crate::capec::asl_capec;
 use crate::conf::MainConfig;
 use crate::error::{ToHttpResponse, ZetaAslResult};
 use crate::headers::pep_forwarded_element;
@@ -165,7 +165,12 @@ async fn handle_subrequest(
     }
 
     let session = SESSION_CACHE.continue_session(&cid).await?;
-    let inner_len = body.len() - SESSION_OVERHEAD;
+    // Check before sizing the buffer: a body shorter than the overhead would underflow here,
+    // long before decrypt_request gets to reject it.
+    let inner_len = body
+        .len()
+        .checked_sub(SESSION_OVERHEAD)
+        .ok_or(AslError::BadFormat)?;
     let mut inner = ngx::collections::Vec::with_capacity_in(inner_len, request.pool());
     inner.resize(inner_len, 0u8);
     let ctr = decrypt_request(asl_config, &session, body, &mut inner)?;
@@ -222,6 +227,11 @@ async fn handle_subrequest(
             // The client-chosen inner Host must not steer the loopback hop (e.g. nginx builds a
             // directory redirect's Location from it); it is pinned to the outer Host below.
             "host" => {}
+            // The relay frames the loopback request from the body it sends (below). A copied
+            // length or encoding announces bytes that never follow, and nginx then takes them
+            // from the next request on this pooled connection — HTTP request smuggling (CWE-444).
+            // hyper keeps a caller-set Content-Length even when the body is empty.
+            "content-length" | "transfer-encoding" => {}
             _ => subrequest = subrequest.header(header.name, header.value),
         };
     }
@@ -381,7 +391,7 @@ pub fn handler(request: &mut Request) -> Status {
             let response = asl_handler(request)
                 .await
                 .inspect_err(|err| {
-                    if let Some(capec) = asl_capec(&err) {
+                    if let Some(capec) = asl_capec(err) {
                         let capec_id = capec.id();
                         let capec_name = capec.name();
                         let detail = tracing::field::display(&err);

@@ -249,8 +249,7 @@ trigger_helm:
     - when: never
   trigger:
     project: zeta/devops/zeta-guard-helm
-    # release branch: smoke-test against the release chart, not main — main's chart
-    # renders pep_pdp_url, which images from this branch deliberately do not support.
+    # release branch: smoke-test against the release chart, not main's 2.0.x chart.
     # A pipeline triggered on releases/1.3.x deploys to zeta-13x, never to zeta-cd.
     branch: releases/1.3.x
     strategy: depend
@@ -324,6 +323,7 @@ publish_artifacts:
     - when: never
   needs:
     - job: package
+    - job: build:pep-build
       artifacts: true
   script:
     - git clone https://zeta-sdk:${REPORTING_TOKEN}@tas-devtools-gitlab.spree.de/zeta/reporting.git
@@ -334,7 +334,7 @@ publish_artifacts:
     - git config user.email "ci@tas-devtools-gitlab.spree.de"
     - git config  user.name "ci"
     - git add .
-    - git commit -m "$COMMIT_MESSAGE"
+    - git diff --cached --quiet || git commit -m "$COMMIT_MESSAGE"
     - git push
 
 publish_to_dependencytrack:

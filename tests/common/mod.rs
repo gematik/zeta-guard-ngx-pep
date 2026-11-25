@@ -147,6 +147,7 @@ struct State {
     started: bool,
     port_lock: PortLock,
     hsm_sim: Option<JoinHandle<()>>,
+    hsm_pki: Option<Arc<hsm_sim::tests::TestPki>>,
     ocsp_responder: Option<JoinHandle<()>>,
     revocation_mock: Option<JoinHandle<()>>,
 }
@@ -163,7 +164,7 @@ fn manager() -> Manager {
     let prefix = Path::new("./prefix").to_path_buf();
 
     // see build.rs for range
-    let port_lock = reserve_port(&prefix, 8003..=8006).expect("port");
+    let port_lock = reserve_port(&prefix, 8003..=8010).expect("port");
 
     MANAGER
         .get_or_init(|| {
@@ -182,6 +183,7 @@ fn manager() -> Manager {
                     started: false,
                     port_lock,
                     hsm_sim: None,
+                    hsm_pki: None,
                     ocsp_responder: None,
                     revocation_mock: None,
                 }),
@@ -204,11 +206,22 @@ impl Manager {
 
         let port = state.port_lock.port;
         let hsm_sim_addr = format!("127.0.0.1:{}", port + 200);
-        let hsm_sim_url = format!("http://{hsm_sim_addr}");
+        let hsm_sim_url = format!("https://{hsm_sim_addr}");
+
+        // nginx reaches hsm_sim over mTLS; the provider reads these files at startup
+        let pki = Arc::new(hsm_sim::tests::TestPki::generate().context("hsm_sim test PKI")?);
+        let hsm_tls_dir = fs::canonicalize(&state.prefix)
+            .context("prefix")?
+            .join(format!("test-{port}/hsm-tls"));
+        fs::create_dir_all(&hsm_tls_dir).context("hsm-tls dir")?;
+        fs::write(hsm_tls_dir.join("ca.pem"), &pki.ca_cert)?;
+        fs::write(hsm_tls_dir.join("client.pem"), &pki.client_cert)?;
+        fs::write(hsm_tls_dir.join("client.key"), &pki.client_key)?;
+        state.hsm_pki = Some(pki.clone());
 
         let hsm_sim_addr_clone = hsm_sim_addr.clone();
         let hsm_sim_task = tokio::spawn(async move {
-            let _ = hsm_sim::tests::start_server(&hsm_sim_addr_clone).await;
+            let _ = hsm_sim::tests::start_mtls_server(&hsm_sim_addr_clone, &pki).await;
         });
 
         let old_handle = state.hsm_sim.replace(hsm_sim_task);
@@ -285,6 +298,9 @@ impl Manager {
         let mut cmd = Command::new(state.prefix.join("sbin/nginx"));
         cmd.args(["-c", &format!("conf/test-{port}.conf")]);
         cmd.env("HSM_PROXY_ADDR", &hsm_sim_url);
+        cmd.env("HSM_PROXY_CA", hsm_tls_dir.join("ca.pem"));
+        cmd.env("HSM_PROXY_CLIENT_CERT", hsm_tls_dir.join("client.pem"));
+        cmd.env("HSM_PROXY_CLIENT_KEY", hsm_tls_dir.join("client.key"));
 
         // Redirect stdout/stderr to the shared test log file.
         // All nginx instances + their ossl_hsm provider output go to one file for easier debugging.
@@ -387,9 +403,17 @@ impl NginxLease {
         Url::parse(&format!("https://127.0.0.1:2{port}")).context("url parse")
     }
 
-    pub async fn hsm_sim_url(&self) -> Result<String> {
-        let port = self.mgr.0.state.lock().await.port_lock.port;
-        Ok(format!("http://127.0.0.1:{}", port + 200))
+    /// Client for this nginx's hsm_sim, authenticated like the provider.
+    pub async fn hsm_sim_client(
+        &self,
+    ) -> Result<
+        hsm_sim::proto::hsm_proxy_service_client::HsmProxyServiceClient<tonic::transport::Channel>,
+    > {
+        let state = self.mgr.0.state.lock().await;
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], state.port_lock.port + 200));
+        let pki = state.hsm_pki.as_ref().context("hsm_sim not started")?;
+        let channel = pki.connect(addr).await?;
+        Ok(hsm_sim::proto::hsm_proxy_service_client::HsmProxyServiceClient::new(channel))
     }
 
     pub async fn revocation_url(&self) -> Result<String> {

@@ -2,6 +2,6 @@
 xtask = "run --manifest-path xtask/Cargo.toml --"
 
 [env]
-NGINX_VERSION = "1.31.3" # NOTE: keep in sync with .gitlab-ci.yml and Dockerfile, and with the nginx contained in BASE_IMAGE_INGRESS (exact version)
+NGINX_VERSION = "1.31.9" # NOTE: keep in sync with .gitlab-ci.yml and Dockerfile, and with the nginx contained in BASE_IMAGE_INGRESS (exact version)
 NGINX_SOURCE_DIR = { value = ".nginx", relative = true }
 OPENSSL_CONF = { value = "target/debug/openssl.cnf", relative = true }

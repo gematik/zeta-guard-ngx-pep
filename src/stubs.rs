@@ -144,6 +144,11 @@ pub unsafe extern "C" fn ngx_http_read_client_request_body(
 pub unsafe extern "C" fn ngx_http_finalize_request(r: *mut ngx_http_request_t, rc: ngx_int_t) {}
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn ngx_http_discard_request_body(r: *mut ngx_http_request_t) -> ngx_int_t {
+    0
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ngx_pcalloc(
     pool: *mut ngx_pool_t,
     size: usize,

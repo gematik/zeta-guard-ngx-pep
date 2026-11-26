@@ -2,6 +2,28 @@
 
 # Release Notes ZETA PEP
 
+## Release 1.2.3
+
+### fixed
+
+- ASL (hardening, CWE-444, HTTP request smuggling): `/CertData.*` and non-`POST` requests to
+  `/ASL` discard an unread request body instead of leaving it on the connection for nginx to
+  parse as the next request. The PEP's own connections to nginx are not pooled on this branch,
+  so a client cannot reach another client's requests through the ASL relay. The change matters
+  when a front proxy or load balancer reuses its connections to the PEP for several clients.
+- OpenSSL prefers the default provider for software keys; with a newer OpenSSL in the base image
+  the ASL signer key could end up in the HSM provider and the PEP failed to start with
+  `asl init: failed to sign ASL keys`
+
+### changed
+
+- Bumps:
+  - rust 1.100.0
+  - nginx 1.31.9 (NOTE: image ref changes from nginxinc/nginx-unprivileged to
+    nginx/nginx-unprivileged due to an upstream naming scheme change)
+  - nginx-ingress 5.8.0
+  - headers-more-nginx-module v0.42
+
 ## Release 1.2.2
 
 ### fixed

@@ -39,10 +39,10 @@ variables:
   DOCKER_TLS_CERTDIR: /certs
   DOCKER_CERT_PATH: $DOCKER_TLS_CERTDIR/client
   DOCKER_TLS_VERIFY: "1"
-  BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.94-slim-bookworm
-  NGINX_VERSION: "1.31.3" # NOTE: keep in sync with .cargo/config.toml and Dockerfile, and with the nginx contained in BASE_IMAGE_INGRESS (exact version: modules only load into the nginx they were built for)
-  BASE_IMAGE: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginxinc/nginx-unprivileged:$NGINX_VERSION-trixie-otel"
-  BASE_IMAGE_INGRESS: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx/nginx-ingress:5.5@sha256:379143154a02d16e4b7d56ad505636bdf73b2c190825ef023c803958ba5eb57c" # NOTE: keep in sync with Dockerfile, contained nginx (1.31.3, controller 5.5.4) must match NGINX_VERSION exactly
+  BASE_IMAGE_BUILD: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/rust:1.100.0-slim-bookworm
+  NGINX_VERSION: "1.31.9" # NOTE: keep in sync with .cargo/config.toml and Dockerfile, and with the nginx contained in BASE_IMAGE_INGRESS (exact version: modules only load into the nginx they were built for)
+  BASE_IMAGE: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx/nginx-unprivileged:$NGINX_VERSION-trixie-otel"
+  BASE_IMAGE_INGRESS: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/nginx/nginx-ingress:5.8.0@sha256:08553c7ed978cb70dd85a081caa318d7fa96a7c732bd7eda287a49f6c5e61b3f" # NOTE: keep in sync with Dockerfile, contained nginx (1.31.9, controller 5.8.0) must match NGINX_VERSION exactly
   BASE_IMAGE_HSM_SIM: "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/debian:bookworm"
   IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
   IMAGE_INGRESS: $CI_REGISTRY_IMAGE/nginx-ingress:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
@@ -237,6 +237,9 @@ trigger_helm:
     # MRs into the 1.2.x line deploy to the zeta-12x stage (helm releases/1.2.x)
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "releases/1.2.x"'
       when: on_success
+    # pushes to the 1.2.x line deploy to zeta-12x as well
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "releases/1.2.x"'
+      when: on_success
     - when: never
   trigger:
     project: zeta/devops/zeta-guard-helm
@@ -261,6 +264,11 @@ tag_image:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       variables:
         TARGET_TAG: "$CI_DEFAULT_BRANCH"
+      when: on_success
+    # zeta-12x (helm private/values.12x.yaml) runs releases-1-2-x-latest
+    - if: $CI_COMMIT_BRANCH == "releases/1.2.x"
+      variables:
+        TARGET_TAG: "$CI_COMMIT_REF_SLUG-latest"
       when: on_success
     - when: never
   needs:

@@ -308,7 +308,18 @@ async fn asl_handler(request: &mut Request) -> ZetaAslResult<Response> {
     let path = request.path().to_string();
     let path = path.strip_suffix("/").unwrap_or(&path);
 
-    if path.starts_with("/CertData.") {
+    let is_cert_data = path.starts_with("/CertData.");
+    if is_cert_data || request.method() != "POST" {
+        // These paths and methods answer without reading a body. Left unread, nginx parses it as
+        // the next request on this (pooled) connection — HTTP request smuggling (CWE-444);
+        // RFC 9112 §9.3 requires either reading the whole body or closing the connection.
+        if !request.discard_request_body().is_ok() {
+            return Err(AslError::BadRequest(anyhow!(
+                "request body could not be discarded"
+            )));
+        }
+    }
+    if is_cert_data {
         return handle_cert_data(request, path.to_string());
     }
     if request.method() != "POST" {
@@ -323,6 +334,12 @@ async fn asl_handler(request: &mut Request) -> ZetaAslResult<Response> {
                 "asl: passing ngx_http_read_client_request_body status: {}",
                 status.0
             );
+            // The body wasn't fully read (that's what failed), so its unread remainder would be
+            // parsed as the next request on this connection unless it's closed — same risk as
+            // above. We answer with the read failure's own status, as before, but force the
+            // connection closed: nginx's lingering_close (on by default) then drains and
+            // discards whatever is still on the wire instead of leaving it for the next request.
+            request.as_mut().set_keepalive(0);
             return Ok(Response::new(status));
         }
     };

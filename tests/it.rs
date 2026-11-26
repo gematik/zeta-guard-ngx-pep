@@ -1064,6 +1064,72 @@ async fn hsm_proxy_tls(#[future(awt)] nginx: NginxLease) -> Result<()> {
     Ok(())
 }
 
+/// CWE-444: `/CertData.*` answers before its body is read. Left
+/// undiscarded, nginx reads that body as the head of the next request on the same connection —
+/// HTTP request smuggling (RFC 9112 §9.3). This sends a `/CertData.x` request whose body is
+/// itself a complete, well-formed second request, immediately followed by a third request the
+/// test sends itself, all on one raw connection: unfixed, nginx answers all three (the smuggled
+/// one included); fixed, the body is discarded and only the test's own two requests are
+/// answered.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn cert_data_body_is_discarded_not_smuggled(#[future(awt)] nginx: NginxLease) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    nginx.wait_ready().await?;
+    let target = nginx.url().await?;
+    let addr = format!(
+        "{}:{}",
+        target.host_str().context("host")?,
+        target.port().context("port")?
+    );
+
+    let mut stream = TcpStream::connect(&addr).await?;
+
+    // Request 1: /CertData.x, wrong key version, answered 404 without reading its body. The
+    // body is itself a full, well-formed request for a location that doesn't exist — if left on
+    // the connection, that is exactly what nginx reads as the next request.
+    let smuggled = b"GET /smuggled-by-the-test HTTP/1.1\r\nHost: x\r\n\r\n";
+    let req1 = format!(
+        "GET /CertData.x HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+        smuggled.len()
+    );
+    stream.write_all(req1.as_bytes()).await?;
+    stream.write_all(smuggled).await?;
+
+    // Request 2: the next request this test actually sends on the connection. /ready/ has
+    // `pep off` and needs no token.
+    let req2 = format!("GET /ready/ HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req2.as_bytes()).await?;
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await?;
+    let raw = String::from_utf8_lossy(&raw);
+
+    // Request 1's 404 comes first either way. If the body was smuggled as a pipelined request,
+    // its answer (to /smuggled-by-the-test, on whatever location matches that path) lands as the
+    // *second* response, ahead of the real request 2 — and, depending on how that unplanned
+    // request is handled, nginx may close the connection before request 2 is even answered. So
+    // the one assertion that distinguishes the two cases either way: the second response must be
+    // request 2's own 200 for /ready/, not whatever the smuggled request got answered with.
+    let responses: Vec<&str> = raw.split("HTTP/1.1 ").skip(1).collect();
+    assert!(
+        responses.len() >= 2,
+        "expected at least 2 responses: {raw:?}"
+    );
+    assert!(
+        responses[0].starts_with("404"),
+        "request 1 (/CertData.x, wrong key version): {raw:?}"
+    );
+    assert!(
+        responses[1].starts_with("200"),
+        "request 2 (/ready/) was not answered as its own request — the body was smuggled as a \
+         pipelined request instead of discarded: {raw:?}"
+    );
+    Ok(())
+}
+
 /// Verify that the ASL handshake includes a valid OCSP response when the OCSP responder is running.
 /// Starts the OCSP responder, performs an ASL handshake, and checks that M2's
 /// SignedAslKeys contains a non-empty ocsp_response that decodes as a valid OCSP response.

@@ -371,17 +371,28 @@ fn generate_proxy_binding() -> Result<()> {
 }
 
 fn generate_openssl_cnf() -> Result<()> {
-    let target_dir = PathBuf::from(env::var("OUT_DIR")?)
-        .join("..")
-        .join("..")
-        .join("..")
-        .canonicalize()?;
+    // OUT_DIR is <profile dir>/build/<pkg>-<hash>/out, or since cargo 1.100
+    // <profile dir>/build/<pkg>/<hash>/out
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?).canonicalize()?;
+    let target_dir = out_dir
+        .ancestors()
+        .find(|dir| dir.file_name().is_some_and(|name| name == "build"))
+        .and_then(Path::parent)
+        .with_context(|| format!("no build directory above {}", out_dir.display()))?
+        .to_path_buf();
     let text = format!(
         "\
         openssl_conf = openssl_init \n\
         \n\
         [openssl_init]\n\
         providers = provider_sect\n\
+        alg_section = alg_sect\n\
+        \n\
+        [alg_sect]\n\
+        # Both providers register EC/ECDSA; without a preference OpenSSL may pick ossl_hsm for\n\
+        # software keys (e.g. the ASL signer key), which then fail to sign. HSM keys are\n\
+        # unaffected: their keymgmt is bound to ossl_hsm.\n\
+        default_properties = ?provider=default\n\
         \n\
         [provider_sect]\n\
         ossl_hsm = ossl_hsm_sect\n\

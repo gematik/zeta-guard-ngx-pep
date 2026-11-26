@@ -27,18 +27,18 @@
 # Some of the targets have -ci variants, that are only meant to be used from CI.
 #
 # The final --targets for interactive usage are:
-# - pep — nginxinc/nginx-unprivileged with pep, headers-more, and openssl provider
+# - pep — nginx/nginx-unprivileged with pep, headers-more, and openssl provider
 # - nginx-ingress — nginx/nginx-ingress with headers-more and openssl provider
 # - hsm-sim — HSM Simulator
 #
 # If no --target is passed, pep is built.
 
-ARG BASE_IMAGE_BUILD="rust:1.95-slim-bookworm"
-ARG NGINX_VERSION=1.31.3 # NOTE: keep in sync with .cargo/config.toml and .gitlab-ci.yml, and with the nginx contained in BASE_IMAGE_INGRESS (exact version)
-ARG HEADERS_MORE_VERSION=0.39 # tag *without v prefix*! (https://github.com/openresty/headers-more-nginx-module/tags)
-ARG BASE_IMAGE="nginxinc/nginx-unprivileged:$NGINX_VERSION-trixie-otel"
+ARG BASE_IMAGE_BUILD="rust:1.100.0-slim-bookworm"
+ARG NGINX_VERSION=1.31.9 # NOTE: keep in sync with .cargo/config.toml and .gitlab-ci.yml, and with the nginx contained in BASE_IMAGE_INGRESS (exact version)
+ARG HEADERS_MORE_VERSION=0.42 # tag *without v prefix*! (https://github.com/openresty/headers-more-nginx-module/tags)
+ARG BASE_IMAGE="nginx/nginx-unprivileged:$NGINX_VERSION-trixie-otel"
 ARG BASE_IMAGE_HSM_SIM="debian:bookworm"
-ARG BASE_IMAGE_INGRESS="nginx/nginx-ingress:5.5@sha256:379143154a02d16e4b7d56ad505636bdf73b2c190825ef023c803958ba5eb57c" # NOTE: keep in sync with .gitlab-ci.yml, contained nginx (1.31.3, controller 5.5.4) must match NGINX_VERSION exactly
+ARG BASE_IMAGE_INGRESS="nginx/nginx-ingress:5.8.0@sha256:08553c7ed978cb70dd85a081caa318d7fa96a7c732bd7eda287a49f6c5e61b3f" # NOTE: keep in sync with .gitlab-ci.yml, contained nginx (1.31.9, controller 5.8.0) must match NGINX_VERSION exactly
 
 FROM ${BASE_IMAGE_BUILD} AS build-env
 ARG AZDO_CRATES_MIRROR_URL=""
